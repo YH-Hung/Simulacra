@@ -7,12 +7,16 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/bufbuild/protocompile"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
+	"google.golang.org/protobuf/types/descriptorpb"
 )
 
 type Registry struct {
@@ -81,6 +85,33 @@ func (r *Registry) AddFile(fd protoreflect.FileDescriptor) error {
 		}
 	}
 	return r.files.RegisterFile(fd)
+}
+
+// AddDescriptorSetFile loads a serialized FileDescriptorSet (e.g. a buf image
+// or `protoc --descriptor_set_out --include_imports` output). The set must be
+// self-contained: every import must be included in the set.
+func (r *Registry) AddDescriptorSetFile(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("reading descriptor set: %w", err)
+	}
+	set := new(descriptorpb.FileDescriptorSet)
+	if err := proto.Unmarshal(data, set); err != nil {
+		return fmt.Errorf("%s is not a valid FileDescriptorSet: %w", path, err)
+	}
+	if len(set.File) == 0 {
+		return fmt.Errorf("%s is not a valid FileDescriptorSet: contains no files", path)
+	}
+	files, err := protodesc.NewFiles(set)
+	if err != nil {
+		return fmt.Errorf("loading %s (descriptor sets must be self-contained; build with `buf build -o` or `protoc --include_imports`): %w", path, err)
+	}
+	var regErr error
+	files.RangeFiles(func(fd protoreflect.FileDescriptor) bool {
+		regErr = r.AddFile(fd)
+		return regErr == nil
+	})
+	return regErr
 }
 
 // LookupMethod resolves "pkg.Service/Method" or "/pkg.Service/Method".
