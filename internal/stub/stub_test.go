@@ -82,6 +82,10 @@ func TestCompileErrors(t *testing.T) {
 			Method: "shop.v1.OrderService/GetOrder",
 			Match:  &matchBlockWithBadField,
 		}, "no_such"},
+		{"negative times", Stub{
+			Method: "shop.v1.OrderService/GetOrder",
+			Times:  -1,
+		}, "times"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

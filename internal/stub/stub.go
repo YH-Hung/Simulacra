@@ -49,6 +49,9 @@ func (c *Compiled) Matches(msg protoreflect.Message, md metadata.MD) bool {
 func (c *Compiled) Response() *dynamicpb.Message { return c.response }
 
 func Compile(reg *schema.Registry, s Stub, source string) (*Compiled, error) {
+	if s.Times < 0 {
+		return nil, fmt.Errorf("%s: times must not be negative (got %d); omit it or use 0 for unlimited", source, s.Times)
+	}
 	m, err := reg.LookupMethod(s.Method)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", source, err)
