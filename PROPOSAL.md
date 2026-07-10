@@ -41,9 +41,13 @@ The closest thing to a gRPC-native mock server, and the honest benchmark for Sim
 - **Verification**: stub *usage* lists (`used-list` / `unused-list`) — you can see which stubs fired, but there is no "assert this method received a request matching M exactly N times," no request capture API, no ordering assertions. For integration testing this is the difference between a stub server and a mock server.
 - **SDKs**: no first-class polyglot test-client story (JUnit extension, Testcontainers modules, typed clients).
 
+### The shared failure mode: undisclosed protobuf gaps
+
+All three tools share a deeper problem than any single feature gap: **none supports the full protobuf feature set, and none tells you where the edges are.** `google.protobuf.Any` fields that won't decode, well-known types mangled by JSON conversion, proto2 extensions, deeply recursive messages, `oneof` presence semantics, 64-bit integers silently losing precision — these failures are discovered mid-test, not in the documentation. WireMock is the only one that even admits it ("only a limited range of standard Protobuf features have been tested"). The cost lands on the user: hours of debugging that end in "the mock is the bug," and eroded trust in the tool for every test after that.
+
 ### The opening
 
-A tool that is simultaneously **gRPC-native like gripmock** and **test-capable like MockServer** — deep matching, first-class verification, full streaming choreography, typed error details — with a polyglot SDK story none of them has. That is Simulacra.
+A tool that is simultaneously **gRPC-native like gripmock** and **test-capable like MockServer** — deep matching, first-class verification, full streaming choreography, typed error details — with a polyglot SDK story none of them has, and a **published, CI-generated protobuf support matrix** so its limits are documented before you hit them, never discovered after. That is Simulacra.
 
 ## 3. Goals and non-goals
 
@@ -52,6 +56,7 @@ A tool that is simultaneously **gRPC-native like gripmock** and **test-capable l
 1. **Automated integration tests** — spin up in milliseconds (binary or Testcontainers), program stubs and verify calls from test code in JVM/Go (Rust/C++ soon after), tear down. Deterministic, isolated, CI-friendly.
 2. **Local dev sandbox** — long-running mock of upstream services from declarative stub files with hot reload, a rich CLI, and a read-only web dashboard for inspection.
 3. **Table-stakes fault simulation** — any gRPC status with typed error details, fixed/ranged response delays, mid-stream errors. (Chaos-grade fault injection is post-v1.)
+4. **Protobuf fidelity, transparently documented** — the full protobuf feature spectrum exercised by a per-release conformance corpus, with results published as a public support matrix. Anything untested is not claimed. See §7.
 
 ### Non-goals (v1)
 
@@ -240,7 +245,40 @@ Simulacra must know message shapes to decode, match, and template. Three sources
 
 Schemas can also be registered at runtime through `SchemaService` (tests ship descriptor bytes; no files needed). Proto3, proto2, and editions are supported to the extent `protocompile`/`protobuf-go` support them — which is first-party and tracks upstream.
 
-## 7. Verification
+## 7. Protobuf fidelity and the public support matrix
+
+The single most frustrating property of existing tools is not any specific missing feature — it's that missing features are *undisclosed*. You find them by watching your test fail, ruling out your own code, and finally suspecting the mock. Simulacra treats this as a product requirement, not a documentation nicety.
+
+### Fidelity by construction
+
+The pipeline never converts protobuf to an intermediate JSON representation. Messages are decoded with first-party `dynamicpb` against real descriptors, matched and templated over protobuf types (CEL operates on protobuf natively), and re-encoded from descriptors. This removes by design the entire class of translation bugs — int64 precision, bytes-vs-base64 confusion, enum name/number drift, well-known-type mangling — that JSON-bridging tools inherit architecturally.
+
+The historically hard cases get first-class, tested treatment:
+
+- **`google.protobuf.Any`** — resolved against a type registry built from the schema registry; matchable and templatable when the payload type is registered, with defined, documented behavior (type-URL matching + opaque bytes) when it isn't.
+- **Well-known types** — `Timestamp`, `Duration`, `Struct`, `Value`, `FieldMask`, wrappers: natural forms in stub YAML, matchers, and CEL.
+- **Unknown fields** — preserved and round-tripped, never silently dropped.
+- **Presence semantics** — proto3 `optional`, `oneof`, message-vs-scalar presence honored in matching (`present: true` means *set*, not *non-default*).
+- **proto2 and editions** — extensions, groups, required fields, and editions-syntax files supported to the same level as `protobuf-go` itself, and tested as such.
+- **Structural stress** — recursive/self-referential messages, deep nesting, large messages, maps with message values, packed repeated fields.
+
+### The conformance corpus
+
+A dedicated fixture corpus — inspired by the official protobuf conformance suite, adapted to the mock-server pipeline — exercises every feature above end-to-end: schema load → request decode → match → template → response encode → client decode, for each RPC shape where it applies. It runs in CI on every commit and against every release binary, alongside the polyglot client matrix (§10).
+
+### The support matrix
+
+Corpus results are not an internal artifact — they are **generated into a public support matrix**, published with every release on the docs site and as `SUPPORT.md` in the repo. Every protobuf feature is in exactly one state:
+
+| State | Meaning |
+|---|---|
+| ✅ Supported | in the corpus, passing, covered by semver |
+| ❌ Not supported | documented, with the failing behavior described and an issue link |
+| ⬜ Untested | **not claimed** — treated as unsupported in public messaging until it enters the corpus |
+
+The policy is one line: **if it isn't tested, it isn't claimed.** A user should never be the first to discover a gap — and where a gap exists, the matrix says so before they write a single stub.
+
+## 8. Verification
 
 The feature that makes Simulacra a *mock* server rather than a stub server:
 
@@ -257,7 +295,7 @@ VerifyCalls(
 - **Order-sensitive verification** (`VerifySequence`) for asserting call ordering across methods.
 - Journal `Reset` between tests; `ReplaceAllStubs` for setup — the two RPCs that make test isolation one line in each SDK.
 
-## 8. Developer experience surfaces
+## 9. Developer experience surfaces
 
 ### CLI
 
@@ -312,7 +350,7 @@ Embedded static assets, served from the control-plane port, zero configuration:
 - **Registered services browser** — services/methods/message shapes from the registry.
 - **Active stubs** — with per-stub hit counts and source (file vs. API).
 
-## 9. Tech stack
+## 10. Tech stack
 
 ### Language assessment
 
@@ -353,7 +391,7 @@ The core must: compile `.proto` at runtime, handle dynamic protobuf messages fai
 
 GoReleaser: macOS/Linux/Windows × amd64/arm64 binaries, Homebrew tap, Scoop manifest, multi-arch Docker image (`FROM scratch` + binary, sub-20MB), checksums + SBOM + signed releases. SDKs to Maven Central and pkg.go.dev; later crates.io and a CMake-consumable C++ release.
 
-## 10. Repository layout
+## 11. Repository layout
 
 Monorepo:
 
@@ -374,34 +412,35 @@ simulacra/
 │   ├── go/                     # Go SDK + testcontainers-go
 │   ├── rust/                   # v1.x
 │   └── cpp/                    # v1.x
-├── conformance/                # polyglot scenario matrix
+├── conformance/                # polyglot scenario matrix + protobuf feature corpus
+│                               #   + support-matrix generator (emits SUPPORT.md)
 └── docs/                       # docs site source (Astro Starlight, built at M4)
 ```
 
-## 11. Roadmap
+## 12. Roadmap
 
 | Milestone | Deliverable | Exit criterion |
 |---|---|---|
 | **M1 — walking skeleton** | Schema registry (proto dir + descriptor sets), dynamic data plane, YAML stubs, unary matching (structured only), CLI `serve`/`check`, reflection + health | `simulacra serve --proto --stubs` answers a real grpcurl unary call correctly |
-| **M2 — the capability core** | CEL matching, templating, all four streaming shapes, typed error details, delays, journal, verification, nearest-miss diagnostics, hot reload | conformance suite (Go client) green across all shapes |
+| **M2 — the capability core** | CEL matching, templating, all four streaming shapes, typed error details, delays, journal, verification, nearest-miss diagnostics, hot reload, protobuf conformance corpus (first pass) | conformance suite (Go client) green across all shapes; corpus covering §7's hard-case list |
 | **M3 — the test story** | Admin API (ConnectRPC), reflection schema import, JVM SDK + JUnit5 + Testcontainers, Go SDK, `calls tail`, journal/stub CLI | a grpc-java integration test using the JVM SDK passes in CI via Testcontainers |
-| **M4 — v1.0 public release** | Dashboard, docs site, GoReleaser pipeline (brew/Docker/binaries), Maven Central publishing, java conformance leg | tagged v1.0.0, installable via `brew install simulacra` and `docker run` |
+| **M4 — v1.0 public release** | Dashboard, docs site, generated protobuf support matrix published, GoReleaser pipeline (brew/Docker/binaries), Maven Central publishing, java conformance leg | tagged v1.0.0, installable via `brew install simulacra` and `docker run`, `SUPPORT.md` auto-generated from CI |
 | **Post-v1** | Rust + C++ SDKs · proxy / record & replay (journal + schema registry are designed as its foundation) · scenario state machines (WireMock-style) · chaos-grade fault injection (bandwidth, resets, jitter distributions) · data-plane gRPC-Web · faker functions in templating | — |
 
 Scenario state machines were deliberately cut from v1: `times` + `priority` covers sequential-response needs in tests, and shipping M1–M4 sooner matters more. They are the first post-v1 feature.
 
-## 12. Risks
+## 13. Risks
 
 | Risk | Mitigation |
 |---|---|
 | **bavix/gripmock closes the gap** (it's active and good) | Differentiate where depth compounds: matching power, verification, SDK breadth, diagnostics quality. The conformance matrix is a publishable credibility asset gripmock lacks. Ship M1–M3 quickly. |
 | **CEL learning curve deters casual users** | Structured matchers cover the common cases with zero learning; CEL is opt-in. Every CEL error message includes the expression, the failing input, and a docs link. |
 | **Bidi semantics scope creep** | v1 bidi is the minimal reactive-rules model, explicitly documented as such; richer choreography arrives with scenario state machines post-v1. |
-| **Dynamic protobuf edge cases** (editions, presence, well-known types) | Every load-bearing dependency is first-party (`protobuf-go`, `protocompile`) and tracks upstream; the conformance matrix exercises exactly these edges with real generated clients. |
+| **Dynamic protobuf edge cases** (editions, presence, well-known types) | Every load-bearing dependency is first-party (`protobuf-go`, `protocompile`) and tracks upstream; the conformance corpus (§7) exercises exactly these edges with real generated clients — and any gap that remains becomes a documented ❌ in the support matrix rather than a user-discovered surprise. |
 | **Maintainer bandwidth (OSS solo start)** | Small core; SDKs mostly generated; UI read-only; milestones are individually shippable; non-goals are written down and enforced. |
 | **Name collisions** ("Simulacra" is used by an indie game and scattered packages) | No conflict in the dev-tools category; binary name `simulacra` is unclaimed in brew/scoop. Do a trademark/package-registry sweep before the v1.0 announcement. |
 
-## 13. What "very approachable" means, concretely
+## 14. What "very approachable" means, concretely
 
 The north-star DX checklist every milestone is measured against:
 
@@ -411,3 +450,4 @@ The north-star DX checklist every milestone is measured against:
 4. **Failures explain themselves**: every non-match produces a nearest-miss explanation, in the place you're already looking (response, log, CLI, dashboard).
 5. **Test isolation is one line**: SDK lifecycle hooks reset stubs + journal per test.
 6. **Stub files teach themselves**: published JSON Schema → editor autocomplete and inline validation.
+7. **No undiscovered gaps**: protobuf feature support is proven by a per-release conformance corpus and published as a support matrix — if it isn't tested, it isn't claimed.
