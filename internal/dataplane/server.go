@@ -5,6 +5,7 @@ package dataplane
 
 import (
 	"net"
+	"strings"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -17,6 +18,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/dynamicpb"
 
+	"github.com/yinghanhung/simulacra/internal/match"
 	"github.com/yinghanhung/simulacra/internal/schema"
 	"github.com/yinghanhung/simulacra/internal/stub"
 )
@@ -91,7 +93,8 @@ func (s *Server) handleUnknown(_ any, stream grpc.ServerStream) error {
 	}
 	md, _ := metadata.FromIncomingContext(stream.Context())
 
-	selected := s.store.Select(full, req.ProtoReflect(), md)
+	in := match.Input{Method: strings.TrimPrefix(full, "/"), Metadata: md, Message: req.ProtoReflect()}
+	selected := s.store.Select(full, in)
 	if selected == nil {
 		return status.Errorf(codes.NotFound,
 			"simulacra: no stub matched %s (%d stub(s) registered for this method)",

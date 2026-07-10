@@ -4,8 +4,7 @@ import (
 	"sort"
 	"sync"
 
-	"google.golang.org/grpc/metadata"
-	"google.golang.org/protobuf/reflect/protoreflect"
+	"github.com/yinghanhung/simulacra/internal/match"
 )
 
 // Store holds compiled stubs grouped by method and selects the stub for a
@@ -35,14 +34,14 @@ func NewStore(stubs []*Compiled) *Store {
 }
 
 // Select returns the first live matching stub for the method, or nil.
-func (s *Store) Select(method string, msg protoreflect.Message, md metadata.MD) *Compiled {
+func (s *Store) Select(method string, in match.Input) *Compiled {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, e := range s.byMethod[method] {
 		if e.stub.Times > 0 && e.used >= e.stub.Times {
 			continue
 		}
-		if e.stub.Matches(msg, md) {
+		if e.stub.Matches(in) {
 			e.used++
 			return e.stub
 		}

@@ -90,11 +90,11 @@ func TestEval(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			c, err := Compile(desc, tc.block)
+			c, err := NewCompiler(nil).Compile(desc, tc.block, Unary)
 			if err != nil {
 				t.Fatalf("Compile: %v", err)
 			}
-			if got := c.Eval(msg(t, desc, tc.body), tc.md); got != tc.want {
+			if got := c.Eval(Input{Message: msg(t, desc, tc.body), Metadata: tc.md}); got != tc.want {
 				t.Errorf("Eval = %v, want %v", got, tc.want)
 			}
 		})
@@ -132,9 +132,41 @@ func TestCompileErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := Compile(desc, tc.block); err == nil {
+			if _, err := NewCompiler(nil).Compile(desc, tc.block, Unary); err == nil {
 				t.Error("expected compile error, got nil")
 			}
 		})
+	}
+}
+
+func TestShapeValidation(t *testing.T) {
+	desc := requestDesc(t)
+	withMsg := &Block{Message: map[string]Rules{"order_id": {"eq": "x"}}}
+	for _, shape := range []Shape{Unary, ServerStream, BidiRule} {
+		if _, err := NewCompiler(nil).Compile(desc, withMsg, shape); err != nil {
+			t.Errorf("Compile(%v) with message rules: %v, want ok", shape, err)
+		}
+	}
+	for _, shape := range []Shape{ClientStream, Bidi} {
+		if _, err := NewCompiler(nil).Compile(desc, withMsg, shape); err == nil {
+			t.Errorf("Compile(%v) with message rules: want error", shape)
+		}
+	}
+	withMD := &Block{Metadata: map[string]Rules{"x-tenant": {"eq": "acme"}}}
+	for _, shape := range []Shape{Unary, ServerStream, ClientStream, Bidi, BidiRule} {
+		if _, err := NewCompiler(nil).Compile(desc, withMD, shape); err != nil {
+			t.Errorf("Compile(%v) with metadata rules: %v, want ok", shape, err)
+		}
+	}
+}
+
+func TestEvalNilMessageFailsMessageRules(t *testing.T) {
+	desc := requestDesc(t)
+	c, err := NewCompiler(nil).Compile(desc, &Block{Message: map[string]Rules{"order_id": {"eq": "x"}}}, Unary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Eval(Input{}) {
+		t.Error("message rule matched an input with no message")
 	}
 }

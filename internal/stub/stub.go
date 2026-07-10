@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/dynamicpb"
@@ -40,8 +39,8 @@ type Compiled struct {
 	response *dynamicpb.Message
 }
 
-func (c *Compiled) Matches(msg protoreflect.Message, md metadata.MD) bool {
-	return c.matcher.Eval(msg, md)
+func (c *Compiled) Matches(in match.Input) bool {
+	return c.matcher.Eval(in)
 }
 
 // Response returns the pre-built response message. It is shared across
@@ -59,7 +58,7 @@ func Compile(reg *schema.Registry, s Stub, source string) (*Compiled, error) {
 	if m.IsStreamingClient() || m.IsStreamingServer() {
 		return nil, fmt.Errorf("%s: %s is a streaming method; this build supports unary methods only", source, s.Method)
 	}
-	cm, err := match.Compile(m.Input(), s.Match)
+	cm, err := match.NewCompiler(reg.Files()).Compile(m.Input(), s.Match, match.ShapeOf(m))
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", source, err)
 	}

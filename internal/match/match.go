@@ -13,7 +13,60 @@ import (
 
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/reflect/protoregistry"
 )
+
+type Shape int
+
+const (
+	Unary Shape = iota
+	ServerStream
+	ClientStream
+	Bidi
+	BidiRule
+)
+
+func (s Shape) String() string {
+	switch s {
+	case Unary:
+		return "unary"
+	case ServerStream:
+		return "server-streaming"
+	case ClientStream:
+		return "client-streaming"
+	case Bidi:
+		return "bidirectional"
+	case BidiRule:
+		return "bidirectional rule"
+	}
+	return "unknown"
+}
+
+func ShapeOf(m protoreflect.MethodDescriptor) Shape {
+	switch {
+	case m.IsStreamingClient() && m.IsStreamingServer():
+		return Bidi
+	case m.IsStreamingClient():
+		return ClientStream
+	case m.IsStreamingServer():
+		return ServerStream
+	default:
+		return Unary
+	}
+}
+
+type Input struct {
+	Method   string
+	Metadata metadata.MD
+	Message  protoreflect.Message
+	Messages []protoreflect.Message
+}
+
+type Compiler struct {
+	files *protoregistry.Files
+}
+
+func NewCompiler(files *protoregistry.Files) *Compiler { return &Compiler{files: files} }
 
 // Block is the YAML shape of a stub's `match:` section (M1 structured subset).
 type Block struct {
@@ -60,10 +113,13 @@ type literal struct {
 
 // Compile validates the block against the request descriptor. A nil block
 // compiles to a matcher that accepts everything.
-func Compile(input protoreflect.MessageDescriptor, b *Block) (*Compiled, error) {
-	c := &Compiled{}
+func (c *Compiler) Compile(input protoreflect.MessageDescriptor, b *Block, shape Shape) (*Compiled, error) {
+	cmp := &Compiled{}
 	if b == nil {
-		return c, nil
+		return cmp, nil
+	}
+	if len(b.Message) > 0 && (shape == ClientStream || shape == Bidi) {
+		return nil, fmt.Errorf("message field matchers are not valid for %s stubs (there is no single request message); use expr over `messages` instead", shape)
 	}
 	for key, rules := range b.Metadata {
 		for op, raw := range rules {
@@ -71,7 +127,7 @@ func Compile(input protoreflect.MessageDescriptor, b *Block) (*Compiled, error) 
 			if err != nil {
 				return nil, fmt.Errorf("metadata %q: %w", key, err)
 			}
-			c.metadata = append(c.metadata, r)
+			cmp.metadata = append(cmp.metadata, r)
 		}
 	}
 	for path, rules := range b.Message {
@@ -84,20 +140,23 @@ func Compile(input protoreflect.MessageDescriptor, b *Block) (*Compiled, error) 
 			if err != nil {
 				return nil, fmt.Errorf("message field %q: %w", path, err)
 			}
-			c.message = append(c.message, r)
+			cmp.message = append(cmp.message, r)
 		}
 	}
-	return c, nil
+	return cmp, nil
 }
 
-func (c *Compiled) Eval(msg protoreflect.Message, md metadata.MD) bool {
+func (c *Compiled) Eval(in Input) bool {
 	for _, r := range c.metadata {
-		if !r.eval(md) {
+		if !r.eval(in.Metadata) {
 			return false
 		}
 	}
+	if len(c.message) > 0 && in.Message == nil {
+		return false
+	}
 	for _, r := range c.message {
-		if !r.eval(msg) {
+		if !r.eval(in.Message) {
 			return false
 		}
 	}

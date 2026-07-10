@@ -52,15 +52,15 @@ func TestSelectPriorityAndTimes(t *testing.T) {
 	req := request(t, reg, `{"order_id":"o-123"}`)
 
 	// Higher priority wins even though it was loaded second.
-	if got := store.Select(method, req.ProtoReflect(), nil); got != specific {
+	if got := store.Select(method, match.Input{Message: req.ProtoReflect()}); got != specific {
 		t.Fatalf("first select = %v, want the priority-10 stub", got)
 	}
 	// times: 1 is now exhausted; fallback matches next.
-	if got := store.Select(method, req.ProtoReflect(), nil); got != fallback {
+	if got := store.Select(method, match.Input{Message: req.ProtoReflect()}); got != fallback {
 		t.Fatalf("second select = %v, want the fallback stub", got)
 	}
 	// No stubs for other methods.
-	if got := store.Select("/shop.v1.OrderService/Other", req.ProtoReflect(), nil); got != nil {
+	if got := store.Select("/shop.v1.OrderService/Other", match.Input{Message: req.ProtoReflect()}); got != nil {
 		t.Fatalf("select for unknown method = %v, want nil", got)
 	}
 	if n := store.CountFor(method); n != 2 {
@@ -76,7 +76,7 @@ func TestSelectNoMatch(t *testing.T) {
 	})
 	store := NewStore([]*Compiled{only})
 	req := request(t, reg, `{"order_id":"o-123"}`)
-	if got := store.Select(method, req.ProtoReflect(), nil); got != nil {
+	if got := store.Select(method, match.Input{Message: req.ProtoReflect()}); got != nil {
 		t.Fatalf("Select = %v, want nil for non-matching request", got)
 	}
 }
