@@ -6,6 +6,7 @@ package match
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"slices"
 	"strings"
@@ -277,29 +278,51 @@ func literalFor(fd protoreflect.FieldDescriptor, raw any) (literal, error) {
 			return l, fmt.Errorf("field %q is a bool, got %T literal", fd.Name(), raw)
 		}
 		l.b = b
-	case protoreflect.Int32Kind, protoreflect.Sint32Kind, protoreflect.Sfixed32Kind,
-		protoreflect.Int64Kind, protoreflect.Sint64Kind, protoreflect.Sfixed64Kind:
-		i, ok := toInt64(raw)
-		if !ok {
-			return l, fmt.Errorf("field %q is an integer, got %T literal", fd.Name(), raw)
+	case protoreflect.Int32Kind, protoreflect.Sint32Kind, protoreflect.Sfixed32Kind:
+		i, err := intLiteral(fd, raw, math.MinInt32, math.MaxInt32)
+		if err != nil {
+			return l, err
 		}
 		l.i = i
-	case protoreflect.Uint32Kind, protoreflect.Fixed32Kind,
-		protoreflect.Uint64Kind, protoreflect.Fixed64Kind:
-		i, ok := toInt64(raw)
-		if !ok || i < 0 {
-			return l, fmt.Errorf("field %q is an unsigned integer, got %v", fd.Name(), raw)
+	case protoreflect.Int64Kind, protoreflect.Sint64Kind, protoreflect.Sfixed64Kind:
+		i, err := intLiteral(fd, raw, math.MinInt64, math.MaxInt64)
+		if err != nil {
+			return l, err
 		}
-		l.u = uint64(i)
+		l.i = i
+	case protoreflect.Uint32Kind, protoreflect.Fixed32Kind:
+		u, err := uintLiteral(fd, raw, math.MaxUint32)
+		if err != nil {
+			return l, err
+		}
+		l.u = u
+	case protoreflect.Uint64Kind, protoreflect.Fixed64Kind:
+		u, err := uintLiteral(fd, raw, math.MaxUint64)
+		if err != nil {
+			return l, err
+		}
+		l.u = u
 	case protoreflect.FloatKind, protoreflect.DoubleKind:
+		var f float64
 		switch v := raw.(type) {
 		case float64:
-			l.f = v
+			f = v
 		case int:
-			l.f = float64(v)
+			f = float64(v)
+		case int64:
+			f = float64(v)
+		case uint64:
+			f = float64(v)
 		default:
 			return l, fmt.Errorf("field %q is a float, got %T literal", fd.Name(), raw)
 		}
+		if k == protoreflect.FloatKind {
+			// The wire value is a float32; protoreflect widens it back to
+			// float64. Normalize the literal the same way or 0.1 would
+			// never equal the float32 0.1 a client actually sent.
+			f = float64(float32(f))
+		}
+		l.f = f
 	case protoreflect.EnumKind:
 		switch v := raw.(type) {
 		case string:
@@ -319,15 +342,54 @@ func literalFor(fd protoreflect.FieldDescriptor, raw any) (literal, error) {
 	return l, nil
 }
 
-func toInt64(raw any) (int64, bool) {
+// intLiteral converts a YAML numeric literal for a signed integer field,
+// rejecting values outside [min, max]. yaml.v3 yields int for most values
+// and uint64 for values above MaxInt64.
+func intLiteral(fd protoreflect.FieldDescriptor, raw any, min, max int64) (int64, error) {
+	var i int64
 	switch v := raw.(type) {
 	case int:
-		return int64(v), true
+		i = int64(v)
 	case int64:
-		return v, true
+		i = v
+	case uint64:
+		if v > math.MaxInt64 {
+			return 0, fmt.Errorf("literal %d overflows %s field %q", v, fd.Kind(), fd.Name())
+		}
+		i = int64(v)
 	default:
-		return 0, false
+		return 0, fmt.Errorf("field %q is an integer, got %T literal", fd.Name(), raw)
 	}
+	if i < min || i > max {
+		return 0, fmt.Errorf("literal %d is out of range for %s field %q [%d, %d]", i, fd.Kind(), fd.Name(), min, max)
+	}
+	return i, nil
+}
+
+// uintLiteral converts a YAML numeric literal for an unsigned integer field,
+// rejecting negatives and values above max.
+func uintLiteral(fd protoreflect.FieldDescriptor, raw any, max uint64) (uint64, error) {
+	var u uint64
+	switch v := raw.(type) {
+	case int:
+		if v < 0 {
+			return 0, fmt.Errorf("field %q is unsigned, got negative literal %d", fd.Name(), v)
+		}
+		u = uint64(v)
+	case int64:
+		if v < 0 {
+			return 0, fmt.Errorf("field %q is unsigned, got negative literal %d", fd.Name(), v)
+		}
+		u = uint64(v)
+	case uint64:
+		u = v
+	default:
+		return 0, fmt.Errorf("field %q is an unsigned integer, got %T literal", fd.Name(), raw)
+	}
+	if u > max {
+		return 0, fmt.Errorf("literal %d is out of range for %s field %q (max %d)", u, fd.Kind(), fd.Name(), max)
+	}
+	return u, nil
 }
 
 func (l literal) equal(v protoreflect.Value) bool {

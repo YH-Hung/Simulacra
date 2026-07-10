@@ -71,6 +71,15 @@ func TestEval(t *testing.T) {
 		{"metadata present", &Block{Metadata: map[string]Rules{"authorization": {"present": true}}}, req, metadata.Pairs("authorization", "Bearer x"), true},
 		{"metadata any-value semantics", &Block{Metadata: map[string]Rules{"x-tag": {"eq": "b"}}}, req, metadata.Pairs("x-tag", "a", "x-tag", "b"), true},
 		{"metadata regex", &Block{Metadata: map[string]Rules{"x-tenant": {"matches": "^ac"}}}, req, metadata.Pairs("x-tenant", "acme"), true},
+		// Numeric correctness: yaml.v3 hands big integers to us as uint64,
+		// and float32 fields must compare after float32 normalization.
+		{"uint64 full range", &Block{Message: map[string]Rules{"big": {"eq": uint64(18446744073709551615)}}}, `{"big":"18446744073709551615"}`, nil, true},
+		{"uint64 full range miss", &Block{Message: map[string]Rules{"big": {"eq": uint64(18446744073709551615)}}}, `{"big":"1"}`, nil, false},
+		{"uint64 small literal as int", &Block{Message: map[string]Rules{"big": {"eq": 7}}}, `{"big":"7"}`, nil, true},
+		{"float32 literal normalized", &Block{Message: map[string]Rules{"ratio": {"eq": 0.1}}}, `{"ratio":0.1}`, nil, true},
+		{"float32 int literal", &Block{Message: map[string]Rules{"ratio": {"eq": 2}}}, `{"ratio":2}`, nil, true},
+		{"double unaffected", &Block{Message: map[string]Rules{"precise": {"eq": 0.1}}}, `{"precise":0.1}`, nil, true},
+		{"int32 in range", &Block{Message: map[string]Rules{"small": {"eq": -42}}}, `{"small":-42}`, nil, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -103,6 +112,10 @@ func TestCompileErrors(t *testing.T) {
 		{"unknown enum name", &Block{Message: map[string]Rules{"customer.region": {"eq": "MARS"}}}},
 		{"type mismatch", &Block{Message: map[string]Rules{"order_id": {"eq": 42}}}},
 		{"metadata unknown op", &Block{Metadata: map[string]Rules{"k": {"has": true}}}},
+		{"int32 literal out of range", &Block{Message: map[string]Rules{"small": {"eq": int64(3000000000)}}}},
+		{"int32 literal below range", &Block{Message: map[string]Rules{"small": {"eq": int64(-3000000000)}}}},
+		{"negative literal on uint64", &Block{Message: map[string]Rules{"big": {"eq": -1}}}},
+		{"huge uint64 literal on signed field", &Block{Message: map[string]Rules{"small": {"eq": uint64(9999999999999999999)}}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
