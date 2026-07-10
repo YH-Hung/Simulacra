@@ -10,7 +10,7 @@ import (
 
 func TestCompileStatusWithPreconditionFailure(t *testing.T) {
 	reg := testRegistry(t)
-	got, err := compileStatus(reg, StatusSpec{
+	got, err := compileStatus(reg, &StatusSpec{
 		Code:    "FAILED_PRECONDITION",
 		Message: "customer must accept the terms",
 		Details: []DetailSpec{{
@@ -51,7 +51,7 @@ func TestCompileStatusWithPreconditionFailure(t *testing.T) {
 
 func TestCompileStatusPacksRegistryMessageDetail(t *testing.T) {
 	reg := testRegistry(t)
-	got, err := compileStatus(reg, StatusSpec{
+	got, err := compileStatus(reg, &StatusSpec{
 		Code: "NOT_FOUND",
 		Details: []DetailSpec{{
 			Type: "shop.v1.Customer",
@@ -76,10 +76,10 @@ func TestCompileStatusPacksRegistryMessageDetail(t *testing.T) {
 func TestCompileStatusRejectsOKUnlessAllowed(t *testing.T) {
 	reg := testRegistry(t)
 	spec := StatusSpec{Code: "OK", Message: "fine"}
-	if _, err := compileStatus(reg, spec, false); err == nil || !strings.Contains(err.Error(), "OK") {
+	if _, err := compileStatus(reg, &spec, false); err == nil || !strings.Contains(err.Error(), "OK") {
 		t.Fatalf("compileStatus(..., false) error = %v, want mention of OK", err)
 	}
-	got, err := compileStatus(reg, spec, true)
+	got, err := compileStatus(reg, &spec, true)
 	if err != nil {
 		t.Fatalf("compileStatus(..., true): %v", err)
 	}
@@ -112,7 +112,7 @@ func TestCompileStatusErrors(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := compileStatus(reg, tt.spec, false)
+			_, err := compileStatus(reg, &tt.spec, false)
 			if err == nil {
 				t.Fatal("compileStatus error = nil, want error")
 			}

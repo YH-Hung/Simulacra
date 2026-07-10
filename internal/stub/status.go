@@ -24,7 +24,7 @@ type DetailSpec struct {
 	Value map[string]any `yaml:"value"`
 }
 
-func compileStatus(reg *schema.Registry, spec StatusSpec, allowOK bool) (*status.Status, error) {
+func compileStatus(reg *schema.Registry, spec *StatusSpec, allowOK bool) (*status.Status, error) {
 	if spec.Code == "" {
 		return nil, fmt.Errorf("status code is required")
 	}
