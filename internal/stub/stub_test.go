@@ -99,3 +99,41 @@ func TestCompileErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildMessageResolvesAnyFromRegistry(t *testing.T) {
+	reg := testRegistry(t)
+	m, err := reg.LookupMethod("shop.v1.OrderService/GetOrder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := BuildMessage(reg.Types(), m.Output(), map[string]any{
+		"extra": map[string]any{
+			"@type":  "type.googleapis.com/shop.v1.Customer",
+			"id":     "c-1",
+			"region": "EU",
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildMessage with Any: %v", err)
+	}
+	out, err := (protojson.MarshalOptions{Resolver: reg.Types()}).Marshal(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"type.googleapis.com/shop.v1.Customer", `"c-1"`} {
+		if !strings.Contains(string(out), want) {
+			t.Errorf("marshaled %s missing %s", out, want)
+		}
+	}
+}
+
+func TestBuildMessageUnknownAnyTypeFails(t *testing.T) {
+	reg := testRegistry(t)
+	m, _ := reg.LookupMethod("shop.v1.OrderService/GetOrder")
+	_, err := BuildMessage(reg.Types(), m.Output(), map[string]any{
+		"extra": map[string]any{"@type": "type.googleapis.com/no.such.Type"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "no.such.Type") {
+		t.Errorf("err = %v, want mention of no.such.Type", err)
+	}
+}

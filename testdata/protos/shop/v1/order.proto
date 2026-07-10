@@ -3,6 +3,7 @@ syntax = "proto3";
 package shop.v1;
 
 import "google/protobuf/timestamp.proto";
+import "google/protobuf/any.proto";
 
 enum Region {
   REGION_UNSPECIFIED = 0;
@@ -43,6 +44,7 @@ message GetOrderResponse {
   OrderStatus status = 2;
   string note = 3;
   google.protobuf.Timestamp eta = 4;
+  google.protobuf.Any extra = 5;
 }
 
 service OrderService {

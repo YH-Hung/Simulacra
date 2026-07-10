@@ -121,3 +121,36 @@ func TestAddDescriptorSetFileRejectsGarbage(t *testing.T) {
 		t.Error("expected error for non-descriptor-set file")
 	}
 }
+
+func TestLookupMessage(t *testing.T) {
+	reg := NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), testProtoDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.LookupMessage("shop.v1.Customer"); err != nil {
+		t.Errorf("LookupMessage(shop.v1.Customer): %v", err)
+	}
+	if _, err := reg.LookupMessage("google.protobuf.FileDescriptorSet"); err != nil {
+		t.Errorf("LookupMessage(google.protobuf.FileDescriptorSet): %v", err)
+	}
+	if _, err := reg.LookupMessage("no.such.Type"); err == nil {
+		t.Error("expected error for unknown message type")
+	}
+	if _, err := reg.LookupMessage("shop.v1.OrderService"); err == nil {
+		t.Error("expected error for non-message descriptor")
+	}
+}
+
+func TestTypesResolvesRegistrySchemas(t *testing.T) {
+	reg := NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), testProtoDir); err != nil {
+		t.Fatal(err)
+	}
+	types := reg.Types()
+	if _, err := types.FindMessageByURL("type.googleapis.com/shop.v1.Customer"); err != nil {
+		t.Errorf("FindMessageByURL(shop.v1.Customer): %v", err)
+	}
+	if _, err := types.FindMessageByName("google.protobuf.FileDescriptorSet"); err != nil {
+		t.Errorf("FindMessageByName(FileDescriptorSet): %v", err)
+	}
+}

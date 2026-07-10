@@ -62,7 +62,7 @@ func Compile(reg *schema.Registry, s Stub, source string) (*Compiled, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", source, err)
 	}
-	resp, err := BuildMessage(m.Output(), s.Respond.Message)
+	resp, err := BuildMessage(reg.Types(), m.Output(), s.Respond.Message)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", source, err)
 	}
@@ -80,7 +80,7 @@ func Compile(reg *schema.Registry, s Stub, source string) (*Compiled, error) {
 // message via the canonical protobuf-JSON mapping (protojson), so enum
 // names, nested/repeated/map fields, 64-bit ints, and well-known types
 // (e.g. Timestamp as RFC 3339 strings) all behave per spec.
-func BuildMessage(desc protoreflect.MessageDescriptor, fields map[string]any) (*dynamicpb.Message, error) {
+func BuildMessage(types *schema.Types, desc protoreflect.MessageDescriptor, fields map[string]any) (*dynamicpb.Message, error) {
 	if fields == nil {
 		fields = map[string]any{}
 	}
@@ -89,7 +89,7 @@ func BuildMessage(desc protoreflect.MessageDescriptor, fields map[string]any) (*
 		return nil, fmt.Errorf("encoding response message as JSON: %w", err)
 	}
 	msg := dynamicpb.NewMessage(desc)
-	if err := protojson.Unmarshal(data, msg); err != nil {
+	if err := (protojson.UnmarshalOptions{Resolver: types}).Unmarshal(data, msg); err != nil {
 		return nil, fmt.Errorf("response message does not fit %s: %w", desc.FullName(), err)
 	}
 	return msg, nil

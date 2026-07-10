@@ -17,6 +17,7 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/descriptorpb"
+	"google.golang.org/protobuf/types/dynamicpb"
 )
 
 type Registry struct {
@@ -135,6 +136,59 @@ func (r *Registry) LookupMethod(fullMethod string) (protoreflect.MethodDescripto
 		return nil, fmt.Errorf("method %q not found on service %q", methodName, svcName)
 	}
 	return m, nil
+}
+
+// LookupMessage resolves a fully-qualified message name against the
+// registry's files, falling back to the process-global registry.
+func (r *Registry) LookupMessage(name string) (protoreflect.MessageDescriptor, error) {
+	full := protoreflect.FullName(name)
+	d, err := r.files.FindDescriptorByName(full)
+	if err != nil {
+		d, err = protoregistry.GlobalFiles.FindDescriptorByName(full)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("message type %q is not registered (add its .proto to a schema source)", name)
+	}
+	md, ok := d.(protoreflect.MessageDescriptor)
+	if !ok {
+		return nil, fmt.Errorf("%q is not a message type", name)
+	}
+	return md, nil
+}
+
+func (r *Registry) Types() *Types { return &Types{dyn: dynamicpb.NewTypes(r.files)} }
+
+// Types is a registry-first, global-fallback protobuf type resolver.
+type Types struct {
+	dyn *dynamicpb.Types
+}
+
+func (t *Types) FindMessageByName(n protoreflect.FullName) (protoreflect.MessageType, error) {
+	if mt, err := t.dyn.FindMessageByName(n); err == nil {
+		return mt, nil
+	}
+	return protoregistry.GlobalTypes.FindMessageByName(n)
+}
+
+func (t *Types) FindMessageByURL(url string) (protoreflect.MessageType, error) {
+	if mt, err := t.dyn.FindMessageByURL(url); err == nil {
+		return mt, nil
+	}
+	return protoregistry.GlobalTypes.FindMessageByURL(url)
+}
+
+func (t *Types) FindExtensionByName(field protoreflect.FullName) (protoreflect.ExtensionType, error) {
+	if et, err := t.dyn.FindExtensionByName(field); err == nil {
+		return et, nil
+	}
+	return protoregistry.GlobalTypes.FindExtensionByName(field)
+}
+
+func (t *Types) FindExtensionByNumber(message protoreflect.FullName, field protoreflect.FieldNumber) (protoreflect.ExtensionType, error) {
+	if et, err := t.dyn.FindExtensionByNumber(message, field); err == nil {
+		return et, nil
+	}
+	return protoregistry.GlobalTypes.FindExtensionByNumber(message, field)
 }
 
 // Services returns every service descriptor across all registered files.
