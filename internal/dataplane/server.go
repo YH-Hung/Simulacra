@@ -4,6 +4,7 @@
 package dataplane
 
 import (
+	"fmt"
 	"net"
 	"strings"
 
@@ -96,9 +97,26 @@ func (s *Server) handleUnknown(_ any, stream grpc.ServerStream) error {
 	in := match.Input{Method: strings.TrimPrefix(full, "/"), Metadata: md, Message: req.ProtoReflect()}
 	selected := s.store.Select(full, in)
 	if selected == nil {
-		return status.Errorf(codes.NotFound,
-			"simulacra: no stub matched %s (%d stub(s) registered for this method)",
-			full, s.store.CountFor(full))
+		return s.noMatch(full, in)
 	}
 	return stream.SendMsg(selected.Response())
+}
+
+func (s *Server) noMatch(full string, in match.Input) error {
+	message := fmt.Sprintf(
+		"simulacra: no stub matched %s (%d stub(s) registered for this method)",
+		full, s.store.CountFor(full),
+	)
+	misses := s.store.Explain(full, in)
+	limit := len(misses)
+	if limit > 3 {
+		limit = 3
+	}
+	for _, miss := range misses[:limit] {
+		message += fmt.Sprintf("; %s (priority %d): %s", miss.Source, miss.Priority, strings.Join(miss.Reasons, "; "))
+	}
+	if len(misses) > limit {
+		message += "; …"
+	}
+	return status.Error(codes.NotFound, message)
 }

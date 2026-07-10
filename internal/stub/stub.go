@@ -43,6 +43,11 @@ func (c *Compiled) Matches(in match.Input) bool {
 	return c.matcher.Eval(in)
 }
 
+// Explain returns every matcher clause that rejects the input.
+func (c *Compiled) Explain(in match.Input) []string {
+	return c.matcher.Explain(in)
+}
+
 // Response returns the pre-built response message. It is shared across
 // calls and must be treated as read-only.
 func (c *Compiled) Response() *dynamicpb.Message { return c.response }

@@ -123,6 +123,9 @@ func TestUnaryNoStubMatched(t *testing.T) {
 	if !strings.Contains(st.Message(), "1 stub") {
 		t.Errorf("message %q should mention how many stubs exist for the method", st.Message())
 	}
+	if !strings.Contains(st.Message(), "x-tenant") {
+		t.Errorf("message %q should include the nearest-miss metadata detail", st.Message())
+	}
 }
 
 func TestUnknownMethodIsUnimplemented(t *testing.T) {

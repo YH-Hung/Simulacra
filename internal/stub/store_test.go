@@ -1,6 +1,7 @@
 package stub
 
 import (
+	"strings"
 	"testing"
 
 	"google.golang.org/protobuf/encoding/protojson"
@@ -78,5 +79,61 @@ func TestSelectNoMatch(t *testing.T) {
 	req := request(t, reg, `{"order_id":"o-123"}`)
 	if got := store.Select(method, match.Input{Message: req.ProtoReflect()}); got != nil {
 		t.Fatalf("Select = %v, want nil for non-matching request", got)
+	}
+}
+
+func TestExplainRanksNearestMiss(t *testing.T) {
+	reg := testRegistry(t)
+	twoWrong := compiled(t, reg, Stub{
+		Method: "shop.v1.OrderService/GetOrder",
+		Match: &match.Block{
+			Metadata: map[string]match.Rules{"x-tenant": {"eq": "acme"}},
+			Message:  map[string]match.Rules{"order_id": {"eq": "o-999"}},
+		},
+		Priority: 20,
+	})
+	twoWrong.Source = "two-wrong.yaml#0"
+	oneWrong := compiled(t, reg, Stub{
+		Method:   "shop.v1.OrderService/GetOrder",
+		Match:    &match.Block{Message: map[string]match.Rules{"order_id": {"eq": "o-777"}}},
+		Priority: 10,
+	})
+	oneWrong.Source = "one-wrong.yaml#0"
+	spent := compiled(t, reg, Stub{
+		Method:   "shop.v1.OrderService/GetOrder",
+		Priority: 30,
+		Times:    1,
+	})
+	spent.Source = "spent.yaml#0"
+
+	store := NewStore([]*Compiled{twoWrong, oneWrong, spent})
+	in := match.Input{Message: request(t, reg, `{"order_id":"o-123"}`).ProtoReflect()}
+	if got := store.Select(method, in); got != spent {
+		t.Fatalf("Select = %v, want catch-all stub", got)
+	}
+
+	misses := store.Explain(method, in)
+	if len(misses) != 3 {
+		t.Fatalf("Explain returned %d misses, want 3: %#v", len(misses), misses)
+	}
+	for i := 1; i < len(misses); i++ {
+		if len(misses[i-1].Reasons) > len(misses[i].Reasons) {
+			t.Errorf("misses are not sorted by reason count: %#v", misses)
+		}
+	}
+	if misses[2].Source != twoWrong.Source || len(misses[2].Reasons) != 2 {
+		t.Errorf("last miss = %#v, want the two-reason candidate", misses[2])
+	}
+	var sawSpent, sawOneWrong bool
+	for _, miss := range misses {
+		switch miss.Source {
+		case spent.Source:
+			sawSpent = len(miss.Reasons) == 1 && strings.Contains(miss.Reasons[0], "times budget exhausted")
+		case oneWrong.Source:
+			sawOneWrong = len(miss.Reasons) == 1 && strings.Contains(miss.Reasons[0], "order_id")
+		}
+	}
+	if !sawSpent || !sawOneWrong {
+		t.Errorf("Explain misses = %#v, want exhausted and one-rule misses", misses)
 	}
 }

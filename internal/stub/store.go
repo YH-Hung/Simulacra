@@ -1,6 +1,7 @@
 package stub
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 
@@ -18,6 +19,13 @@ type Store struct {
 type entry struct {
 	stub *Compiled
 	used int
+}
+
+// Miss describes why one registered stub did not select for a request.
+type Miss struct {
+	Source   string
+	Priority int
+	Reasons  []string
 }
 
 func NewStore(stubs []*Compiled) *Store {
@@ -47,6 +55,33 @@ func (s *Store) Select(method string, in match.Input) *Compiled {
 		}
 	}
 	return nil
+}
+
+// Explain ranks the registered stubs that miss an input by ascending number
+// of failed clauses. It is diagnostic only and never consumes a times budget.
+func (s *Store) Explain(method string, in match.Input) []Miss {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var misses []Miss
+	for _, e := range s.byMethod[method] {
+		reasons := e.stub.Explain(in)
+		if e.stub.Times > 0 && e.used >= e.stub.Times {
+			reasons = append(reasons, fmt.Sprintf("times budget exhausted (%d/%d used)", e.used, e.stub.Times))
+		}
+		if len(reasons) == 0 {
+			continue
+		}
+		misses = append(misses, Miss{
+			Source:   e.stub.Source,
+			Priority: e.stub.Priority,
+			Reasons:  reasons,
+		})
+	}
+	sort.SliceStable(misses, func(i, j int) bool {
+		return len(misses[i].Reasons) < len(misses[j].Reasons)
+	})
+	return misses
 }
 
 // CountFor reports how many stubs are registered for a method (regardless

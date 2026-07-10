@@ -158,6 +158,7 @@ type msgRule struct {
 // literal is a stub-file literal pre-converted to the leaf field's kind.
 type literal struct {
 	kind protoreflect.Kind
+	src  string
 	str  string
 	b    bool
 	i    int64
@@ -421,7 +422,7 @@ func compileMsgRule(path []protoreflect.FieldDescriptor, op string, raw any) (ms
 
 func literalFor(fd protoreflect.FieldDescriptor, raw any) (literal, error) {
 	k := fd.Kind()
-	l := literal{kind: k}
+	l := literal{kind: k, src: fmt.Sprintf("%v", raw)}
 	switch k {
 	case protoreflect.StringKind:
 		s, ok := raw.(string)
