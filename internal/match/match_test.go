@@ -8,6 +8,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/dynamicpb"
 
 	"github.com/yinghanhung/simulacra/internal/schema"
@@ -168,5 +169,102 @@ func TestEvalNilMessageFailsMessageRules(t *testing.T) {
 	}
 	if c.Eval(Input{}) {
 		t.Error("message rule matched an input with no message")
+	}
+}
+
+func testFiles(t *testing.T) *protoregistry.Files {
+	t.Helper()
+	reg := schema.NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), "../../testdata/protos"); err != nil {
+		t.Fatal(err)
+	}
+	return reg.Files()
+}
+
+func TestExprMatching(t *testing.T) {
+	desc := requestDesc(t)
+	mc := NewCompiler(testFiles(t))
+	req := `{
+		"order_id": "o-123",
+		"customer": {"id": "c-9", "region": "EU"},
+		"items": [{"sku": "A1", "qty": "3"}, {"sku": "B2", "qty": "1"}],
+		"tags": ["prio", "gift"]
+	}`
+	cases := []struct {
+		name string
+		expr string
+		md   metadata.MD
+		want bool
+	}{
+		{"compound predicate", `message.items.exists(i, i.sku == "A1") && size(message.items) <= 10`, nil, true},
+		{"compound predicate miss", `message.items.exists(i, i.sku == "ZZ")`, nil, false},
+		{"int64 arithmetic", `message.items[0].qty * 2 == 6`, nil, true},
+		{"enum comparison", `message.customer.region == shop.v1.Region.EU`, nil, true},
+		{"metadata multi-value", `'acme' in metadata['x-tenant']`, metadata.Pairs("x-tenant", "other", "x-tenant", "acme"), true},
+		{"metadata guard", `'x-tenant' in metadata && 'acme' in metadata['x-tenant']`, nil, false},
+		{"method variable", `method == "shop.v1.OrderService/GetOrder"`, nil, true},
+		{"eval error is a non-match", `metadata['absent-key'][0] == "x"`, nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := mc.Compile(desc, &Block{Expr: tc.expr}, Unary)
+			if err != nil {
+				t.Fatalf("Compile: %v", err)
+			}
+			in := Input{Method: "shop.v1.OrderService/GetOrder", Metadata: tc.md, Message: msg(t, desc, req)}
+			if got := c.Eval(in); got != tc.want {
+				t.Errorf("Eval = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestExprMessagesForClientStream(t *testing.T) {
+	desc := requestDesc(t)
+	mc := NewCompiler(testFiles(t))
+	c, err := mc.Compile(desc, &Block{Expr: `size(messages) == 2 && messages.exists(m, m.order_id == "o-1")`}, ClientStream)
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	in := Input{Messages: []protoreflect.Message{
+		msg(t, desc, `{"order_id":"o-1"}`),
+		msg(t, desc, `{"order_id":"o-2"}`),
+	}}
+	if !c.Eval(in) {
+		t.Error("Eval = false, want true")
+	}
+	if c.Eval(Input{Messages: in.Messages[:1]}) {
+		t.Error("Eval with one message = true, want false")
+	}
+}
+
+func TestExprCompileErrors(t *testing.T) {
+	desc := requestDesc(t)
+	mc := NewCompiler(testFiles(t))
+	cases := []struct {
+		name  string
+		expr  string
+		shape Shape
+	}{
+		{"not a bool", `size(message.items)`, Unary},
+		{"unknown field", `message.no_such_field == 1`, Unary},
+		{"syntax error", `message.order_id ==`, Unary},
+		{"message var absent for client-streaming", `message.order_id == "x"`, ClientStream},
+		{"messages var absent for unary", `size(messages) > 0`, Unary},
+		{"message var absent at bidi open", `message.order_id == "x"`, Bidi},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := mc.Compile(desc, &Block{Expr: tc.expr}, tc.shape); err == nil {
+				t.Error("expected compile error, got nil")
+			}
+		})
+	}
+}
+
+func TestExprWithoutFilesFails(t *testing.T) {
+	desc := requestDesc(t)
+	if _, err := NewCompiler(nil).Compile(desc, &Block{Expr: `true`}, Unary); err == nil {
+		t.Error("expected error compiling expr without descriptor files")
 	}
 }

@@ -10,7 +10,11 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/google/cel-go/cel"
+	"github.com/google/cel-go/common/types"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
@@ -64,6 +68,13 @@ type Input struct {
 
 type Compiler struct {
 	files *protoregistry.Files
+	mu    sync.Mutex
+	envs  map[envKey]*cel.Env
+}
+
+type envKey struct {
+	msg   protoreflect.FullName
+	shape Shape
 }
 
 func NewCompiler(files *protoregistry.Files) *Compiler { return &Compiler{files: files} }
@@ -72,6 +83,7 @@ func NewCompiler(files *protoregistry.Files) *Compiler { return &Compiler{files:
 type Block struct {
 	Metadata map[string]Rules `yaml:"metadata"`
 	Message  map[string]Rules `yaml:"message"`
+	Expr     string           `yaml:"expr"`
 }
 
 // Rules maps an operator name (eq, ne, in, matches, present, contains) to its literal.
@@ -80,6 +92,49 @@ type Rules map[string]any
 type Compiled struct {
 	metadata []mdRule
 	message  []msgRule
+	expr     *exprRule
+}
+
+type exprRule struct {
+	prg cel.Program
+	src string
+}
+
+func (c *Compiler) Env(input protoreflect.MessageDescriptor, shape Shape) (*cel.Env, error) {
+	if c.files == nil {
+		return nil, fmt.Errorf("CEL is unavailable: match compiler was built without descriptor files")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.envs == nil {
+		c.envs = map[envKey]*cel.Env{}
+	}
+	key := envKey{input.FullName(), shape}
+	if env, ok := c.envs[key]; ok {
+		return env, nil
+	}
+	obj := cel.ObjectType(string(input.FullName()))
+	opts := []cel.EnvOption{
+		cel.TypeDescs(c.files),
+		cel.Variable("metadata", cel.MapType(cel.StringType, cel.ListType(cel.StringType))),
+		cel.Variable("method", cel.StringType),
+		cel.Variable("now", cel.TimestampType),
+	}
+	switch shape {
+	case Unary, ServerStream:
+		opts = append(opts, cel.Variable("message", obj))
+	case ClientStream:
+		opts = append(opts, cel.Variable("messages", cel.ListType(obj)))
+	case BidiRule:
+		opts = append(opts, cel.Variable("message", obj), cel.Variable("messages", cel.ListType(obj)))
+	case Bidi:
+	}
+	env, err := cel.NewEnv(opts...)
+	if err != nil {
+		return nil, fmt.Errorf("building CEL environment for %s: %w", input.FullName(), err)
+	}
+	c.envs[key] = env
+	return env, nil
 }
 
 type mdRule struct {
@@ -143,6 +198,24 @@ func (c *Compiler) Compile(input protoreflect.MessageDescriptor, b *Block, shape
 			cmp.message = append(cmp.message, r)
 		}
 	}
+	if b.Expr != "" {
+		env, err := c.Env(input, shape)
+		if err != nil {
+			return nil, err
+		}
+		ast, iss := env.Compile(b.Expr)
+		if iss.Err() != nil {
+			return nil, fmt.Errorf("expr: %w", iss.Err())
+		}
+		if !ast.OutputType().IsExactType(cel.BoolType) {
+			return nil, fmt.Errorf("expr must evaluate to a bool, got %s: %s", ast.OutputType(), b.Expr)
+		}
+		prg, err := env.Program(ast)
+		if err != nil {
+			return nil, fmt.Errorf("expr: %w", err)
+		}
+		cmp.expr = &exprRule{prg: prg, src: b.Expr}
+	}
 	return cmp, nil
 }
 
@@ -160,7 +233,32 @@ func (c *Compiled) Eval(in Input) bool {
 			return false
 		}
 	}
+	if c.expr != nil {
+		out, _, err := c.expr.prg.Eval(Activation(in))
+		if err != nil || out != types.True {
+			return false
+		}
+	}
 	return true
+}
+
+func Activation(in Input) map[string]any {
+	md := map[string][]string{}
+	for k, v := range in.Metadata {
+		md[k] = v
+	}
+	act := map[string]any{"metadata": md, "method": in.Method, "now": time.Now()}
+	if in.Message != nil {
+		act["message"] = in.Message.Interface()
+	}
+	if in.Messages != nil {
+		msgs := make([]any, len(in.Messages))
+		for i, m := range in.Messages {
+			msgs[i] = m.Interface()
+		}
+		act["messages"] = msgs
+	}
+	return act
 }
 
 // --- metadata rules ---
