@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/yinghanhung/simulacra/internal/match"
 )
@@ -26,6 +27,11 @@ type Miss struct {
 	Source   string
 	Priority int
 	Reasons  []string
+}
+
+type candidateSnapshot struct {
+	stub *Compiled
+	used int
 }
 
 func NewStore(stubs []*Compiled) *Store {
@@ -57,24 +63,59 @@ func (s *Store) Select(method string, in match.Input) *Compiled {
 	return nil
 }
 
+// SelectOrExplain atomically selects a live stub or snapshots the failed
+// selection for diagnostics. Matcher explanations run after releasing the
+// store lock and use the same timestamp as the selection attempt.
+func (s *Store) SelectOrExplain(method string, in match.Input) (*Compiled, []Miss) {
+	in = inputWithTime(in)
+	s.mu.Lock()
+	for _, e := range s.byMethod[method] {
+		if e.stub.Times > 0 && e.used >= e.stub.Times {
+			continue
+		}
+		if e.stub.Matches(in) {
+			e.used++
+			s.mu.Unlock()
+			return e.stub, nil
+		}
+	}
+	snapshot := s.snapshotLocked(method)
+	s.mu.Unlock()
+	return nil, explainSnapshot(snapshot, in)
+}
+
 // Explain ranks the registered stubs that miss an input by ascending number
 // of failed clauses. It is diagnostic only and never consumes a times budget.
 func (s *Store) Explain(method string, in match.Input) []Miss {
+	in = inputWithTime(in)
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	snapshot := s.snapshotLocked(method)
+	s.mu.Unlock()
+	return explainSnapshot(snapshot, in)
+}
 
+func (s *Store) snapshotLocked(method string) []candidateSnapshot {
+	entries := s.byMethod[method]
+	snapshot := make([]candidateSnapshot, len(entries))
+	for i, e := range entries {
+		snapshot[i] = candidateSnapshot{stub: e.stub, used: e.used}
+	}
+	return snapshot
+}
+
+func explainSnapshot(snapshot []candidateSnapshot, in match.Input) []Miss {
 	var misses []Miss
-	for _, e := range s.byMethod[method] {
-		reasons := e.stub.Explain(in)
-		if e.stub.Times > 0 && e.used >= e.stub.Times {
-			reasons = append(reasons, fmt.Sprintf("times budget exhausted (%d/%d used)", e.used, e.stub.Times))
+	for _, candidate := range snapshot {
+		reasons := candidate.stub.Explain(in)
+		if candidate.stub.Times > 0 && candidate.used >= candidate.stub.Times {
+			reasons = append(reasons, fmt.Sprintf("times budget exhausted (%d/%d used)", candidate.used, candidate.stub.Times))
 		}
 		if len(reasons) == 0 {
 			continue
 		}
 		misses = append(misses, Miss{
-			Source:   e.stub.Source,
-			Priority: e.stub.Priority,
+			Source:   candidate.stub.Source,
+			Priority: candidate.stub.Priority,
 			Reasons:  reasons,
 		})
 	}
@@ -82,6 +123,13 @@ func (s *Store) Explain(method string, in match.Input) []Miss {
 		return len(misses[i].Reasons) < len(misses[j].Reasons)
 	})
 	return misses
+}
+
+func inputWithTime(in match.Input) match.Input {
+	if in.Now.IsZero() {
+		in.Now = time.Now()
+	}
+	return in
 }
 
 // CountFor reports how many stubs are registered for a method (regardless

@@ -64,6 +64,7 @@ type Input struct {
 	Metadata metadata.MD
 	Message  protoreflect.Message
 	Messages []protoreflect.Message
+	Now      time.Time
 }
 
 type Compiler struct {
@@ -177,8 +178,10 @@ func (c *Compiler) Compile(input protoreflect.MessageDescriptor, b *Block, shape
 	if len(b.Message) > 0 && (shape == ClientStream || shape == Bidi) {
 		return nil, fmt.Errorf("message field matchers are not valid for %s stubs (there is no single request message); use expr over `messages` instead", shape)
 	}
-	for key, rules := range b.Metadata {
-		for op, raw := range rules {
+	for _, key := range sortedKeys(b.Metadata) {
+		rules := b.Metadata[key]
+		for _, op := range sortedKeys(rules) {
+			raw := rules[op]
 			r, err := compileMDRule(strings.ToLower(key), op, raw)
 			if err != nil {
 				return nil, fmt.Errorf("metadata %q: %w", key, err)
@@ -186,12 +189,14 @@ func (c *Compiler) Compile(input protoreflect.MessageDescriptor, b *Block, shape
 			cmp.metadata = append(cmp.metadata, r)
 		}
 	}
-	for path, rules := range b.Message {
+	for _, path := range sortedKeys(b.Message) {
+		rules := b.Message[path]
 		fds, err := resolvePath(input, path)
 		if err != nil {
 			return nil, err
 		}
-		for op, raw := range rules {
+		for _, op := range sortedKeys(rules) {
+			raw := rules[op]
 			r, err := compileMsgRule(fds, op, raw)
 			if err != nil {
 				return nil, fmt.Errorf("message field %q: %w", path, err)
@@ -218,6 +223,15 @@ func (c *Compiler) Compile(input protoreflect.MessageDescriptor, b *Block, shape
 		cmp.expr = &exprRule{prg: prg, src: b.Expr}
 	}
 	return cmp, nil
+}
+
+func sortedKeys[V any](values map[string]V) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	return keys
 }
 
 func (c *Compiled) Eval(in Input) bool {
@@ -248,7 +262,11 @@ func Activation(in Input) map[string]any {
 	for k, v := range in.Metadata {
 		md[k] = v
 	}
-	act := map[string]any{"metadata": md, "method": in.Method, "now": time.Now()}
+	now := in.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	act := map[string]any{"metadata": md, "method": in.Method, "now": now}
 	if in.Message != nil {
 		act["message"] = in.Message.Interface()
 	}

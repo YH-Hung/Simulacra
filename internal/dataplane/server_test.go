@@ -19,6 +19,7 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/dynamicpb"
 
+	"github.com/yinghanhung/simulacra/internal/match"
 	"github.com/yinghanhung/simulacra/internal/schema"
 	"github.com/yinghanhung/simulacra/internal/stub"
 )
@@ -125,6 +126,56 @@ func TestUnaryNoStubMatched(t *testing.T) {
 	}
 	if !strings.Contains(st.Message(), "x-tenant") {
 		t.Errorf("message %q should include the nearest-miss metadata detail", st.Message())
+	}
+}
+
+func TestNoMatchFormatsTopThreeAndEllipsis(t *testing.T) {
+	const full = "/shop.v1.OrderService/GetOrder"
+	reg := schema.NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), "../../testdata/protos"); err != nil {
+		t.Fatal(err)
+	}
+	var stubs []*stub.Compiled
+	for i, tc := range []struct {
+		source   string
+		priority int
+		orderID  string
+	}{
+		{"first", 40, "o-1"},
+		{"second", 30, "o-2"},
+		{"third", 20, "o-3"},
+		{"fourth", 10, "o-4"},
+	} {
+		compiled, err := stub.Compile(reg, stub.Stub{
+			Method:   "shop.v1.OrderService/GetOrder",
+			Priority: tc.priority,
+			Match:    &match.Block{Message: map[string]match.Rules{"order_id": {"eq": tc.orderID}}},
+		}, tc.source)
+		if err != nil {
+			t.Fatalf("Compile stub %d: %v", i, err)
+		}
+		stubs = append(stubs, compiled)
+	}
+	store := stub.NewStore(stubs)
+	methodDesc, err := reg.LookupMethod(full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := dynamicpb.NewMessage(methodDesc.Input())
+	if err := protojson.Unmarshal([]byte(`{"order_id":"actual"}`), request); err != nil {
+		t.Fatal(err)
+	}
+	in := match.Input{Method: strings.TrimPrefix(full, "/"), Message: request.ProtoReflect()}
+	server := &Server{store: store}
+
+	selected, misses := store.SelectOrExplain(full, in)
+	if selected != nil {
+		t.Fatalf("SelectOrExplain selected %v, want nearest misses", selected)
+	}
+	message := status.Convert(server.noMatch(full, misses)).Message()
+	want := `simulacra: no stub matched /shop.v1.OrderService/GetOrder (4 stub(s) registered for this method); first (priority 40): message order_id: expected to equal "o-1"; actual "actual"; second (priority 30): message order_id: expected to equal "o-2"; actual "actual"; third (priority 20): message order_id: expected to equal "o-3"; actual "actual"; …`
+	if message != want {
+		t.Fatalf("no-match message:\n got: %s\nwant: %s", message, want)
 	}
 }
 

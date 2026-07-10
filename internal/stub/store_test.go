@@ -1,7 +1,9 @@
 package stub
 
 import (
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"google.golang.org/protobuf/encoding/protojson"
@@ -135,5 +137,102 @@ func TestExplainRanksNearestMiss(t *testing.T) {
 	}
 	if !sawSpent || !sawOneWrong {
 		t.Errorf("Explain misses = %#v, want exhausted and one-rule misses", misses)
+	}
+}
+
+func TestExplainStableTiesAndDoesNotConsumeBudget(t *testing.T) {
+	reg := testRegistry(t)
+	makeMiss := func(source, orderID string, priority int) *Compiled {
+		stub := compiled(t, reg, Stub{
+			Method:   "shop.v1.OrderService/GetOrder",
+			Match:    &match.Block{Message: map[string]match.Rules{"order_id": {"eq": orderID}}},
+			Priority: priority,
+		})
+		stub.Source = source
+		return stub
+	}
+	first := makeMiss("first", "o-first", 10)
+	high := makeMiss("high", "o-high", 20)
+	second := makeMiss("second", "o-second", 10)
+	store := NewStore([]*Compiled{first, high, second})
+	in := match.Input{Message: request(t, reg, `{"order_id":"actual"}`).ProtoReflect()}
+
+	misses := store.Explain(method, in)
+	gotSources := make([]string, len(misses))
+	for i, miss := range misses {
+		gotSources[i] = miss.Source
+	}
+	if want := []string{"high", "first", "second"}; !reflect.DeepEqual(gotSources, want) {
+		t.Fatalf("equal-distance miss order = %v, want %v", gotSources, want)
+	}
+
+	limited := compiled(t, reg, Stub{
+		Method: "shop.v1.OrderService/GetOrder",
+		Match:  &match.Block{Message: map[string]match.Rules{"order_id": {"eq": "actual"}}},
+		Times:  1,
+	})
+	budgetStore := NewStore([]*Compiled{limited})
+	if reasons := budgetStore.Explain(method, in); reasons != nil {
+		t.Fatalf("Explain for a live match = %#v, want nil", reasons)
+	}
+	if got := budgetStore.Select(method, in); got != limited {
+		t.Fatalf("Select after Explain = %v, want the unconsumed limited stub", got)
+	}
+	if got := budgetStore.Select(method, in); got != nil {
+		t.Fatalf("second Select = %v, want exhausted budget", got)
+	}
+}
+
+func TestSelectOrExplainSnapshotsConcurrentLastBudget(t *testing.T) {
+	reg := testRegistry(t)
+	limited := compiled(t, reg, Stub{
+		Method: "shop.v1.OrderService/GetOrder",
+		Times:  1,
+	})
+	limited.Source = "limited"
+	store := NewStore([]*Compiled{limited})
+
+	type result struct {
+		selected *Compiled
+		misses   []Miss
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			selected, misses := store.SelectOrExplain(method, match.Input{})
+			results <- result{selected: selected, misses: misses}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	selectedCount := 0
+	missCount := 0
+	for got := range results {
+		if got.selected != nil {
+			selectedCount++
+			if got.selected != limited || got.misses != nil {
+				t.Errorf("selected result = %#v, want limited stub and no misses", got)
+			}
+			continue
+		}
+		missCount++
+		want := []Miss{{
+			Source:   "limited",
+			Priority: 0,
+			Reasons:  []string{"times budget exhausted (1/1 used)"},
+		}}
+		if !reflect.DeepEqual(got.misses, want) {
+			t.Errorf("losing result misses = %#v, want %#v", got.misses, want)
+		}
+	}
+	if selectedCount != 1 || missCount != 1 {
+		t.Fatalf("selected results = %d, miss results = %d; want one of each", selectedCount, missCount)
 	}
 }

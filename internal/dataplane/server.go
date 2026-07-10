@@ -95,19 +95,18 @@ func (s *Server) handleUnknown(_ any, stream grpc.ServerStream) error {
 	md, _ := metadata.FromIncomingContext(stream.Context())
 
 	in := match.Input{Method: strings.TrimPrefix(full, "/"), Metadata: md, Message: req.ProtoReflect()}
-	selected := s.store.Select(full, in)
+	selected, misses := s.store.SelectOrExplain(full, in)
 	if selected == nil {
-		return s.noMatch(full, in)
+		return s.noMatch(full, misses)
 	}
 	return stream.SendMsg(selected.Response())
 }
 
-func (s *Server) noMatch(full string, in match.Input) error {
+func (s *Server) noMatch(full string, misses []stub.Miss) error {
 	message := fmt.Sprintf(
 		"simulacra: no stub matched %s (%d stub(s) registered for this method)",
 		full, s.store.CountFor(full),
 	)
-	misses := s.store.Explain(full, in)
 	limit := len(misses)
 	if limit > 3 {
 		limit = 3
