@@ -6,7 +6,7 @@
 
 **Architecture:** One gRPC server whose only handler is grpc-go's `UnknownServiceHandler`; every request is decoded into a `dynamicpb` message against a schema registry built at startup (runtime-compiled `.proto` trees via `bufbuild/protocompile`, or descriptor-set files), matched against compiled YAML stubs, and answered with a pre-built dynamic response message. Reflection and health are served so standard tooling works out of the box.
 
-**Tech Stack:** Go 1.24, `google.golang.org/grpc`, `google.golang.org/protobuf` (`dynamicpb`, `protoreflect`, `protojson`), `github.com/bufbuild/protocompile`, `gopkg.in/yaml.v3`, `github.com/spf13/cobra`. Tests use the standard library only.
+**Tech Stack:** Go 1.25, `google.golang.org/grpc`, `google.golang.org/protobuf` (`dynamicpb`, `protoreflect`, `protojson`), `github.com/bufbuild/protocompile`, `gopkg.in/yaml.v3`, `github.com/spf13/cobra`. Tests use the standard library only.
 
 **Reference:** `PROPOSAL.md` §4 (architecture), §5 (stub model — M1 implements the structured-matcher subset), §6 (schema management — proto dirs + descriptor sets only in M1), §12 (roadmap M1 row).
 
@@ -2403,7 +2403,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          go-version: "1.25"
       - run: go build ./...
       - run: go vet ./...
       - run: go test -race ./...
