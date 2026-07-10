@@ -320,7 +320,11 @@ func literalFor(fd protoreflect.FieldDescriptor, raw any) (literal, error) {
 			// The wire value is a float32; protoreflect widens it back to
 			// float64. Normalize the literal the same way or 0.1 would
 			// never equal the float32 0.1 a client actually sent.
-			f = float64(float32(f))
+			f32 := float64(float32(f))
+			if math.IsInf(f32, 0) && !math.IsInf(f, 0) {
+				return l, fmt.Errorf("literal %v overflows float (float32) field %q; use .inf to match infinity", f, fd.Name())
+			}
+			f = f32
 		}
 		l.f = f
 	case protoreflect.EnumKind:
@@ -331,8 +335,15 @@ func literalFor(fd protoreflect.FieldDescriptor, raw any) (literal, error) {
 				return l, fmt.Errorf("enum %s has no value named %q", fd.Enum().FullName(), v)
 			}
 			l.enum = ev.Number()
-		case int:
-			l.enum = protoreflect.EnumNumber(v)
+		case int, int64, uint64:
+			// EnumNumber is int32-backed; range-check like any int32 so
+			// out-of-range numbers fail instead of wrapping. Proto3 enums
+			// are open, so any in-range number stays matchable.
+			n, err := intLiteral(fd, v, math.MinInt32, math.MaxInt32)
+			if err != nil {
+				return l, err
+			}
+			l.enum = protoreflect.EnumNumber(n)
 		default:
 			return l, fmt.Errorf("field %q is an enum, got %T literal", fd.Name(), raw)
 		}

@@ -2,6 +2,7 @@ package match
 
 import (
 	"context"
+	"math"
 	"testing"
 
 	"google.golang.org/grpc/metadata"
@@ -80,6 +81,12 @@ func TestEval(t *testing.T) {
 		{"float32 int literal", &Block{Message: map[string]Rules{"ratio": {"eq": 2}}}, `{"ratio":2}`, nil, true},
 		{"double unaffected", &Block{Message: map[string]Rules{"precise": {"eq": 0.1}}}, `{"precise":0.1}`, nil, true},
 		{"int32 in range", &Block{Message: map[string]Rules{"small": {"eq": -42}}}, `{"small":-42}`, nil, true},
+		{"enum by number", &Block{Message: map[string]Rules{"customer.region": {"eq": 1}}}, req, nil, true},
+		// Proto3 enums are open: an in-range number with no declared name is
+		// legal on the wire and must be matchable.
+		{"enum by undeclared number", &Block{Message: map[string]Rules{"customer.region": {"eq": 42}}}, `{"customer":{"region":42}}`, nil, true},
+		// Explicit infinity is a legitimate float value a client can send.
+		{"explicit inf on float32", &Block{Message: map[string]Rules{"ratio": {"eq": math.Inf(1)}}}, `{"ratio":"Infinity"}`, nil, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -116,6 +123,12 @@ func TestCompileErrors(t *testing.T) {
 		{"int32 literal below range", &Block{Message: map[string]Rules{"small": {"eq": int64(-3000000000)}}}},
 		{"negative literal on uint64", &Block{Message: map[string]Rules{"big": {"eq": -1}}}},
 		{"huge uint64 literal on signed field", &Block{Message: map[string]Rules{"small": {"eq": uint64(9999999999999999999)}}}},
+		// yaml.v3 hands 4294967296 over as int (fits in 64-bit int), which
+		// previously wrapped through the int32-backed EnumNumber to 0.
+		{"enum number wraps int32", &Block{Message: map[string]Rules{"customer.region": {"eq": 4294967296}}}},
+		{"enum number negative overflow", &Block{Message: map[string]Rules{"customer.region": {"eq": -4294967296}}}},
+		{"enum number huge uint64", &Block{Message: map[string]Rules{"customer.region": {"eq": uint64(9999999999999999999)}}}},
+		{"finite float literal overflows float32", &Block{Message: map[string]Rules{"ratio": {"eq": 1e100}}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
