@@ -63,7 +63,13 @@ func (s *Server) GetServiceInfo() map[string]grpc.ServiceInfo {
 }
 
 func (s *Server) Serve(lis net.Listener) error { return s.grpc.Serve(lis) }
-func (s *Server) GracefulStop()                { s.grpc.GracefulStop() }
+
+// GracefulStop waits for in-flight RPCs — including open streams — so it
+// can block indefinitely. Callers that need a bound must fall back to Stop.
+func (s *Server) GracefulStop() { s.grpc.GracefulStop() }
+
+// Stop aborts all connections immediately.
+func (s *Server) Stop() { s.grpc.Stop() }
 
 func (s *Server) handleUnknown(_ any, stream grpc.ServerStream) error {
 	full, ok := grpc.MethodFromServerStream(stream)

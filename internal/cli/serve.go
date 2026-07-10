@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -41,13 +42,10 @@ func newServeCmd() *cobra.Command {
 			cmd.Printf("  %d service(s) registered, %d stub(s) loaded — reflection and health enabled\n",
 				len(reg.Services()), len(stubs))
 
-			sig := make(chan os.Signal, 1)
+			sig := make(chan os.Signal, 2)
 			signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-			go func() {
-				<-sig
-				cmd.Println("simulacra: shutting down")
-				srv.GracefulStop()
-			}()
+			defer signal.Stop(sig)
+			go waitAndShutdown(sig, 10*time.Second, srv.GracefulStop, srv.Stop, cmd.Println)
 			return srv.Serve(lis)
 		},
 	}
