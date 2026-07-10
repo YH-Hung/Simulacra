@@ -12,7 +12,9 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/metadata"
+	v1reflectionpb "google.golang.org/grpc/reflection/grpc_reflection_v1"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/dynamicpb"
@@ -135,6 +137,67 @@ func TestUnknownMethodIsUnimplemented(t *testing.T) {
 	err := conn.Invoke(ctx, "/no.such.Service/Nope", req, resp)
 	if st, ok := status.FromError(err); !ok || st.Code() != codes.Unimplemented {
 		t.Fatalf("err = %v, want Unimplemented", err)
+	}
+}
+
+func TestReflectionListsAndResolvesServices(t *testing.T) {
+	_, conn := startServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	rc := v1reflectionpb.NewServerReflectionClient(conn)
+	strm, err := rc.ServerReflectionInfo(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// ListServices must include the mocked service and health.
+	if err := strm.Send(&v1reflectionpb.ServerReflectionRequest{
+		MessageRequest: &v1reflectionpb.ServerReflectionRequest_ListServices{ListServices: ""},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := strm.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]bool{}
+	for _, s := range resp.GetListServicesResponse().GetService() {
+		names[s.GetName()] = true
+	}
+	for _, want := range []string{"shop.v1.OrderService", "grpc.health.v1.Health"} {
+		if !names[want] {
+			t.Errorf("ListServices missing %s (got %v)", want, names)
+		}
+	}
+
+	// FileContainingSymbol must return descriptor bytes for the mocked service.
+	if err := strm.Send(&v1reflectionpb.ServerReflectionRequest{
+		MessageRequest: &v1reflectionpb.ServerReflectionRequest_FileContainingSymbol{
+			FileContainingSymbol: "shop.v1.OrderService",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err = strm.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.GetFileDescriptorResponse().GetFileDescriptorProto()) == 0 {
+		t.Error("FileContainingSymbol returned no descriptors for shop.v1.OrderService")
+	}
+}
+
+func TestHealthCheck(t *testing.T) {
+	_, conn := startServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := healthpb.NewHealthClient(conn).Check(ctx, &healthpb.HealthCheckRequest{})
+	if err != nil {
+		t.Fatalf("health check: %v", err)
+	}
+	if resp.GetStatus() != healthpb.HealthCheckResponse_SERVING {
+		t.Errorf("status = %v, want SERVING", resp.GetStatus())
 	}
 }
 
