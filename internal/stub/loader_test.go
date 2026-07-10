@@ -76,6 +76,51 @@ func TestLoadDirsRejectsUnknownKeys(t *testing.T) {
 	}
 }
 
+func TestLoadDirsMultiDocument(t *testing.T) {
+	// A file may hold several `---` documents; all of them must load.
+	reg := testRegistry(t)
+	dir := t.TempDir()
+	writeFile(t, dir, "multi.yaml", `
+- method: shop.v1.OrderService/GetOrder
+  respond:
+    message: { note: "doc one" }
+---
+- method: shop.v1.OrderService/GetOrder
+  respond:
+    message: { note: "doc two" }
+`)
+	stubs, errs := LoadDirs(reg, []string{dir})
+	if len(errs) > 0 {
+		t.Fatalf("LoadDirs errors: %v", errs)
+	}
+	if len(stubs) != 2 {
+		t.Fatalf("got %d stubs, want 2 (one per document)", len(stubs))
+	}
+}
+
+func TestLoadDirsMultiDocumentStrictInLaterDocs(t *testing.T) {
+	// Unknown keys must fail loudly even in the second document.
+	reg := testRegistry(t)
+	dir := t.TempDir()
+	writeFile(t, dir, "multi.yaml", `
+- method: shop.v1.OrderService/GetOrder
+  respond:
+    message: {}
+---
+- method: shop.v1.OrderService/GetOrder
+  respond:
+    message: {}
+    delay: 50ms
+`)
+	_, errs := LoadDirs(reg, []string{dir})
+	if len(errs) == 0 {
+		t.Fatal("expected an error for unknown key in second document")
+	}
+	if !strings.Contains(errs[0].Error(), "delay") {
+		t.Errorf("error %q should mention the unknown key", errs[0])
+	}
+}
+
 func TestLoadDirsRejectsInvalidYAML(t *testing.T) {
 	reg := testRegistry(t)
 	dir := t.TempDir()

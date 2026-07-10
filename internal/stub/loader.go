@@ -2,7 +2,9 @@ package stub
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -61,8 +63,9 @@ func LoadDirs(reg *schema.Registry, dirs []string) ([]*Compiled, []error) {
 	return out, errs
 }
 
-// parseFile reads one YAML file holding a list of stubs. Parsing is strict:
-// unknown keys are errors, so unsupported/future syntax fails loudly.
+// parseFile reads one YAML file holding a list of stubs, decoding every
+// `---` document in the file. Parsing is strict: unknown keys are errors,
+// so unsupported/future syntax fails loudly instead of being ignored.
 func parseFile(path string) ([]Stub, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -71,8 +74,14 @@ func parseFile(path string) ([]Stub, error) {
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	var stubs []Stub
-	if err := dec.Decode(&stubs); err != nil {
-		return nil, fmt.Errorf("parsing %s: %w", path, err)
+	for {
+		var doc []Stub
+		if err := dec.Decode(&doc); err != nil {
+			if errors.Is(err, io.EOF) {
+				return stubs, nil
+			}
+			return nil, fmt.Errorf("parsing %s: %w", path, err)
+		}
+		stubs = append(stubs, doc...)
 	}
-	return stubs, nil
 }
