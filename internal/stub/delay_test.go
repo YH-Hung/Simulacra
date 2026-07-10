@@ -2,6 +2,7 @@ package stub
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -86,5 +87,70 @@ func TestDelayPickWithinInclusiveRange(t *testing.T) {
 		if got < delay.Min || got > delay.Max {
 			t.Fatalf("pick() = %v, want within [%v, %v]", got, delay.Min, delay.Max)
 		}
+	}
+}
+
+func TestDelayPickIncludesBothEndpoints(t *testing.T) {
+	delay := &Delay{Min: time.Second, Max: time.Second + time.Nanosecond}
+	seen := map[time.Duration]bool{}
+	for i := 0; i < 1_000; i++ {
+		got := delay.pick()
+		if got < delay.Min || got > delay.Max {
+			t.Fatalf("pick() = %v, want within [%v, %v]", got, delay.Min, delay.Max)
+		}
+		seen[got] = true
+	}
+	if !seen[delay.Min] || !seen[delay.Max] {
+		t.Fatalf("pick() endpoints seen = %v, want both %v and %v", seen, delay.Min, delay.Max)
+	}
+}
+
+func TestDelayPickMaximumDurationRange(t *testing.T) {
+	delay, err := ParseDelay("0s..2562047h47m16.854775807s")
+	if err != nil {
+		t.Fatalf("ParseDelay() error = %v", err)
+	}
+	for i := 0; i < 10; i++ {
+		got := delay.pick()
+		if got < delay.Min || got > delay.Max {
+			t.Fatalf("pick() = %v, want within [%v, %v]", got, delay.Min, delay.Max)
+		}
+	}
+}
+
+func TestInvalidDelayIsSafe(t *testing.T) {
+	tests := []struct {
+		name  string
+		delay *Delay
+	}{
+		{name: "negative minimum", delay: &Delay{Min: -time.Nanosecond, Max: time.Nanosecond}},
+		{name: "reversed range", delay: &Delay{Min: 2 * time.Nanosecond, Max: time.Nanosecond}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.delay.pick(); got != 0 {
+				t.Fatalf("invalid Delay.pick() = %v, want zero", got)
+			}
+			if err := tt.delay.Wait(context.Background()); err == nil {
+				t.Fatal("invalid Delay.Wait() error = nil, want validation error")
+			}
+		})
+	}
+}
+
+func TestDelayWaitAlreadyCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	delay := &Delay{Min: 5 * time.Second, Max: 5 * time.Second}
+	if err := delay.Wait(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Wait() error = %v, want %v", err, context.Canceled)
+	}
+}
+
+func TestDelayWaitCompletes(t *testing.T) {
+	delay := &Delay{Min: time.Nanosecond, Max: time.Nanosecond}
+	if err := delay.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait() error = %v, want nil", err)
 	}
 }

@@ -33,28 +33,45 @@ func ParseDelay(value string) (*Delay, error) {
 			return nil, fmt.Errorf("parsing delay maximum %q: %w", strings.TrimSpace(maxText), err)
 		}
 	}
-	if min < 0 {
-		return nil, fmt.Errorf("delay minimum must not be negative: %s", min)
-	}
-	if max < min {
-		return nil, fmt.Errorf("delay maximum %s must not be less than minimum %s", max, min)
+	delay := &Delay{Min: min, Max: max}
+	if err := delay.validate(); err != nil {
+		return nil, err
 	}
 
-	return &Delay{Min: min, Max: max}, nil
+	return delay, nil
+}
+
+func (d *Delay) validate() error {
+	if d == nil {
+		return fmt.Errorf("delay must not be nil")
+	}
+	if d.Min < 0 {
+		return fmt.Errorf("delay minimum must not be negative: %s", d.Min)
+	}
+	if d.Max < d.Min {
+		return fmt.Errorf("delay maximum %s must not be less than minimum %s", d.Max, d.Min)
+	}
+	return nil
 }
 
 func (d *Delay) pick() time.Duration {
+	if err := d.validate(); err != nil {
+		return 0
+	}
 	if d.Min == d.Max {
 		return d.Min
 	}
-	span := d.Max - d.Min
-	return d.Min + rand.N(span+1)
+	width := uint64(d.Max-d.Min) + 1
+	return d.Min + time.Duration(rand.N(width))
 }
 
 // Wait blocks for the selected delay or until the context is canceled.
 func (d *Delay) Wait(ctx context.Context) error {
 	if d == nil {
 		return ctx.Err()
+	}
+	if err := d.validate(); err != nil {
+		return err
 	}
 	duration := d.pick()
 	if duration <= 0 {
