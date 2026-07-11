@@ -3,6 +3,7 @@ package dataplane
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -77,6 +78,11 @@ const stubsYAML = `
       - delay: 20ms
         message: { order_id: "o-123", status: ORDER_STATUS_SHIPPED, note: "for {{ message.order_id }}" }
       - status: { code: UNAVAILABLE, message: "backend hiccup" }
+- method: shop.v1.OrderService/UploadOrders
+  match:
+    expr: 'size(messages) == 2 && messages.exists(m, m.order_id == "o-1")'
+  respond:
+    message: { note: 'got {{ size(messages) }} orders' }
 `
 
 func writeStubFile(dir, content string) error {
@@ -582,6 +588,81 @@ func TestServerStreamingRejectsSecondRequestFrame(t *testing.T) {
 	st := status.Convert(err)
 	if st.Code() != codes.Internal || !strings.Contains(st.Message(), "cardinality") {
 		t.Fatalf("RecvMsg error = %v, want Internal cardinality error", err)
+	}
+}
+
+func TestClientStreamingMatchesAtClose(t *testing.T) {
+	reg, conn := startServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stream, method := openStream(t, reg, conn, ctx, "/shop.v1.OrderService/UploadOrders")
+	sendJSON(t, stream, method.Input(), `{"order_id":"o-1"}`)
+	sendJSON(t, stream, method.Input(), `{"order_id":"o-2"}`)
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("CloseSend: %v", err)
+	}
+
+	response := dynamicpb.NewMessage(method.Output())
+	if err := stream.RecvMsg(response); err != nil {
+		t.Fatalf("RecvMsg: %v", err)
+	}
+	body, err := protojson.Marshal(response)
+	if err != nil {
+		t.Fatalf("Marshal response: %v", err)
+	}
+	if !strings.Contains(string(body), "got 2 orders") {
+		t.Fatalf("response = %s, want templated message count", body)
+	}
+	if err := stream.RecvMsg(dynamicpb.NewMessage(method.Output())); err != io.EOF {
+		t.Fatalf("second RecvMsg = %v, want EOF", err)
+	}
+}
+
+func TestClientStreamingNoMatchExplainsMessagesExpression(t *testing.T) {
+	reg, conn := startServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stream, method := openStream(t, reg, conn, ctx, "/shop.v1.OrderService/UploadOrders")
+	sendJSON(t, stream, method.Input(), `{"order_id":"o-9"}`)
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("CloseSend: %v", err)
+	}
+
+	err := stream.RecvMsg(dynamicpb.NewMessage(method.Output()))
+	st := status.Convert(err)
+	if st.Code() != codes.NotFound {
+		t.Fatalf("RecvMsg error = %v, want NotFound", err)
+	}
+	if !strings.Contains(st.Message(), "size(messages)") {
+		t.Fatalf("message = %q, want messages expression nearest miss", st.Message())
+	}
+}
+
+func TestClientStreamingPreservesReceiveStatusCode(t *testing.T) {
+	reg := schema.NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), "../../testdata/protos"); err != nil {
+		t.Fatal(err)
+	}
+	method, err := reg.LookupMethod("/shop.v1.OrderService/UploadOrders")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, code := range []codes.Code{codes.ResourceExhausted, codes.Canceled, codes.DeadlineExceeded} {
+		t.Run(code.String(), func(t *testing.T) {
+			receiveErr := status.Error(code, "transport receive failed")
+			err := (&Server{}).clientStream(receiveErrorStream{err: receiveErr},
+				"/shop.v1.OrderService/UploadOrders", method, match.Input{})
+			st := status.Convert(err)
+			if st.Code() != code {
+				t.Fatalf("code = %s, want %s (err %v)", st.Code(), code, err)
+			}
+			if !strings.Contains(st.Message(), "receiving request") || !strings.Contains(st.Message(), "transport receive failed") {
+				t.Fatalf("message = %q, want receive context and cause", st.Message())
+			}
+		})
 	}
 }
 

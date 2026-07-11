@@ -95,12 +95,35 @@ func (s *Server) handleUnknown(_ any, stream grpc.ServerStream) error {
 	case match.ServerStream:
 		return s.serverStream(stream, full, m, in)
 	case match.ClientStream:
-		return status.Errorf(codes.Unimplemented, "simulacra: client streaming is not implemented for %s (Task 11)", full)
+		return s.clientStream(stream, full, m, in)
 	case match.Bidi:
 		return status.Errorf(codes.Unimplemented, "simulacra: bidirectional streaming is not implemented for %s (Task 12)", full)
 	default:
 		return status.Errorf(codes.Internal, "simulacra: unsupported method shape for %s", full)
 	}
+}
+
+func (s *Server) clientStream(stream grpc.ServerStream, full string, method protoreflect.MethodDescriptor, in match.Input) error {
+	for {
+		message := dynamicpb.NewMessage(method.Input())
+		err := stream.RecvMsg(message)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return receiveError(err)
+		}
+		in.Messages = append(in.Messages, message.ProtoReflect())
+	}
+
+	selected, misses := s.store.SelectOrExplain(full, in)
+	if selected == nil {
+		return s.noMatch(full, misses)
+	}
+	if err := applyMetadata(stream, selected.Plan()); err != nil {
+		return err
+	}
+	return sendSingle(stream, selected.Plan(), in)
 }
 
 func (s *Server) unary(stream grpc.ServerStream, full string, method protoreflect.MethodDescriptor, in match.Input) error {
