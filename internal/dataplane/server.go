@@ -97,9 +97,51 @@ func (s *Server) handleUnknown(_ any, stream grpc.ServerStream) error {
 	case match.ClientStream:
 		return s.clientStream(stream, full, m, in)
 	case match.Bidi:
-		return status.Errorf(codes.Unimplemented, "simulacra: bidirectional streaming is not implemented for %s (Task 12)", full)
+		return s.bidi(stream, full, m, in)
 	default:
 		return status.Errorf(codes.Internal, "simulacra: unsupported method shape for %s", full)
+	}
+}
+
+func (s *Server) bidi(stream grpc.ServerStream, full string, method protoreflect.MethodDescriptor, in match.Input) error {
+	if in.Messages == nil {
+		in.Messages = []protoreflect.Message{}
+	}
+	selected, misses := s.store.SelectOrExplain(full, in)
+	if selected == nil {
+		return s.noMatch(full, misses)
+	}
+	plan := selected.Plan()
+	if err := applyMetadata(stream, plan); err != nil {
+		return err
+	}
+	if err := runSteps(stream.Context(), stream, plan.OnOpen, in); err != nil {
+		return err
+	}
+
+	for {
+		message := dynamicpb.NewMessage(method.Input())
+		err := stream.RecvMsg(message)
+		if err == io.EOF {
+			if plan.OnClose == nil {
+				return nil
+			}
+			return plan.OnClose.Err()
+		}
+		if err != nil {
+			return receiveError(err)
+		}
+		in.Message = message.ProtoReflect()
+		in.Messages = append(in.Messages, in.Message)
+		for _, rule := range plan.Rules {
+			if !rule.Matcher.Eval(in) {
+				continue
+			}
+			if err := runSteps(stream.Context(), stream, rule.Send, in); err != nil {
+				return err
+			}
+			break
+		}
 	}
 }
 

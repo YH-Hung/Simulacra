@@ -88,6 +88,22 @@ const stubsYAML = `
     expr: 'size(messages) == 0'
   respond:
     message: { note: 'got {{ size(messages) }} orders' }
+- method: shop.v1.OrderService/Chat
+  respond:
+    on_open:
+      - message: { text: welcome }
+    rules:
+      - match:
+          message:
+            text: { matches: 'ping.*' }
+        send:
+          - message: { text: pong }
+      - match:
+          expr: 'size(messages) >= 3'
+        send:
+          - message: { text: chatty }
+    on_close:
+      status: { code: OK }
 `
 
 func writeStubFile(dir, content string) error {
@@ -95,13 +111,17 @@ func writeStubFile(dir, content string) error {
 }
 
 func startServer(t *testing.T) (*schema.Registry, *grpc.ClientConn) {
+	return startServerWithStubs(t, stubsYAML)
+}
+
+func startServerWithStubs(t *testing.T, contents string) (*schema.Registry, *grpc.ClientConn) {
 	t.Helper()
 	reg := schema.NewRegistry()
 	if err := reg.AddProtoDir(context.Background(), "../../testdata/protos"); err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
-	if err := writeStubFile(dir, stubsYAML); err != nil {
+	if err := writeStubFile(dir, contents); err != nil {
 		t.Fatal(err)
 	}
 	stubs, errs := stub.LoadDirs(reg, []string{dir})
@@ -178,6 +198,19 @@ func sendJSON(t *testing.T, stream grpc.ClientStream, desc protoreflect.MessageD
 	if err := stream.SendMsg(message); err != nil {
 		t.Fatalf("SendMsg: %v", err)
 	}
+}
+
+func recvText(t *testing.T, stream grpc.ClientStream, desc protoreflect.MessageDescriptor) string {
+	t.Helper()
+	message := dynamicpb.NewMessage(desc)
+	if err := stream.RecvMsg(message); err != nil {
+		t.Fatalf("RecvMsg: %v", err)
+	}
+	field := desc.Fields().ByName("text")
+	if field == nil {
+		t.Fatalf("message %s has no text field", desc.FullName())
+	}
+	return message.Get(field).String()
 }
 
 func TestUnaryMatchedCall(t *testing.T) {
@@ -683,6 +716,116 @@ func TestClientStreamingPreservesReceiveStatusCode(t *testing.T) {
 			receiveErr := status.Error(code, "transport receive failed")
 			err := (&Server{}).clientStream(receiveErrorStream{err: receiveErr},
 				"/shop.v1.OrderService/UploadOrders", method, match.Input{})
+			st := status.Convert(err)
+			if st.Code() != code {
+				t.Fatalf("code = %s, want %s (err %v)", st.Code(), code, err)
+			}
+			if !strings.Contains(st.Message(), "receiving request") || !strings.Contains(st.Message(), "transport receive failed") {
+				t.Fatalf("message = %q, want receive context and cause", st.Message())
+			}
+		})
+	}
+}
+
+func TestBidirectionalStreamingReactiveRules(t *testing.T) {
+	reg, conn := startServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stream, method := openStream(t, reg, conn, ctx, "/shop.v1.OrderService/Chat")
+	if got := recvText(t, stream, method.Output()); got != "welcome" {
+		t.Fatalf("on_open response = %q, want welcome", got)
+	}
+
+	sendJSON(t, stream, method.Input(), `{"text":"ping one"}`)
+	if got := recvText(t, stream, method.Output()); got != "pong" {
+		t.Fatalf("ping response = %q, want pong", got)
+	}
+	sendJSON(t, stream, method.Input(), `{"text":"xyz"}`)
+	sendJSON(t, stream, method.Input(), `{"text":"abc"}`)
+	if got := recvText(t, stream, method.Output()); got != "chatty" {
+		t.Fatalf("third-message response = %q, want chatty", got)
+	}
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("CloseSend: %v", err)
+	}
+	if err := stream.RecvMsg(dynamicpb.NewMessage(method.Output())); err != io.EOF {
+		t.Fatalf("RecvMsg after CloseSend = %v, want EOF", err)
+	}
+}
+
+func TestBidirectionalStreamingFirstMatchingRuleWins(t *testing.T) {
+	reg, conn := startServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stream, method := openStream(t, reg, conn, ctx, "/shop.v1.OrderService/Chat")
+	if got := recvText(t, stream, method.Output()); got != "welcome" {
+		t.Fatalf("on_open response = %q, want welcome", got)
+	}
+	sendJSON(t, stream, method.Input(), `{"text":"one"}`)
+	sendJSON(t, stream, method.Input(), `{"text":"two"}`)
+	sendJSON(t, stream, method.Input(), `{"text":"ping three"}`)
+	if got := recvText(t, stream, method.Output()); got != "pong" {
+		t.Fatalf("overlapping-rule response = %q, want first rule's pong", got)
+	}
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("CloseSend: %v", err)
+	}
+	if err := stream.RecvMsg(dynamicpb.NewMessage(method.Output())); err != io.EOF {
+		t.Fatalf("second overlapping-rule response = %v, want EOF", err)
+	}
+}
+
+func TestBidirectionalStreamingSelectsAtOpenAndExplainsMetadataMiss(t *testing.T) {
+	const gated = `
+- method: shop.v1.OrderService/Chat
+  match:
+    metadata:
+      x-room: { eq: general }
+  respond:
+    on_open:
+      - message: { text: welcome }
+`
+	reg, conn := startServerWithStubs(t, gated)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stream, method := openStream(t, reg, conn, ctx, "/shop.v1.OrderService/Chat")
+	err := stream.RecvMsg(dynamicpb.NewMessage(method.Output()))
+	st := status.Convert(err)
+	if st.Code() != codes.NotFound {
+		t.Fatalf("RecvMsg error = %v, want NotFound", err)
+	}
+	if !strings.Contains(st.Message(), "x-room") {
+		t.Fatalf("message = %q, want nearest metadata miss", st.Message())
+	}
+}
+
+func TestBidirectionalStreamingPreservesReceiveStatusCode(t *testing.T) {
+	reg := schema.NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), "../../testdata/protos"); err != nil {
+		t.Fatal(err)
+	}
+	method, err := reg.LookupMethod("/shop.v1.OrderService/Chat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	compiled, err := stub.Compile(reg, stub.Stub{
+		Method: "shop.v1.OrderService/Chat",
+		Respond: stub.Respond{Rules: []stub.RuleSpec{{
+			Send: []stub.StepSpec{{Message: map[string]any{"text": "unused"}}},
+		}}},
+	}, "chat.yaml#0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, code := range []codes.Code{codes.ResourceExhausted, codes.Canceled, codes.DeadlineExceeded} {
+		t.Run(code.String(), func(t *testing.T) {
+			receiveErr := status.Error(code, "transport receive failed")
+			err := (&Server{store: stub.NewStore([]*stub.Compiled{compiled})}).bidi(
+				receiveErrorStream{err: receiveErr}, "/shop.v1.OrderService/Chat", method, match.Input{})
 			st := status.Convert(err)
 			if st.Code() != code {
 				t.Fatalf("code = %s, want %s (err %v)", st.Code(), code, err)
