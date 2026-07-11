@@ -2,6 +2,7 @@ package dataplane
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/dynamicpb"
 
 	"github.com/yinghanhung/simulacra/internal/match"
@@ -63,6 +65,18 @@ const stubsYAML = `
   respond:
     delay: 2s
     message: { order_id: "slow", note: "eventually" }
+- method: shop.v1.OrderService/WatchOrder
+  match:
+    message:
+      order_id: { eq: "o-123" }
+  respond:
+    metadata: { x-mock: "watch" }
+    trailers: { x-served-by: "stream-script" }
+    stream:
+      - message: { order_id: "o-123", status: ORDER_STATUS_PENDING }
+      - delay: 20ms
+        message: { order_id: "o-123", status: ORDER_STATUS_SHIPPED, note: "for {{ message.order_id }}" }
+      - status: { code: UNAVAILABLE, message: "backend hiccup" }
 `
 
 func writeStubFile(dir, content string) error {
@@ -126,6 +140,33 @@ func invokeWithOptions(t *testing.T, reg *schema.Registry, conn *grpc.ClientConn
 		t.Fatal(err)
 	}
 	return string(out), nil
+}
+
+func openStream(t *testing.T, reg *schema.Registry, conn *grpc.ClientConn, ctx context.Context, method string) (grpc.ClientStream, protoreflect.MethodDescriptor) {
+	t.Helper()
+	desc, err := reg.LookupMethod(method)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := conn.NewStream(ctx, &grpc.StreamDesc{
+		ClientStreams: desc.IsStreamingClient(),
+		ServerStreams: desc.IsStreamingServer(),
+	}, method)
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+	return stream, desc
+}
+
+func sendJSON(t *testing.T, stream grpc.ClientStream, desc protoreflect.MessageDescriptor, body string) {
+	t.Helper()
+	message := dynamicpb.NewMessage(desc)
+	if err := protojson.Unmarshal([]byte(body), message); err != nil {
+		t.Fatalf("protojson.Unmarshal: %v", err)
+	}
+	if err := stream.SendMsg(message); err != nil {
+		t.Fatalf("SendMsg: %v", err)
+	}
 }
 
 func TestUnaryMatchedCall(t *testing.T) {
@@ -448,19 +489,191 @@ func TestHealthCheck(t *testing.T) {
 	}
 }
 
-func TestStreamingMethodRejected(t *testing.T) {
+func TestServerStreamingScript(t *testing.T) {
 	reg, conn := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	m, _ := reg.LookupMethod("/shop.v1.OrderService/GetOrder")
-	req := dynamicpb.NewMessage(m.Input())
-	resp := dynamicpb.NewMessage(m.Output())
-	err := conn.Invoke(ctx, "/shop.v1.OrderService/WatchOrder", req, resp)
-	st, ok := status.FromError(err)
-	if !ok || st.Code() != codes.Unimplemented {
-		t.Fatalf("err = %v, want Unimplemented for streaming method in M1", err)
+
+	stream, method := openStream(t, reg, conn, ctx, "/shop.v1.OrderService/WatchOrder")
+	sendJSON(t, stream, method.Input(), `{"order_id":"o-123"}`)
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("CloseSend: %v", err)
 	}
-	if !strings.Contains(st.Message(), "streaming") {
-		t.Errorf("message %q should explain streaming is not supported yet", st.Message())
+
+	wants := []struct {
+		status string
+		note   string
+	}{
+		{status: "ORDER_STATUS_PENDING"},
+		{status: "ORDER_STATUS_SHIPPED", note: "for o-123"},
+	}
+	for i, want := range wants {
+		response := dynamicpb.NewMessage(method.Output())
+		if err := stream.RecvMsg(response); err != nil {
+			t.Fatalf("RecvMsg(%d): %v", i+1, err)
+		}
+		body, err := protojson.Marshal(response)
+		if err != nil {
+			t.Fatalf("Marshal response %d: %v", i+1, err)
+		}
+		if !strings.Contains(string(body), want.status) {
+			t.Errorf("response %d = %s, want status %s", i+1, body, want.status)
+		}
+		if want.note != "" && !strings.Contains(string(body), want.note) {
+			t.Errorf("response %d = %s, want note %q", i+1, body, want.note)
+		}
+		if i == 0 {
+			header, err := stream.Header()
+			if err != nil {
+				t.Fatalf("Header: %v", err)
+			}
+			if got := header.Get("x-mock"); len(got) != 1 || got[0] != "watch" {
+				t.Errorf("x-mock header = %v, want [watch]", got)
+			}
+		}
+	}
+
+	err := stream.RecvMsg(dynamicpb.NewMessage(method.Output()))
+	st := status.Convert(err)
+	if st.Code() != codes.Unavailable || st.Message() != "backend hiccup" {
+		t.Fatalf("terminal error = %v, want Unavailable backend hiccup", err)
+	}
+	if got := stream.Trailer().Get("x-served-by"); len(got) != 1 || got[0] != "stream-script" {
+		t.Errorf("x-served-by trailer = %v, want [stream-script]", got)
+	}
+}
+
+func TestServerStreamingRejectsMissingRequestFrame(t *testing.T) {
+	reg, conn := startServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stream, method := openStream(t, reg, conn, ctx, "/shop.v1.OrderService/WatchOrder")
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("CloseSend: %v", err)
+	}
+	err := stream.RecvMsg(dynamicpb.NewMessage(method.Output()))
+	st := status.Convert(err)
+	if st.Code() != codes.Internal || !strings.Contains(st.Message(), "missing request") {
+		t.Fatalf("RecvMsg error = %v, want Internal missing request", err)
+	}
+}
+
+func TestServerStreamingRejectsSecondRequestFrame(t *testing.T) {
+	reg, conn := startServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	method, err := reg.LookupMethod("/shop.v1.OrderService/WatchOrder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := conn.NewStream(ctx, &grpc.StreamDesc{ClientStreams: true, ServerStreams: true},
+		"/shop.v1.OrderService/WatchOrder")
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+	sendJSON(t, stream, method.Input(), `{"order_id":"o-123"}`)
+	sendJSON(t, stream, method.Input(), `{"order_id":"o-123"}`)
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("CloseSend: %v", err)
+	}
+	err = stream.RecvMsg(dynamicpb.NewMessage(method.Output()))
+	st := status.Convert(err)
+	if st.Code() != codes.Internal || !strings.Contains(st.Message(), "cardinality") {
+		t.Fatalf("RecvMsg error = %v, want Internal cardinality error", err)
+	}
+}
+
+type recordingSender struct {
+	messages []any
+	err      error
+}
+
+func (s *recordingSender) SendMsg(message any) error {
+	s.messages = append(s.messages, message)
+	return s.err
+}
+
+func compileServerPlan(t *testing.T, reg *schema.Registry, respond stub.Respond) *stub.Plan {
+	t.Helper()
+	compiled, err := stub.Compile(reg, stub.Stub{
+		Method:  "shop.v1.OrderService/WatchOrder",
+		Respond: respond,
+	}, "runner.yaml#0")
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	return compiled.Plan()
+}
+
+func TestRunStepsCompletesEmptyScript(t *testing.T) {
+	sender := &recordingSender{}
+	if err := runSteps(context.Background(), sender, nil, match.Input{}); err != nil {
+		t.Fatalf("runSteps: %v", err)
+	}
+	if len(sender.messages) != 0 {
+		t.Fatalf("sent %d messages, want none", len(sender.messages))
+	}
+}
+
+func TestRunStepsPreservesSendError(t *testing.T) {
+	reg := schema.NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), "../../testdata/protos"); err != nil {
+		t.Fatal(err)
+	}
+	plan := compileServerPlan(t, reg, stub.Respond{Stream: []stub.StepSpec{{
+		Message: map[string]any{"order_id": "o-123"},
+	}}})
+	sendErr := errors.New("transport send failed")
+	err := runSteps(context.Background(), &recordingSender{err: sendErr}, plan.Stream, match.Input{})
+	if err != sendErr {
+		t.Fatalf("runSteps error = %v, want exact send error %v", err, sendErr)
+	}
+}
+
+func TestRunStepsHonorsCanceledDelay(t *testing.T) {
+	reg := schema.NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), "../../testdata/protos"); err != nil {
+		t.Fatal(err)
+	}
+	plan := compileServerPlan(t, reg, stub.Respond{Stream: []stub.StepSpec{{
+		Delay: "2s", Message: map[string]any{"order_id": "o-123"},
+	}}})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := runSteps(ctx, &recordingSender{}, plan.Stream, match.Input{})
+	if got := status.Code(err); got != codes.Canceled {
+		t.Fatalf("runSteps code = %s, want Canceled (err %v)", got, err)
+	}
+}
+
+func TestRunStepsReturnsTerminalStatus(t *testing.T) {
+	reg := schema.NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), "../../testdata/protos"); err != nil {
+		t.Fatal(err)
+	}
+	plan := compileServerPlan(t, reg, stub.Respond{Stream: []stub.StepSpec{{
+		Status: &stub.StatusSpec{Code: "UNAVAILABLE", Message: "planned outage"},
+	}}})
+	err := runSteps(context.Background(), &recordingSender{}, plan.Stream, match.Input{})
+	st := status.Convert(err)
+	if st.Code() != codes.Unavailable || st.Message() != "planned outage" {
+		t.Fatalf("runSteps error = %v, want Unavailable planned outage", err)
+	}
+}
+
+func TestRunStepsMapsTemplateFailureToInternal(t *testing.T) {
+	reg := schema.NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), "../../testdata/protos"); err != nil {
+		t.Fatal(err)
+	}
+	plan := compileServerPlan(t, reg, stub.Respond{Stream: []stub.StepSpec{{
+		Message: map[string]any{"note": "{{ metadata['missing'][0] }}"},
+	}}})
+	err := runSteps(context.Background(), &recordingSender{}, plan.Stream, match.Input{})
+	st := status.Convert(err)
+	if st.Code() != codes.Internal || !strings.Contains(st.Message(), "rendering response") {
+		t.Fatalf("runSteps error = %v, want Internal rendering response", err)
 	}
 }

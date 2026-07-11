@@ -4,6 +4,7 @@
 package dataplane
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -92,7 +93,7 @@ func (s *Server) handleUnknown(_ any, stream grpc.ServerStream) error {
 	case match.Unary:
 		return s.unary(stream, full, m, in)
 	case match.ServerStream:
-		return status.Errorf(codes.Unimplemented, "simulacra: server streaming is not implemented for %s (Task 10)", full)
+		return s.serverStream(stream, full, m, in)
 	case match.ClientStream:
 		return status.Errorf(codes.Unimplemented, "simulacra: client streaming is not implemented for %s (Task 11)", full)
 	case match.Bidi:
@@ -103,19 +104,9 @@ func (s *Server) handleUnknown(_ any, stream grpc.ServerStream) error {
 }
 
 func (s *Server) unary(stream grpc.ServerStream, full string, method protoreflect.MethodDescriptor, in match.Input) error {
-	req := dynamicpb.NewMessage(method.Input())
-	if err := stream.RecvMsg(req); err != nil {
-		if err == io.EOF {
-			return status.Error(codes.Internal, "simulacra: missing request for unary RPC")
-		}
-		return receiveError(err)
-	}
-	extra := dynamicpb.NewMessage(method.Input())
-	if err := stream.RecvMsg(extra); err != io.EOF {
-		if err == nil {
-			return status.Error(codes.Internal, "simulacra: unary request cardinality violation: received more than one request")
-		}
-		return receiveError(err)
+	req, err := receiveSingleRequest(stream, method, "unary")
+	if err != nil {
+		return err
 	}
 	in.Message = req.ProtoReflect()
 	selected, misses := s.store.SelectOrExplain(full, in)
@@ -126,6 +117,46 @@ func (s *Server) unary(stream grpc.ServerStream, full string, method protoreflec
 		return err
 	}
 	return sendSingle(stream, selected.Plan(), in)
+}
+
+func (s *Server) serverStream(stream grpc.ServerStream, full string, method protoreflect.MethodDescriptor, in match.Input) error {
+	req, err := receiveSingleRequest(stream, method, "server-streaming")
+	if err != nil {
+		return err
+	}
+	in.Message = req.ProtoReflect()
+	selected, misses := s.store.SelectOrExplain(full, in)
+	if selected == nil {
+		return s.noMatch(full, misses)
+	}
+	plan := selected.Plan()
+	if err := applyMetadata(stream, plan); err != nil {
+		return err
+	}
+	if plan.Delay != nil {
+		if err := plan.Delay.Wait(stream.Context()); err != nil {
+			return status.FromContextError(err).Err()
+		}
+	}
+	return runSteps(stream.Context(), stream, plan.Stream, in)
+}
+
+func receiveSingleRequest(stream grpc.ServerStream, method protoreflect.MethodDescriptor, shape string) (*dynamicpb.Message, error) {
+	req := dynamicpb.NewMessage(method.Input())
+	if err := stream.RecvMsg(req); err != nil {
+		if err == io.EOF {
+			return nil, status.Errorf(codes.Internal, "simulacra: missing request for %s RPC", shape)
+		}
+		return nil, receiveError(err)
+	}
+	extra := dynamicpb.NewMessage(method.Input())
+	if err := stream.RecvMsg(extra); err != io.EOF {
+		if err == nil {
+			return nil, status.Errorf(codes.Internal, "simulacra: %s request cardinality violation: received more than one request", shape)
+		}
+		return nil, receiveError(err)
+	}
+	return req, nil
 }
 
 func receiveError(err error) error {
@@ -158,6 +189,31 @@ func sendSingle(stream grpc.ServerStream, plan *stub.Plan, in match.Input) error
 		return status.Errorf(codes.Internal, "simulacra: rendering response: %v", err)
 	}
 	return stream.SendMsg(response)
+}
+
+type messageSender interface {
+	SendMsg(any) error
+}
+
+func runSteps(ctx context.Context, sender messageSender, steps []stub.Step, in match.Input) error {
+	for _, step := range steps {
+		if step.Delay != nil {
+			if err := step.Delay.Wait(ctx); err != nil {
+				return status.FromContextError(err).Err()
+			}
+		}
+		if step.Status != nil {
+			return step.Status.Err()
+		}
+		message, err := step.Message.Render(in)
+		if err != nil {
+			return status.Errorf(codes.Internal, "simulacra: rendering response: %v", err)
+		}
+		if err := sender.SendMsg(message); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Server) noMatch(full string, misses []stub.Miss) error {
