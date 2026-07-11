@@ -17,6 +17,7 @@ import (
 	v1reflectionpb "google.golang.org/grpc/reflection/grpc_reflection_v1"
 	v1alphareflectionpb "google.golang.org/grpc/reflection/grpc_reflection_v1alpha"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/dynamicpb"
 
 	"github.com/yinghanhung/simulacra/internal/match"
@@ -83,23 +84,57 @@ func (s *Server) handleUnknown(_ any, stream grpc.ServerStream) error {
 	if err != nil {
 		return status.Errorf(codes.Unimplemented, "simulacra: %v", err)
 	}
-	if m.IsStreamingClient() || m.IsStreamingServer() {
-		return status.Errorf(codes.Unimplemented,
-			"simulacra: %s is a streaming method; this build supports unary methods only (streaming lands in M2)", full)
-	}
+	md, _ := metadata.FromIncomingContext(stream.Context())
+	in := match.Input{Method: strings.TrimPrefix(full, "/"), Metadata: md}
 
-	req := dynamicpb.NewMessage(m.Input())
+	switch match.ShapeOf(m) {
+	case match.Unary:
+		return s.unary(stream, full, m, in)
+	case match.ServerStream:
+		return status.Errorf(codes.Unimplemented, "simulacra: server streaming is not implemented for %s (Task 10)", full)
+	case match.ClientStream:
+		return status.Errorf(codes.Unimplemented, "simulacra: client streaming is not implemented for %s (Task 11)", full)
+	case match.Bidi:
+		return status.Errorf(codes.Unimplemented, "simulacra: bidirectional streaming is not implemented for %s (Task 12)", full)
+	default:
+		return status.Errorf(codes.Internal, "simulacra: unsupported method shape for %s", full)
+	}
+}
+
+func (s *Server) unary(stream grpc.ServerStream, full string, method protoreflect.MethodDescriptor, in match.Input) error {
+	req := dynamicpb.NewMessage(method.Input())
 	if err := stream.RecvMsg(req); err != nil {
 		return status.Errorf(codes.Internal, "simulacra: receiving request: %v", err)
 	}
-	md, _ := metadata.FromIncomingContext(stream.Context())
-
-	in := match.Input{Method: strings.TrimPrefix(full, "/"), Metadata: md, Message: req.ProtoReflect()}
+	in.Message = req.ProtoReflect()
 	selected, misses := s.store.SelectOrExplain(full, in)
 	if selected == nil {
 		return s.noMatch(full, misses)
 	}
-	plan := selected.Plan()
+	if err := applyMetadata(stream, selected.Plan()); err != nil {
+		return err
+	}
+	return sendSingle(stream, selected.Plan(), in)
+}
+
+func applyMetadata(stream grpc.ServerStream, plan *stub.Plan) error {
+	if len(plan.Header) > 0 {
+		if err := stream.SetHeader(plan.Header); err != nil {
+			return status.Errorf(codes.Internal, "simulacra: setting response headers: %v", err)
+		}
+	}
+	if len(plan.Trailer) > 0 {
+		stream.SetTrailer(plan.Trailer)
+	}
+	return nil
+}
+
+func sendSingle(stream grpc.ServerStream, plan *stub.Plan, in match.Input) error {
+	if plan.Delay != nil {
+		if err := plan.Delay.Wait(stream.Context()); err != nil {
+			return status.FromContextError(err).Err()
+		}
+	}
 	if plan.Status != nil {
 		return plan.Status.Err()
 	}

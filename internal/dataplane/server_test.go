@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -16,6 +17,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	v1reflectionpb "google.golang.org/grpc/reflection/grpc_reflection_v1"
 	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/test/bufconn"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/dynamicpb"
 
@@ -33,6 +35,34 @@ const stubsYAML = `
       order_id: { eq: "o-123" }
   respond:
     message: { order_id: "o-123", status: ORDER_STATUS_SHIPPED, note: "hello" }
+- method: shop.v1.OrderService/GetOrder
+  match:
+    message:
+      order_id: { eq: "echo" }
+  respond:
+    metadata: { x-mock: "echo" }
+    trailers: { x-served-by: "simulacra" }
+    message: { order_id: "echo", note: 'tenant {{ metadata["x-tenant"][0] }}' }
+- method: shop.v1.OrderService/GetOrder
+  match:
+    message:
+      order_id: { eq: "fail" }
+  respond:
+    status:
+      code: FAILED_PRECONDITION
+      message: order cannot be fulfilled
+      details:
+        - type: google.rpc.PreconditionFailure
+          value:
+            violations:
+              - { type: ORDER_STATE, subject: "o-123", description: order is not ready }
+- method: shop.v1.OrderService/GetOrder
+  match:
+    message:
+      order_id: { eq: "slow" }
+  respond:
+    delay: 2s
+    message: { order_id: "slow", note: "eventually" }
 `
 
 func writeStubFile(dir, content string) error {
@@ -57,15 +87,15 @@ func startServer(t *testing.T) (*schema.Registry, *grpc.ClientConn) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	lis := bufconn.Listen(1024 * 1024)
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(srv.GracefulStop)
 
-	conn, err := grpc.NewClient(lis.Addr().String(),
-		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient("passthrough:///bufconn",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return lis.Dial()
+		}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,6 +104,10 @@ func startServer(t *testing.T) (*schema.Registry, *grpc.ClientConn) {
 }
 
 func invoke(t *testing.T, reg *schema.Registry, conn *grpc.ClientConn, ctx context.Context, method, reqJSON string) (string, error) {
+	return invokeWithOptions(t, reg, conn, ctx, method, reqJSON)
+}
+
+func invokeWithOptions(t *testing.T, reg *schema.Registry, conn *grpc.ClientConn, ctx context.Context, method, reqJSON string, opts ...grpc.CallOption) (string, error) {
 	t.Helper()
 	m, err := reg.LookupMethod(method)
 	if err != nil {
@@ -84,7 +118,7 @@ func invoke(t *testing.T, reg *schema.Registry, conn *grpc.ClientConn, ctx conte
 		t.Fatal(err)
 	}
 	resp := dynamicpb.NewMessage(m.Output())
-	if err := conn.Invoke(ctx, method, req, resp); err != nil {
+	if err := conn.Invoke(ctx, method, req, resp, opts...); err != nil {
 		return "", err
 	}
 	out, err := protojson.Marshal(resp)
@@ -121,11 +155,73 @@ func TestUnaryNoStubMatched(t *testing.T) {
 	if !ok || st.Code() != codes.NotFound {
 		t.Fatalf("err = %v, want NotFound", err)
 	}
-	if !strings.Contains(st.Message(), "1 stub") {
+	if !strings.Contains(st.Message(), "4 stub") {
 		t.Errorf("message %q should mention how many stubs exist for the method", st.Message())
 	}
 	if !strings.Contains(st.Message(), "x-tenant") {
 		t.Errorf("message %q should include the nearest-miss metadata detail", st.Message())
+	}
+}
+
+func TestUnaryStatusIncludesConcretePreconditionFailure(t *testing.T) {
+	reg, conn := startServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := invoke(t, reg, conn, ctx, "/shop.v1.OrderService/GetOrder", `{"order_id":"fail"}`)
+	st, ok := status.FromError(err)
+	if !ok || st.Code() != codes.FailedPrecondition {
+		t.Fatalf("err = %v, want FailedPrecondition", err)
+	}
+	details := st.Details()
+	if len(details) != 1 {
+		t.Fatalf("details = %v, want one PreconditionFailure", details)
+	}
+	precondition, ok := details[0].(*errdetails.PreconditionFailure)
+	if !ok {
+		t.Fatalf("details[0] = %T, want *errdetails.PreconditionFailure", details[0])
+	}
+	violations := precondition.GetViolations()
+	if len(violations) != 1 || violations[0].GetSubject() != "o-123" {
+		t.Fatalf("violations = %v, want subject o-123", violations)
+	}
+}
+
+func TestUnaryTemplateAndResponseMetadata(t *testing.T) {
+	reg, conn := startServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ctx = metadata.AppendToOutgoingContext(ctx, "x-tenant", "acme")
+	var header, trailer metadata.MD
+
+	out, err := invokeWithOptions(t, reg, conn, ctx, "/shop.v1.OrderService/GetOrder", `{"order_id":"echo"}`,
+		grpc.Header(&header), grpc.Trailer(&trailer))
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if !strings.Contains(out, "tenant acme") {
+		t.Errorf("response %s missing rendered tenant", out)
+	}
+	if got := header.Get("x-mock"); len(got) != 1 || got[0] != "echo" {
+		t.Errorf("x-mock header = %v, want [echo]", got)
+	}
+	if got := trailer.Get("x-served-by"); len(got) != 1 || got[0] != "simulacra" {
+		t.Errorf("x-served-by trailer = %v, want [simulacra]", got)
+	}
+}
+
+func TestUnaryDelayHonorsDeadline(t *testing.T) {
+	reg, conn := startServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+
+	_, err := invoke(t, reg, conn, ctx, "/shop.v1.OrderService/GetOrder", `{"order_id":"slow"}`)
+	if st, ok := status.FromError(err); !ok || st.Code() != codes.DeadlineExceeded {
+		t.Fatalf("err = %v, want DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("deadline returned after %v, want under 1s", elapsed)
 	}
 }
 
