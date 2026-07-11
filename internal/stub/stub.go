@@ -142,8 +142,15 @@ func (c *Compiler) Compile(s Stub, source string) (*Compiled, error) {
 }
 
 func (c *Compiler) compilePlan(method protoreflect.MethodDescriptor, shape match.Shape, spec Respond, source string) (*Plan, error) {
-	plan := &Plan{Header: metadata.New(spec.Metadata), Trailer: metadata.New(spec.Trailers)}
-	var err error
+	header, err := compileMetadata(spec.Metadata)
+	if err != nil {
+		return nil, fmt.Errorf("%s: respond.metadata: %w", source, err)
+	}
+	trailer, err := compileMetadata(spec.Trailers)
+	if err != nil {
+		return nil, fmt.Errorf("%s: respond.trailers: %w", source, err)
+	}
+	plan := &Plan{Header: header, Trailer: trailer}
 	if spec.Delay != "" {
 		plan.Delay, err = ParseDelay(spec.Delay)
 		if err != nil {

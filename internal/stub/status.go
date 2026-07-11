@@ -37,8 +37,16 @@ func compileStatus(reg *schema.Registry, spec *StatusSpec, allowOK bool) (*statu
 	if err := code.UnmarshalJSON(encodedCode); err != nil {
 		return nil, fmt.Errorf("invalid status code %q: %w", spec.Code, err)
 	}
-	if code == codes.OK && !allowOK {
-		return nil, fmt.Errorf("status code OK is not allowed here")
+	if code == codes.OK {
+		if !allowOK {
+			return nil, fmt.Errorf("status code OK is not allowed here")
+		}
+		if spec.Message != "" {
+			return nil, fmt.Errorf("status code OK must not include a message")
+		}
+		if len(spec.Details) != 0 {
+			return nil, fmt.Errorf("status code OK must not include details")
+		}
 	}
 
 	protoStatus := &spb.Status{Code: int32(code), Message: spec.Message}

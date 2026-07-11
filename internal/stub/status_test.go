@@ -75,7 +75,7 @@ func TestCompileStatusPacksRegistryMessageDetail(t *testing.T) {
 
 func TestCompileStatusRejectsOKUnlessAllowed(t *testing.T) {
 	reg := testRegistry(t)
-	spec := StatusSpec{Code: "OK", Message: "fine"}
+	spec := StatusSpec{Code: "OK"}
 	if _, err := compileStatus(reg, &spec, false); err == nil || !strings.Contains(err.Error(), "OK") {
 		t.Fatalf("compileStatus(..., false) error = %v, want mention of OK", err)
 	}
@@ -83,8 +83,34 @@ func TestCompileStatusRejectsOKUnlessAllowed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compileStatus(..., true): %v", err)
 	}
-	if got.Code() != codes.OK || got.Message() != "fine" {
-		t.Errorf("allowed status = (%v, %q), want (OK, %q)", got.Code(), got.Message(), "fine")
+	if got.Code() != codes.OK || got.Message() != "" {
+		t.Errorf("allowed status = (%v, %q), want bare OK", got.Code(), got.Message())
+	}
+}
+
+func TestCompileStatusRejectsOKWithPayload(t *testing.T) {
+	reg := testRegistry(t)
+	tests := []struct {
+		name string
+		spec StatusSpec
+		want string
+	}{
+		{name: "message", spec: StatusSpec{Code: "OK", Message: "silently lost"}, want: "message"},
+		{name: "details", spec: StatusSpec{
+			Code: "OK",
+			Details: []DetailSpec{{
+				Type:  "shop.v1.Customer",
+				Value: map[string]any{"id": "c-1"},
+			}},
+		}, want: "details"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := compileStatus(reg, &tt.spec, true)
+			if err == nil || !strings.Contains(err.Error(), "OK") || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("compileStatus error = %v, want OK and %q", err, tt.want)
+			}
+		})
 	}
 }
 
