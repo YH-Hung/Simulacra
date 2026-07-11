@@ -72,23 +72,16 @@ func (t Times) String() string {
 	case t.Never:
 		return "never"
 	case t.Exactly != nil:
-		return fmt.Sprintf("exactly %d %s", *t.Exactly, countNoun(*t.Exactly))
+		return fmt.Sprintf("exactly %d", *t.Exactly)
 	case t.AtLeast != nil && t.AtMost != nil:
-		return fmt.Sprintf("between %d and %d times", *t.AtLeast, *t.AtMost)
+		return fmt.Sprintf("at least %d and at most %d", *t.AtLeast, *t.AtMost)
 	case t.AtLeast != nil:
-		return fmt.Sprintf("at least %d %s", *t.AtLeast, countNoun(*t.AtLeast))
+		return fmt.Sprintf("at least %d", *t.AtLeast)
 	case t.AtMost != nil:
-		return fmt.Sprintf("at most %d %s", *t.AtMost, countNoun(*t.AtMost))
+		return fmt.Sprintf("at most %d", *t.AtMost)
 	default:
 		return "invalid times assertion"
 	}
-}
-
-func countNoun(count int) string {
-	if count == 1 {
-		return "time"
-	}
-	return "times"
 }
 
 // Miss explains why a considered call did not satisfy the matcher.

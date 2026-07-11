@@ -56,11 +56,11 @@ func TestTimesOKAndString(t *testing.T) {
 		wantOK     bool
 		wantString string
 	}{
-		{name: "exactly passes", times: Times{Exactly: intPtr(2)}, count: 2, wantOK: true, wantString: "exactly 2 times"},
-		{name: "exactly fails", times: Times{Exactly: intPtr(2)}, count: 1, wantString: "exactly 2 times"},
-		{name: "at least", times: Times{AtLeast: intPtr(2)}, count: 3, wantOK: true, wantString: "at least 2 times"},
-		{name: "at most", times: Times{AtMost: intPtr(2)}, count: 3, wantString: "at most 2 times"},
-		{name: "range", times: Times{AtLeast: intPtr(1), AtMost: intPtr(3)}, count: 2, wantOK: true, wantString: "between 1 and 3 times"},
+		{name: "exactly passes", times: Times{Exactly: intPtr(2)}, count: 2, wantOK: true, wantString: "exactly 2"},
+		{name: "exactly fails", times: Times{Exactly: intPtr(2)}, count: 1, wantString: "exactly 2"},
+		{name: "at least", times: Times{AtLeast: intPtr(2)}, count: 3, wantOK: true, wantString: "at least 2"},
+		{name: "at most", times: Times{AtMost: intPtr(2)}, count: 3, wantString: "at most 2"},
+		{name: "range", times: Times{AtLeast: intPtr(1), AtMost: intPtr(3)}, count: 2, wantOK: true, wantString: "at least 1 and at most 3"},
 		{name: "never", times: Times{Never: true}, count: 0, wantOK: true, wantString: "never"},
 	}
 	for _, tt := range tests {
@@ -85,13 +85,13 @@ func TestVerifyCountsMatchingCalls(t *testing.T) {
 		matched int
 		want    string
 	}{
-		{name: "exactly", matcher: orderOne, times: Times{Exactly: intPtr(2)}, pass: true, matched: 2, want: "exactly 2 times"},
-		{name: "at least", matcher: orderOne, times: Times{AtLeast: intPtr(2)}, pass: true, matched: 2, want: "at least 2 times"},
-		{name: "at most", matcher: orderOne, times: Times{AtMost: intPtr(1)}, matched: 2, want: "at most 1 time"},
-		{name: "range", matcher: orderOne, times: Times{AtLeast: intPtr(1), AtMost: intPtr(2)}, pass: true, matched: 2, want: "between 1 and 2 times"},
+		{name: "exactly", matcher: orderOne, times: Times{Exactly: intPtr(2)}, pass: true, matched: 2, want: "exactly 2"},
+		{name: "at least", matcher: orderOne, times: Times{AtLeast: intPtr(2)}, pass: true, matched: 2, want: "at least 2"},
+		{name: "at most", matcher: orderOne, times: Times{AtMost: intPtr(1)}, matched: 2, want: "at most 1"},
+		{name: "range", matcher: orderOne, times: Times{AtLeast: intPtr(1), AtMost: intPtr(2)}, pass: true, matched: 2, want: "at least 1 and at most 2"},
 		{name: "never pass", matcher: orderNine, times: Times{Never: true}, pass: true, matched: 0, want: "never"},
 		{name: "never fail", matcher: orderOne, times: Times{Never: true}, matched: 2, want: "never"},
-		{name: "nil matcher counts all", matcher: nil, times: Times{Exactly: intPtr(3)}, pass: true, matched: 3, want: "exactly 3 times"},
+		{name: "nil matcher counts all", matcher: nil, times: Times{Exactly: intPtr(3)}, pass: true, matched: 3, want: "exactly 3"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -116,7 +116,7 @@ func TestVerifyFailureExplainsNonMatchingCall(t *testing.T) {
 		t.Fatalf("Verify: %v", err)
 	}
 	wantMisses := []Miss{{Seq: 3, Reasons: []string{`message order_id: expected to equal "o-1"; actual "o-2"`}}}
-	if report.Pass || report.Want != "exactly 3 times" || !reflect.DeepEqual(report.Misses, wantMisses) {
+	if report.Pass || report.Want != "exactly 3" || !reflect.DeepEqual(report.Misses, wantMisses) {
 		t.Fatalf("report = %#v, want failure with %#v", report, wantMisses)
 	}
 }
