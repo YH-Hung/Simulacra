@@ -5,6 +5,7 @@ package dataplane
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"strings"
 
@@ -104,7 +105,17 @@ func (s *Server) handleUnknown(_ any, stream grpc.ServerStream) error {
 func (s *Server) unary(stream grpc.ServerStream, full string, method protoreflect.MethodDescriptor, in match.Input) error {
 	req := dynamicpb.NewMessage(method.Input())
 	if err := stream.RecvMsg(req); err != nil {
-		return status.Errorf(codes.Internal, "simulacra: receiving request: %v", err)
+		if err == io.EOF {
+			return status.Error(codes.Internal, "simulacra: missing request for unary RPC")
+		}
+		return receiveError(err)
+	}
+	extra := dynamicpb.NewMessage(method.Input())
+	if err := stream.RecvMsg(extra); err != io.EOF {
+		if err == nil {
+			return status.Error(codes.Internal, "simulacra: unary request cardinality violation: received more than one request")
+		}
+		return receiveError(err)
 	}
 	in.Message = req.ProtoReflect()
 	selected, misses := s.store.SelectOrExplain(full, in)
@@ -115,6 +126,10 @@ func (s *Server) unary(stream grpc.ServerStream, full string, method protoreflec
 		return err
 	}
 	return sendSingle(stream, selected.Plan(), in)
+}
+
+func receiveError(err error) error {
+	return status.Errorf(status.Convert(err).Code(), "simulacra: receiving request: %v", err)
 }
 
 func applyMetadata(stream grpc.ServerStream, plan *stub.Plan) error {

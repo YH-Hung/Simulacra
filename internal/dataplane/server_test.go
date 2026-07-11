@@ -225,6 +225,103 @@ func TestUnaryDelayHonorsDeadline(t *testing.T) {
 	}
 }
 
+func TestUnaryRejectsMissingRequestFrame(t *testing.T) {
+	reg, conn := startServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stream, err := conn.NewStream(ctx, &grpc.StreamDesc{ClientStreams: true, ServerStreams: true},
+		"/shop.v1.OrderService/GetOrder")
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("CloseSend: %v", err)
+	}
+	method, err := reg.LookupMethod("/shop.v1.OrderService/GetOrder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = stream.RecvMsg(dynamicpb.NewMessage(method.Output()))
+	st := status.Convert(err)
+	if st.Code() != codes.Internal {
+		t.Fatalf("RecvMsg error = %v, want Internal", err)
+	}
+	if !strings.Contains(st.Message(), "missing request") {
+		t.Fatalf("message = %q, want missing request context", st.Message())
+	}
+}
+
+func TestUnaryRejectsSecondRequestFrame(t *testing.T) {
+	reg, conn := startServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stream, err := conn.NewStream(ctx, &grpc.StreamDesc{ClientStreams: true, ServerStreams: true},
+		"/shop.v1.OrderService/GetOrder")
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+	method, err := reg.LookupMethod("/shop.v1.OrderService/GetOrder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		req := dynamicpb.NewMessage(method.Input())
+		if err := protojson.Unmarshal([]byte(`{"order_id":"slow"}`), req); err != nil {
+			t.Fatal(err)
+		}
+		if err := stream.SendMsg(req); err != nil {
+			t.Fatalf("SendMsg(%d): %v", i+1, err)
+		}
+	}
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("CloseSend: %v", err)
+	}
+	err = stream.RecvMsg(dynamicpb.NewMessage(method.Output()))
+	st := status.Convert(err)
+	if st.Code() != codes.Internal {
+		t.Fatalf("RecvMsg error = %v, want Internal", err)
+	}
+	if !strings.Contains(st.Message(), "cardinality") {
+		t.Fatalf("message = %q, want cardinality context", st.Message())
+	}
+}
+
+type receiveErrorStream struct {
+	grpc.ServerStream
+	err error
+}
+
+func (s receiveErrorStream) Context() context.Context { return context.Background() }
+func (s receiveErrorStream) RecvMsg(any) error        { return s.err }
+
+func TestUnaryPreservesReceiveStatusCode(t *testing.T) {
+	reg := schema.NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), "../../testdata/protos"); err != nil {
+		t.Fatal(err)
+	}
+	method, err := reg.LookupMethod("/shop.v1.OrderService/GetOrder")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, code := range []codes.Code{codes.ResourceExhausted, codes.Canceled, codes.DeadlineExceeded} {
+		t.Run(code.String(), func(t *testing.T) {
+			receiveErr := status.Error(code, "transport receive failed")
+			err := (&Server{}).unary(receiveErrorStream{err: receiveErr},
+				"/shop.v1.OrderService/GetOrder", method, match.Input{})
+			st := status.Convert(err)
+			if st.Code() != code {
+				t.Fatalf("code = %s, want %s (err %v)", st.Code(), code, err)
+			}
+			if !strings.Contains(st.Message(), "receiving request") || !strings.Contains(st.Message(), "transport receive failed") {
+				t.Fatalf("message = %q, want receive context and cause", st.Message())
+			}
+		})
+	}
+}
+
 func TestNoMatchFormatsTopThreeAndEllipsis(t *testing.T) {
 	const full = "/shop.v1.OrderService/GetOrder"
 	reg := schema.NewRegistry()
