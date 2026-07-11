@@ -381,6 +381,18 @@ type receiveErrorStream struct {
 func (s receiveErrorStream) Context() context.Context { return context.Background() }
 func (s receiveErrorStream) RecvMsg(any) error        { return s.err }
 
+type headerErrorStream struct {
+	grpc.ServerStream
+	err error
+}
+
+func (s headerErrorStream) Context() context.Context     { return context.Background() }
+func (s headerErrorStream) SetHeader(metadata.MD) error  { return s.err }
+func (s headerErrorStream) SendHeader(metadata.MD) error { return s.err }
+func (s headerErrorStream) SetTrailer(metadata.MD)       {}
+func (s headerErrorStream) RecvMsg(any) error            { return io.EOF }
+func (s headerErrorStream) SendMsg(any) error            { return nil }
+
 func TestUnaryPreservesReceiveStatusCode(t *testing.T) {
 	reg := schema.NewRegistry()
 	if err := reg.AddProtoDir(context.Background(), "../../testdata/protos"); err != nil {
@@ -774,6 +786,75 @@ func TestBidirectionalStreamingFirstMatchingRuleWins(t *testing.T) {
 	}
 	if err := stream.RecvMsg(dynamicpb.NewMessage(method.Output())); err != io.EOF {
 		t.Fatalf("second overlapping-rule response = %v, want EOF", err)
+	}
+}
+
+func TestBidirectionalStreamingFlushesHeadersBeforeReceiving(t *testing.T) {
+	const rulesOnly = `
+- method: shop.v1.OrderService/Chat
+  respond:
+    metadata: { x-open: ready }
+    trailers: { x-final: done }
+    rules:
+      - match:
+          message:
+            text: { eq: ping }
+        send:
+          - message: { text: pong }
+`
+	reg, conn := startServerWithStubs(t, rulesOnly)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stream, method := openStream(t, reg, conn, ctx, "/shop.v1.OrderService/Chat")
+	header, err := stream.Header()
+	if err != nil {
+		t.Fatalf("Header before sending request: %v", err)
+	}
+	if got := header.Get("x-open"); len(got) != 1 || got[0] != "ready" {
+		t.Fatalf("x-open header = %v, want [ready]", got)
+	}
+	sendJSON(t, stream, method.Input(), `{"text":"ping"}`)
+	if got := recvText(t, stream, method.Output()); got != "pong" {
+		t.Fatalf("rule response = %q, want pong", got)
+	}
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("CloseSend: %v", err)
+	}
+	if err := stream.RecvMsg(dynamicpb.NewMessage(method.Output())); err != io.EOF {
+		t.Fatalf("RecvMsg after CloseSend = %v, want EOF", err)
+	}
+	if got := stream.Trailer().Get("x-final"); len(got) != 1 || got[0] != "done" {
+		t.Fatalf("x-final trailer = %v, want [done]", got)
+	}
+}
+
+func TestBidirectionalStreamingPreservesSendHeaderError(t *testing.T) {
+	reg := schema.NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), "../../testdata/protos"); err != nil {
+		t.Fatal(err)
+	}
+	method, err := reg.LookupMethod("/shop.v1.OrderService/Chat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	compiled, err := stub.Compile(reg, stub.Stub{
+		Method: "shop.v1.OrderService/Chat",
+		Respond: stub.Respond{
+			Metadata: map[string]string{"x-open": "ready"},
+			Rules: []stub.RuleSpec{{
+				Send: []stub.StepSpec{{Message: map[string]any{"text": "unused"}}},
+			}},
+		},
+	}, "chat.yaml#0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	headerErr := status.Error(codes.Unavailable, "header transport failed")
+	err = (&Server{store: stub.NewStore([]*stub.Compiled{compiled})}).bidi(
+		headerErrorStream{err: headerErr}, "/shop.v1.OrderService/Chat", method, match.Input{})
+	if err != headerErr {
+		t.Fatalf("bidi error = %v, want exact SendHeader error %v", err, headerErr)
 	}
 }
 

@@ -112,8 +112,13 @@ func (s *Server) bidi(stream grpc.ServerStream, full string, method protoreflect
 		return s.noMatch(full, misses)
 	}
 	plan := selected.Plan()
-	if err := applyMetadata(stream, plan); err != nil {
-		return err
+	if len(plan.Trailer) > 0 {
+		stream.SetTrailer(plan.Trailer)
+	}
+	if len(plan.Header) > 0 {
+		if err := stream.SendHeader(plan.Header); err != nil {
+			return err
+		}
 	}
 	if err := runSteps(stream.Context(), stream, plan.OnOpen, in); err != nil {
 		return err
