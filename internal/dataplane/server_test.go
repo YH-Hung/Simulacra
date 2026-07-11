@@ -519,6 +519,43 @@ func TestUnknownMethodIsUnimplemented(t *testing.T) {
 	}
 }
 
+type panicTransportStream struct{ method string }
+
+func (s panicTransportStream) Method() string             { return s.method }
+func (panicTransportStream) SetHeader(metadata.MD) error  { return nil }
+func (panicTransportStream) SendHeader(metadata.MD) error { return nil }
+func (panicTransportStream) SetTrailer(metadata.MD) error { return nil }
+
+type contextServerStream struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (s contextServerStream) Context() context.Context { return s.ctx }
+
+func TestHandleUnknownRecordsInternalStatusAndRepanics(t *testing.T) {
+	calls := journal.New(1)
+	server := &Server{calls: calls} // nil registry deliberately panics after method extraction.
+	ctx := grpc.NewContextWithServerTransportStream(context.Background(), panicTransportStream{
+		method: "/shop.v1.OrderService/GetOrder",
+	})
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		_ = server.handleUnknown(nil, contextServerStream{ctx: ctx})
+	}()
+	if recovered == nil {
+		t.Fatal("handleUnknown did not repanic")
+	}
+	recorded := calls.List()
+	if len(recorded) != 1 || recorded[0].Err == nil || recorded[0].Err.Code() != codes.Internal {
+		t.Fatalf("journal = %+v, want one Internal panic call", recorded)
+	}
+	if recorded[0].Method != "/shop.v1.OrderService/GetOrder" || recorded[0].Duration < 0 {
+		t.Errorf("recorded method/duration = %q/%v", recorded[0].Method, recorded[0].Duration)
+	}
+}
+
 func TestReflectionListsAndResolvesServices(t *testing.T) {
 	_, conn, _ := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

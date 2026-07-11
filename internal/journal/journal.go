@@ -8,6 +8,7 @@ import (
 
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
@@ -32,9 +33,11 @@ type Filter struct {
 
 // Journal is a mutex-protected bounded journal.
 type Journal struct {
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	entries []*Call
 	cap     int
+	start   int
+	count   int
 	total   uint64
 }
 
@@ -42,38 +45,49 @@ func New(capacity int) *Journal {
 	if capacity < 1 {
 		capacity = 1
 	}
-	return &Journal{cap: capacity}
+	return &Journal{entries: make([]*Call, capacity), cap: capacity}
 }
 
-// Record assigns the next sequence number and retains the call.
+// Record assigns the next sequence number and retains an independent snapshot.
+// Capacity bounds calls, not decoded message bytes: every request and rendered
+// response is deliberately retained in full.
 func (j *Journal) Record(call *Call) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	j.total++
 	call.Seq = j.total
 	call.Method = normalizeMethod(call.Method)
-	if len(j.entries) == j.cap {
-		copy(j.entries, j.entries[1:])
-		j.entries[len(j.entries)-1] = call
-		return
+	retained := cloneCall(call)
+	var index int
+	if j.count < j.cap {
+		index = (j.start + j.count) % j.cap
+		j.count++
+	} else {
+		index = j.start
+		j.start = (j.start + 1) % j.cap
 	}
-	j.entries = append(j.entries, call)
+	j.entries[index] = retained
 }
 
-// List returns retained calls oldest first.
+// List returns independent call snapshots oldest first.
 func (j *Journal) List() []*Call {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	return append([]*Call(nil), j.entries...)
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	out := make([]*Call, j.count)
+	for i := 0; i < j.count; i++ {
+		out[i] = cloneCall(j.entries[(j.start+i)%j.cap])
+	}
+	return out
 }
 
 // Filter returns matching calls oldest first, restricted to the newest Limit.
 func (j *Journal) Filter(filter Filter) []*Call {
-	j.mu.Lock()
-	defer j.mu.Unlock()
+	j.mu.RLock()
+	defer j.mu.RUnlock()
 	method := normalizeMethod(filter.Method)
-	matched := make([]*Call, 0, len(j.entries))
-	for _, call := range j.entries {
+	matched := make([]*Call, 0, j.count)
+	for i := 0; i < j.count; i++ {
+		call := j.entries[(j.start+i)%j.cap]
 		if method == "" || call.Method == method {
 			matched = append(matched, call)
 		}
@@ -81,21 +95,53 @@ func (j *Journal) Filter(filter Filter) []*Call {
 	if filter.Limit > 0 && len(matched) > filter.Limit {
 		matched = matched[len(matched)-filter.Limit:]
 	}
-	return append([]*Call(nil), matched...)
+	out := make([]*Call, len(matched))
+	for i, call := range matched {
+		out[i] = cloneCall(call)
+	}
+	return out
 }
 
 // Reset clears retained entries without resetting sequence numbers or total.
 func (j *Journal) Reset() {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	j.entries = nil
+	for i := range j.entries {
+		j.entries[i] = nil
+	}
+	j.start = 0
+	j.count = 0
 }
 
 // Total returns the number of calls ever recorded.
 func (j *Journal) Total() uint64 {
-	j.mu.Lock()
-	defer j.mu.Unlock()
+	j.mu.RLock()
+	defer j.mu.RUnlock()
 	return j.total
+}
+
+func cloneCall(call *Call) *Call {
+	cloned := *call
+	cloned.Metadata = call.Metadata.Copy()
+	cloned.Requests = cloneMessages(call.Requests)
+	cloned.Responses = cloneMessages(call.Responses)
+	if call.Err != nil {
+		cloned.Err = status.FromProto(call.Err.Proto())
+	}
+	return &cloned
+}
+
+func cloneMessages(messages []*dynamicpb.Message) []*dynamicpb.Message {
+	if messages == nil {
+		return nil
+	}
+	cloned := make([]*dynamicpb.Message, len(messages))
+	for i, message := range messages {
+		if message != nil {
+			cloned[i] = proto.Clone(message).(*dynamicpb.Message)
+		}
+	}
+	return cloned
 }
 
 func normalizeMethod(method string) string {

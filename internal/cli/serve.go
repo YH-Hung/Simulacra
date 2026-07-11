@@ -23,6 +23,9 @@ func newServeCmd() *cobra.Command {
 		Use:   "serve",
 		Short: "Start the mock gRPC server",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if journalSize <= 0 {
+				return fmt.Errorf("journal-size must be greater than zero (got %d)", journalSize)
+			}
 			reg, err := src.buildRegistry(cmd.Context())
 			if err != nil {
 				return err

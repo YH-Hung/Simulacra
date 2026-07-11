@@ -81,17 +81,24 @@ func (s *Server) GracefulStop() { s.grpc.GracefulStop() }
 func (s *Server) Stop() { s.grpc.Stop() }
 
 func (s *Server) handleUnknown(_ any, stream grpc.ServerStream) (err error) {
-	md, _ := metadata.FromIncomingContext(stream.Context())
-	call := &journal.Call{Metadata: md.Copy(), Start: time.Now()}
+	call := &journal.Call{Start: time.Now()}
 	defer func() {
+		panicked := recover()
 		call.Duration = time.Since(call.Start)
-		if err != nil {
+		if panicked != nil {
+			call.Err = status.New(codes.Internal, fmt.Sprintf("simulacra: panic serving call: %v", panicked))
+		} else if err != nil {
 			call.Err = status.Convert(err)
 		}
 		if s.calls != nil {
 			s.calls.Record(call)
 		}
+		if panicked != nil {
+			panic(panicked)
+		}
 	}()
+	md, _ := metadata.FromIncomingContext(stream.Context())
+	call.Metadata = md.Copy()
 
 	full, ok := grpc.MethodFromServerStream(stream)
 	if !ok {
@@ -284,6 +291,7 @@ func sendSingle(stream grpc.ServerStream, plan *stub.Plan, in match.Input, call 
 	if err != nil {
 		return status.Errorf(codes.Internal, "simulacra: rendering response: %v", err)
 	}
+	// Responses are rendered attempts, retained even if the transport send fails.
 	call.Responses = append(call.Responses, response)
 	return stream.SendMsg(response)
 }
@@ -306,6 +314,7 @@ func runSteps(ctx context.Context, sender messageSender, steps []stub.Step, in m
 		if err != nil {
 			return status.Errorf(codes.Internal, "simulacra: rendering response: %v", err)
 		}
+		// Responses are rendered attempts, retained even if the transport send fails.
 		call.Responses = append(call.Responses, message)
 		if err := sender.SendMsg(message); err != nil {
 			return err
