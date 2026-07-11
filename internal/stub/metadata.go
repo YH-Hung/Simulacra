@@ -7,6 +7,17 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
+var transportReservedMetadataKeys = map[string]struct{}{
+	"content-type":      {},
+	"user-agent":        {},
+	"te":                {},
+	"grpc-status":       {},
+	"grpc-message":      {},
+	"grpc-timeout":      {},
+	"grpc-encoding":     {},
+	"grpc-message-type": {},
+}
+
 // compileMetadata validates response metadata at load time. Values for keys
 // ending in -bin are raw bytes carried in a Go/YAML string and are therefore
 // exempt from the printable-ASCII rule applied to ordinary metadata values.
@@ -36,6 +47,9 @@ func compileMetadata(values map[string]string) (metadata.MD, error) {
 func validateMetadataKey(key string) error {
 	if key == "" {
 		return fmt.Errorf("must not be empty")
+	}
+	if _, reserved := transportReservedMetadataKeys[key]; reserved {
+		return fmt.Errorf("transport-reserved metadata name is not allowed")
 	}
 	if strings.HasPrefix(key, "grpc-") {
 		return fmt.Errorf("reserved grpc- prefix is not allowed")

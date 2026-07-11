@@ -74,6 +74,38 @@ func TestCompileResponseMetadataPreservesCaseCollisions(t *testing.T) {
 	}
 }
 
+func TestCompileResponseMetadataRejectsTransportReservedNames(t *testing.T) {
+	reg := testRegistry(t)
+	reserved := []string{
+		"Content-Type",
+		"user-agent",
+		"te",
+		"grpc-status",
+		"grpc-message",
+		"grpc-timeout",
+		"grpc-encoding",
+		"grpc-message-type",
+	}
+	for _, key := range reserved {
+		for _, location := range []string{"metadata", "trailers"} {
+			t.Run(location+"/"+key, func(t *testing.T) {
+				respond := Respond{Metadata: map[string]string{key: "reserved"}}
+				if location == "trailers" {
+					respond = Respond{Trailers: map[string]string{key: "reserved"}}
+				}
+				_, err := Compile(reg, Stub{Method: "shop.v1.OrderService/GetOrder", Respond: respond}, "reserved.yaml#0")
+				if err == nil {
+					t.Fatal("Compile error = nil, want reserved metadata name error")
+				}
+				where := "respond." + location
+				if !strings.Contains(err.Error(), where) || !strings.Contains(err.Error(), key) {
+					t.Errorf("error %q must mention %q and key %q", err, where, key)
+				}
+			})
+		}
+	}
+}
+
 func TestCompileResponseMetadataRejectsInvalidKeysAndValuesWithContext(t *testing.T) {
 	reg := testRegistry(t)
 	tests := []struct {
