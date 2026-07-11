@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -22,6 +23,7 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/dynamicpb"
 
+	"github.com/yinghanhung/simulacra/internal/journal"
 	"github.com/yinghanhung/simulacra/internal/match"
 	"github.com/yinghanhung/simulacra/internal/schema"
 	"github.com/yinghanhung/simulacra/internal/stub"
@@ -30,11 +32,12 @@ import (
 type Server struct {
 	reg   *schema.Registry
 	store *stub.Store
+	calls *journal.Journal
 	grpc  *grpc.Server
 }
 
-func New(reg *schema.Registry, store *stub.Store) (*Server, error) {
-	s := &Server{reg: reg, store: store}
+func New(reg *schema.Registry, store *stub.Store, calls *journal.Journal) (*Server, error) {
+	s := &Server{reg: reg, store: store, calls: calls}
 	s.grpc = grpc.NewServer(grpc.UnknownServiceHandler(s.handleUnknown))
 
 	// Health: standard grpc.health.v1 protocol, always SERVING in M1.
@@ -77,33 +80,45 @@ func (s *Server) GracefulStop() { s.grpc.GracefulStop() }
 // Stop aborts all connections immediately.
 func (s *Server) Stop() { s.grpc.Stop() }
 
-func (s *Server) handleUnknown(_ any, stream grpc.ServerStream) error {
+func (s *Server) handleUnknown(_ any, stream grpc.ServerStream) (err error) {
+	md, _ := metadata.FromIncomingContext(stream.Context())
+	call := &journal.Call{Metadata: md.Copy(), Start: time.Now()}
+	defer func() {
+		call.Duration = time.Since(call.Start)
+		if err != nil {
+			call.Err = status.Convert(err)
+		}
+		if s.calls != nil {
+			s.calls.Record(call)
+		}
+	}()
+
 	full, ok := grpc.MethodFromServerStream(stream)
 	if !ok {
 		return status.Error(codes.Internal, "simulacra: no method name on stream")
 	}
+	call.Method = full
 	m, err := s.reg.LookupMethod(full)
 	if err != nil {
 		return status.Errorf(codes.Unimplemented, "simulacra: %v", err)
 	}
-	md, _ := metadata.FromIncomingContext(stream.Context())
 	in := match.Input{Method: strings.TrimPrefix(full, "/"), Metadata: md}
 
 	switch match.ShapeOf(m) {
 	case match.Unary:
-		return s.unary(stream, full, m, in)
+		return s.unary(stream, full, m, in, call)
 	case match.ServerStream:
-		return s.serverStream(stream, full, m, in)
+		return s.serverStream(stream, full, m, in, call)
 	case match.ClientStream:
-		return s.clientStream(stream, full, m, in)
+		return s.clientStream(stream, full, m, in, call)
 	case match.Bidi:
-		return s.bidi(stream, full, m, in)
+		return s.bidi(stream, full, m, in, call)
 	default:
 		return status.Errorf(codes.Internal, "simulacra: unsupported method shape for %s", full)
 	}
 }
 
-func (s *Server) bidi(stream grpc.ServerStream, full string, method protoreflect.MethodDescriptor, in match.Input) error {
+func (s *Server) bidi(stream grpc.ServerStream, full string, method protoreflect.MethodDescriptor, in match.Input, call *journal.Call) error {
 	if in.Messages == nil {
 		in.Messages = []protoreflect.Message{}
 	}
@@ -111,6 +126,7 @@ func (s *Server) bidi(stream grpc.ServerStream, full string, method protoreflect
 	if selected == nil {
 		return s.noMatch(full, misses)
 	}
+	call.StubSource = selected.Source
 	plan := selected.Plan()
 	if len(plan.Trailer) > 0 {
 		stream.SetTrailer(plan.Trailer)
@@ -120,7 +136,7 @@ func (s *Server) bidi(stream grpc.ServerStream, full string, method protoreflect
 			return err
 		}
 	}
-	if err := runSteps(stream.Context(), stream, plan.OnOpen, in); err != nil {
+	if err := runSteps(stream.Context(), stream, plan.OnOpen, in, call); err != nil {
 		return err
 	}
 
@@ -136,13 +152,14 @@ func (s *Server) bidi(stream grpc.ServerStream, full string, method protoreflect
 		if err != nil {
 			return receiveError(err)
 		}
+		call.Requests = append(call.Requests, message)
 		in.Message = message.ProtoReflect()
 		in.Messages = append(in.Messages, in.Message)
 		for _, rule := range plan.Rules {
 			if !rule.Matcher.Eval(in) {
 				continue
 			}
-			if err := runSteps(stream.Context(), stream, rule.Send, in); err != nil {
+			if err := runSteps(stream.Context(), stream, rule.Send, in, call); err != nil {
 				return err
 			}
 			break
@@ -150,7 +167,7 @@ func (s *Server) bidi(stream grpc.ServerStream, full string, method protoreflect
 	}
 }
 
-func (s *Server) clientStream(stream grpc.ServerStream, full string, method protoreflect.MethodDescriptor, in match.Input) error {
+func (s *Server) clientStream(stream grpc.ServerStream, full string, method protoreflect.MethodDescriptor, in match.Input, call *journal.Call) error {
 	if in.Messages == nil {
 		in.Messages = []protoreflect.Message{}
 	}
@@ -163,6 +180,7 @@ func (s *Server) clientStream(stream grpc.ServerStream, full string, method prot
 		if err != nil {
 			return receiveError(err)
 		}
+		call.Requests = append(call.Requests, message)
 		in.Messages = append(in.Messages, message.ProtoReflect())
 	}
 
@@ -170,14 +188,15 @@ func (s *Server) clientStream(stream grpc.ServerStream, full string, method prot
 	if selected == nil {
 		return s.noMatch(full, misses)
 	}
+	call.StubSource = selected.Source
 	if err := applyMetadata(stream, selected.Plan()); err != nil {
 		return err
 	}
-	return sendSingle(stream, selected.Plan(), in)
+	return sendSingle(stream, selected.Plan(), in, call)
 }
 
-func (s *Server) unary(stream grpc.ServerStream, full string, method protoreflect.MethodDescriptor, in match.Input) error {
-	req, err := receiveSingleRequest(stream, method, "unary")
+func (s *Server) unary(stream grpc.ServerStream, full string, method protoreflect.MethodDescriptor, in match.Input, call *journal.Call) error {
+	req, err := receiveSingleRequest(stream, method, "unary", call)
 	if err != nil {
 		return err
 	}
@@ -186,14 +205,15 @@ func (s *Server) unary(stream grpc.ServerStream, full string, method protoreflec
 	if selected == nil {
 		return s.noMatch(full, misses)
 	}
+	call.StubSource = selected.Source
 	if err := applyMetadata(stream, selected.Plan()); err != nil {
 		return err
 	}
-	return sendSingle(stream, selected.Plan(), in)
+	return sendSingle(stream, selected.Plan(), in, call)
 }
 
-func (s *Server) serverStream(stream grpc.ServerStream, full string, method protoreflect.MethodDescriptor, in match.Input) error {
-	req, err := receiveSingleRequest(stream, method, "server-streaming")
+func (s *Server) serverStream(stream grpc.ServerStream, full string, method protoreflect.MethodDescriptor, in match.Input, call *journal.Call) error {
+	req, err := receiveSingleRequest(stream, method, "server-streaming", call)
 	if err != nil {
 		return err
 	}
@@ -202,6 +222,7 @@ func (s *Server) serverStream(stream grpc.ServerStream, full string, method prot
 	if selected == nil {
 		return s.noMatch(full, misses)
 	}
+	call.StubSource = selected.Source
 	plan := selected.Plan()
 	if err := applyMetadata(stream, plan); err != nil {
 		return err
@@ -211,10 +232,10 @@ func (s *Server) serverStream(stream grpc.ServerStream, full string, method prot
 			return status.FromContextError(err).Err()
 		}
 	}
-	return runSteps(stream.Context(), stream, plan.Stream, in)
+	return runSteps(stream.Context(), stream, plan.Stream, in, call)
 }
 
-func receiveSingleRequest(stream grpc.ServerStream, method protoreflect.MethodDescriptor, shape string) (*dynamicpb.Message, error) {
+func receiveSingleRequest(stream grpc.ServerStream, method protoreflect.MethodDescriptor, shape string, call *journal.Call) (*dynamicpb.Message, error) {
 	req := dynamicpb.NewMessage(method.Input())
 	if err := stream.RecvMsg(req); err != nil {
 		if err == io.EOF {
@@ -222,9 +243,11 @@ func receiveSingleRequest(stream grpc.ServerStream, method protoreflect.MethodDe
 		}
 		return nil, receiveError(err)
 	}
+	call.Requests = append(call.Requests, req)
 	extra := dynamicpb.NewMessage(method.Input())
 	if err := stream.RecvMsg(extra); err != io.EOF {
 		if err == nil {
+			call.Requests = append(call.Requests, extra)
 			return nil, status.Errorf(codes.Internal, "simulacra: %s request cardinality violation: received more than one request", shape)
 		}
 		return nil, receiveError(err)
@@ -248,7 +271,7 @@ func applyMetadata(stream grpc.ServerStream, plan *stub.Plan) error {
 	return nil
 }
 
-func sendSingle(stream grpc.ServerStream, plan *stub.Plan, in match.Input) error {
+func sendSingle(stream grpc.ServerStream, plan *stub.Plan, in match.Input, call *journal.Call) error {
 	if plan.Delay != nil {
 		if err := plan.Delay.Wait(stream.Context()); err != nil {
 			return status.FromContextError(err).Err()
@@ -261,6 +284,7 @@ func sendSingle(stream grpc.ServerStream, plan *stub.Plan, in match.Input) error
 	if err != nil {
 		return status.Errorf(codes.Internal, "simulacra: rendering response: %v", err)
 	}
+	call.Responses = append(call.Responses, response)
 	return stream.SendMsg(response)
 }
 
@@ -268,7 +292,7 @@ type messageSender interface {
 	SendMsg(any) error
 }
 
-func runSteps(ctx context.Context, sender messageSender, steps []stub.Step, in match.Input) error {
+func runSteps(ctx context.Context, sender messageSender, steps []stub.Step, in match.Input, call *journal.Call) error {
 	for _, step := range steps {
 		if step.Delay != nil {
 			if err := step.Delay.Wait(ctx); err != nil {
@@ -282,6 +306,7 @@ func runSteps(ctx context.Context, sender messageSender, steps []stub.Step, in m
 		if err != nil {
 			return status.Errorf(codes.Internal, "simulacra: rendering response: %v", err)
 		}
+		call.Responses = append(call.Responses, message)
 		if err := sender.SendMsg(message); err != nil {
 			return err
 		}

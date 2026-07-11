@@ -11,12 +11,14 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/yinghanhung/simulacra/internal/dataplane"
+	"github.com/yinghanhung/simulacra/internal/journal"
 	"github.com/yinghanhung/simulacra/internal/stub"
 )
 
 func newServeCmd() *cobra.Command {
 	src := &sources{}
 	var listen string
+	var journalSize int
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Start the mock gRPC server",
@@ -29,7 +31,8 @@ func newServeCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			srv, err := dataplane.New(reg, stub.NewStore(stubs))
+			store := stub.NewStore(stubs)
+			srv, err := dataplane.New(reg, store, journal.New(journalSize))
 			if err != nil {
 				return err
 			}
@@ -51,5 +54,6 @@ func newServeCmd() *cobra.Command {
 	}
 	src.register(cmd)
 	cmd.Flags().StringVar(&listen, "listen", ":6565", "data-plane listen address")
+	cmd.Flags().IntVar(&journalSize, "journal-size", 1024, "number of recent data-plane calls to retain")
 	return cmd
 }

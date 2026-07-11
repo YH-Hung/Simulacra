@@ -24,6 +24,7 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/dynamicpb"
 
+	"github.com/yinghanhung/simulacra/internal/journal"
 	"github.com/yinghanhung/simulacra/internal/match"
 	"github.com/yinghanhung/simulacra/internal/schema"
 	"github.com/yinghanhung/simulacra/internal/stub"
@@ -110,11 +111,11 @@ func writeStubFile(dir, content string) error {
 	return os.WriteFile(filepath.Join(dir, "stubs.yaml"), []byte(content), 0o644)
 }
 
-func startServer(t *testing.T) (*schema.Registry, *grpc.ClientConn) {
+func startServer(t *testing.T) (*schema.Registry, *grpc.ClientConn, *journal.Journal) {
 	return startServerWithStubs(t, stubsYAML)
 }
 
-func startServerWithStubs(t *testing.T, contents string) (*schema.Registry, *grpc.ClientConn) {
+func startServerWithStubs(t *testing.T, contents string) (*schema.Registry, *grpc.ClientConn, *journal.Journal) {
 	t.Helper()
 	reg := schema.NewRegistry()
 	if err := reg.AddProtoDir(context.Background(), "../../testdata/protos"); err != nil {
@@ -128,7 +129,8 @@ func startServerWithStubs(t *testing.T, contents string) (*schema.Registry, *grp
 	if len(errs) > 0 {
 		t.Fatalf("stub load errors: %v", errs)
 	}
-	srv, err := New(reg, stub.NewStore(stubs))
+	j := journal.New(100)
+	srv, err := New(reg, stub.NewStore(stubs), j)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -145,7 +147,7 @@ func startServerWithStubs(t *testing.T, contents string) (*schema.Registry, *grp
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	return reg, conn
+	return reg, conn, j
 }
 
 func invoke(t *testing.T, reg *schema.Registry, conn *grpc.ClientConn, ctx context.Context, method, reqJSON string) (string, error) {
@@ -214,7 +216,7 @@ func recvText(t *testing.T, stream grpc.ClientStream, desc protoreflect.MessageD
 }
 
 func TestUnaryMatchedCall(t *testing.T) {
-	reg, conn := startServer(t)
+	reg, conn, calls := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	ctx = metadata.AppendToOutgoingContext(ctx, "x-tenant", "acme")
@@ -228,10 +230,32 @@ func TestUnaryMatchedCall(t *testing.T) {
 			t.Errorf("response %s missing %q", out, want)
 		}
 	}
+	recorded := calls.List()
+	if len(recorded) != 1 {
+		t.Fatalf("journal calls = %d, want 1", len(recorded))
+	}
+	call := recorded[0]
+	if call.Method != "/shop.v1.OrderService/GetOrder" || call.StubSource == "" {
+		t.Errorf("journal method/source = %q/%q", call.Method, call.StubSource)
+	}
+	if got := call.Metadata.Get("x-tenant"); len(got) != 1 || got[0] != "acme" {
+		t.Errorf("journal metadata x-tenant = %v, want [acme]", got)
+	}
+	if call.Err != nil || call.Start.IsZero() || call.Duration < 0 {
+		t.Errorf("journal status/timing = %v/%v/%v", call.Err, call.Start, call.Duration)
+	}
+	if len(call.Requests) != 1 || len(call.Responses) != 1 {
+		t.Fatalf("journal request/response counts = %d/%d, want 1/1", len(call.Requests), len(call.Responses))
+	}
+	requestJSON, _ := protojson.Marshal(call.Requests[0])
+	responseJSON, _ := protojson.Marshal(call.Responses[0])
+	if !strings.Contains(string(requestJSON), "o-123") || !strings.Contains(string(responseJSON), "SHIPPED") {
+		t.Errorf("journal request/response = %s/%s", requestJSON, responseJSON)
+	}
 }
 
 func TestUnaryNoStubMatched(t *testing.T) {
-	reg, conn := startServer(t)
+	reg, conn, calls := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	// Right method, but metadata is missing → no stub matches.
@@ -246,10 +270,17 @@ func TestUnaryNoStubMatched(t *testing.T) {
 	if !strings.Contains(st.Message(), "x-tenant") {
 		t.Errorf("message %q should include the nearest-miss metadata detail", st.Message())
 	}
+	recorded := calls.List()
+	if len(recorded) != 1 || recorded[0].Err == nil || recorded[0].Err.Code() != codes.NotFound {
+		t.Fatalf("journal = %+v, want one NotFound call", recorded)
+	}
+	if recorded[0].StubSource != "" || len(recorded[0].Requests) != 1 || len(recorded[0].Responses) != 0 {
+		t.Errorf("journal unmatched source/requests/responses = %q/%d/%d", recorded[0].StubSource, len(recorded[0].Requests), len(recorded[0].Responses))
+	}
 }
 
 func TestUnaryStatusIncludesConcretePreconditionFailure(t *testing.T) {
-	reg, conn := startServer(t)
+	reg, conn, _ := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -273,7 +304,7 @@ func TestUnaryStatusIncludesConcretePreconditionFailure(t *testing.T) {
 }
 
 func TestUnaryTemplateAndResponseMetadata(t *testing.T) {
-	reg, conn := startServer(t)
+	reg, conn, _ := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	ctx = metadata.AppendToOutgoingContext(ctx, "x-tenant", "acme")
@@ -296,7 +327,7 @@ func TestUnaryTemplateAndResponseMetadata(t *testing.T) {
 }
 
 func TestUnaryDelayHonorsDeadline(t *testing.T) {
-	reg, conn := startServer(t)
+	reg, conn, _ := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	started := time.Now()
@@ -311,7 +342,7 @@ func TestUnaryDelayHonorsDeadline(t *testing.T) {
 }
 
 func TestUnaryRejectsMissingRequestFrame(t *testing.T) {
-	reg, conn := startServer(t)
+	reg, conn, _ := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -338,7 +369,7 @@ func TestUnaryRejectsMissingRequestFrame(t *testing.T) {
 }
 
 func TestUnaryRejectsSecondRequestFrame(t *testing.T) {
-	reg, conn := startServer(t)
+	reg, conn, _ := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -407,7 +438,7 @@ func TestUnaryPreservesReceiveStatusCode(t *testing.T) {
 		t.Run(code.String(), func(t *testing.T) {
 			receiveErr := status.Error(code, "transport receive failed")
 			err := (&Server{}).unary(receiveErrorStream{err: receiveErr},
-				"/shop.v1.OrderService/GetOrder", method, match.Input{})
+				"/shop.v1.OrderService/GetOrder", method, match.Input{}, &journal.Call{})
 			st := status.Convert(err)
 			if st.Code() != code {
 				t.Fatalf("code = %s, want %s (err %v)", st.Code(), code, err)
@@ -470,7 +501,7 @@ func TestNoMatchFormatsTopThreeAndEllipsis(t *testing.T) {
 }
 
 func TestUnknownMethodIsUnimplemented(t *testing.T) {
-	reg, conn := startServer(t)
+	reg, conn, calls := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	// Any proto message works as a payload; the server must reject the
@@ -482,10 +513,14 @@ func TestUnknownMethodIsUnimplemented(t *testing.T) {
 	if st, ok := status.FromError(err); !ok || st.Code() != codes.Unimplemented {
 		t.Fatalf("err = %v, want Unimplemented", err)
 	}
+	recorded := calls.List()
+	if len(recorded) != 1 || recorded[0].Method != "/no.such.Service/Nope" || recorded[0].Err == nil || recorded[0].Err.Code() != codes.Unimplemented {
+		t.Fatalf("journal = %+v, want one Unimplemented unknown-method call", recorded)
+	}
 }
 
 func TestReflectionListsAndResolvesServices(t *testing.T) {
-	_, conn := startServer(t)
+	_, conn, _ := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -533,7 +568,7 @@ func TestReflectionListsAndResolvesServices(t *testing.T) {
 }
 
 func TestHealthCheck(t *testing.T) {
-	_, conn := startServer(t)
+	_, conn, _ := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	resp, err := healthpb.NewHealthClient(conn).Check(ctx, &healthpb.HealthCheckRequest{})
@@ -546,7 +581,7 @@ func TestHealthCheck(t *testing.T) {
 }
 
 func TestServerStreamingScript(t *testing.T) {
-	reg, conn := startServer(t)
+	reg, conn, _ := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -600,7 +635,7 @@ func TestServerStreamingScript(t *testing.T) {
 }
 
 func TestServerStreamingRejectsMissingRequestFrame(t *testing.T) {
-	reg, conn := startServer(t)
+	reg, conn, _ := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -616,7 +651,7 @@ func TestServerStreamingRejectsMissingRequestFrame(t *testing.T) {
 }
 
 func TestServerStreamingRejectsSecondRequestFrame(t *testing.T) {
-	reg, conn := startServer(t)
+	reg, conn, _ := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -642,7 +677,7 @@ func TestServerStreamingRejectsSecondRequestFrame(t *testing.T) {
 }
 
 func TestClientStreamingMatchesAtClose(t *testing.T) {
-	reg, conn := startServer(t)
+	reg, conn, _ := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -670,7 +705,7 @@ func TestClientStreamingMatchesAtClose(t *testing.T) {
 }
 
 func TestClientStreamingMatchesEmptyMessageList(t *testing.T) {
-	reg, conn := startServer(t)
+	reg, conn, _ := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -693,7 +728,7 @@ func TestClientStreamingMatchesEmptyMessageList(t *testing.T) {
 }
 
 func TestClientStreamingNoMatchExplainsMessagesExpression(t *testing.T) {
-	reg, conn := startServer(t)
+	reg, conn, _ := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -727,7 +762,7 @@ func TestClientStreamingPreservesReceiveStatusCode(t *testing.T) {
 		t.Run(code.String(), func(t *testing.T) {
 			receiveErr := status.Error(code, "transport receive failed")
 			err := (&Server{}).clientStream(receiveErrorStream{err: receiveErr},
-				"/shop.v1.OrderService/UploadOrders", method, match.Input{})
+				"/shop.v1.OrderService/UploadOrders", method, match.Input{}, &journal.Call{})
 			st := status.Convert(err)
 			if st.Code() != code {
 				t.Fatalf("code = %s, want %s (err %v)", st.Code(), code, err)
@@ -740,7 +775,7 @@ func TestClientStreamingPreservesReceiveStatusCode(t *testing.T) {
 }
 
 func TestBidirectionalStreamingReactiveRules(t *testing.T) {
-	reg, conn := startServer(t)
+	reg, conn, _ := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -767,7 +802,7 @@ func TestBidirectionalStreamingReactiveRules(t *testing.T) {
 }
 
 func TestBidirectionalStreamingFirstMatchingRuleWins(t *testing.T) {
-	reg, conn := startServer(t)
+	reg, conn, _ := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -802,7 +837,7 @@ func TestBidirectionalStreamingFlushesHeadersBeforeReceiving(t *testing.T) {
         send:
           - message: { text: pong }
 `
-	reg, conn := startServerWithStubs(t, rulesOnly)
+	reg, conn, _ := startServerWithStubs(t, rulesOnly)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -852,7 +887,7 @@ func TestBidirectionalStreamingPreservesSendHeaderError(t *testing.T) {
 	}
 	headerErr := status.Error(codes.Unavailable, "header transport failed")
 	err = (&Server{store: stub.NewStore([]*stub.Compiled{compiled})}).bidi(
-		headerErrorStream{err: headerErr}, "/shop.v1.OrderService/Chat", method, match.Input{})
+		headerErrorStream{err: headerErr}, "/shop.v1.OrderService/Chat", method, match.Input{}, &journal.Call{})
 	if err != headerErr {
 		t.Fatalf("bidi error = %v, want exact SendHeader error %v", err, headerErr)
 	}
@@ -868,7 +903,7 @@ func TestBidirectionalStreamingSelectsAtOpenAndExplainsMetadataMiss(t *testing.T
     on_open:
       - message: { text: welcome }
 `
-	reg, conn := startServerWithStubs(t, gated)
+	reg, conn, _ := startServerWithStubs(t, gated)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -906,7 +941,7 @@ func TestBidirectionalStreamingPreservesReceiveStatusCode(t *testing.T) {
 		t.Run(code.String(), func(t *testing.T) {
 			receiveErr := status.Error(code, "transport receive failed")
 			err := (&Server{store: stub.NewStore([]*stub.Compiled{compiled})}).bidi(
-				receiveErrorStream{err: receiveErr}, "/shop.v1.OrderService/Chat", method, match.Input{})
+				receiveErrorStream{err: receiveErr}, "/shop.v1.OrderService/Chat", method, match.Input{}, &journal.Call{})
 			st := status.Convert(err)
 			if st.Code() != code {
 				t.Fatalf("code = %s, want %s (err %v)", st.Code(), code, err)
@@ -942,7 +977,7 @@ func compileServerPlan(t *testing.T, reg *schema.Registry, respond stub.Respond)
 
 func TestRunStepsCompletesEmptyScript(t *testing.T) {
 	sender := &recordingSender{}
-	if err := runSteps(context.Background(), sender, nil, match.Input{}); err != nil {
+	if err := runSteps(context.Background(), sender, nil, match.Input{}, &journal.Call{}); err != nil {
 		t.Fatalf("runSteps: %v", err)
 	}
 	if len(sender.messages) != 0 {
@@ -959,7 +994,7 @@ func TestRunStepsPreservesSendError(t *testing.T) {
 		Message: map[string]any{"order_id": "o-123"},
 	}}})
 	sendErr := errors.New("transport send failed")
-	err := runSteps(context.Background(), &recordingSender{err: sendErr}, plan.Stream, match.Input{})
+	err := runSteps(context.Background(), &recordingSender{err: sendErr}, plan.Stream, match.Input{}, &journal.Call{})
 	if err != sendErr {
 		t.Fatalf("runSteps error = %v, want exact send error %v", err, sendErr)
 	}
@@ -975,7 +1010,7 @@ func TestRunStepsHonorsCanceledDelay(t *testing.T) {
 	}}})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := runSteps(ctx, &recordingSender{}, plan.Stream, match.Input{})
+	err := runSteps(ctx, &recordingSender{}, plan.Stream, match.Input{}, &journal.Call{})
 	if got := status.Code(err); got != codes.Canceled {
 		t.Fatalf("runSteps code = %s, want Canceled (err %v)", got, err)
 	}
@@ -989,7 +1024,7 @@ func TestRunStepsReturnsTerminalStatus(t *testing.T) {
 	plan := compileServerPlan(t, reg, stub.Respond{Stream: []stub.StepSpec{{
 		Status: &stub.StatusSpec{Code: "UNAVAILABLE", Message: "planned outage"},
 	}}})
-	err := runSteps(context.Background(), &recordingSender{}, plan.Stream, match.Input{})
+	err := runSteps(context.Background(), &recordingSender{}, plan.Stream, match.Input{}, &journal.Call{})
 	st := status.Convert(err)
 	if st.Code() != codes.Unavailable || st.Message() != "planned outage" {
 		t.Fatalf("runSteps error = %v, want Unavailable planned outage", err)
@@ -1004,7 +1039,7 @@ func TestRunStepsMapsTemplateFailureToInternal(t *testing.T) {
 	plan := compileServerPlan(t, reg, stub.Respond{Stream: []stub.StepSpec{{
 		Message: map[string]any{"note": "{{ metadata['missing'][0] }}"},
 	}}})
-	err := runSteps(context.Background(), &recordingSender{}, plan.Stream, match.Input{})
+	err := runSteps(context.Background(), &recordingSender{}, plan.Stream, match.Input{}, &journal.Call{})
 	st := status.Convert(err)
 	if st.Code() != codes.Internal || !strings.Contains(st.Message(), "rendering response") {
 		t.Fatalf("runSteps error = %v, want Internal rendering response", err)
