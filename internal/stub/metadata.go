@@ -28,7 +28,7 @@ func compileMetadata(values map[string]string) (metadata.MD, error) {
 				}
 			}
 		}
-		out[key] = []string{value}
+		out[key] = append(out[key], value)
 	}
 	return out, nil
 }

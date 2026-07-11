@@ -1,6 +1,7 @@
 package stub
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -36,6 +37,40 @@ func TestCompileMetadataPreservesNilAndEmpty(t *testing.T) {
 	}
 	if emptyMD == nil || len(emptyMD) != 0 {
 		t.Errorf("compileMetadata(empty) = %#v, want non-nil empty MD", emptyMD)
+	}
+}
+
+func TestCompileResponseMetadataPreservesCaseCollisions(t *testing.T) {
+	reg := testRegistry(t)
+	compiled, err := Compile(reg, Stub{
+		Method: "shop.v1.OrderService/GetOrder",
+		Respond: Respond{
+			Metadata: map[string]string{"X-Mock": "header-one", "x-mock": "header-two"},
+			Trailers: map[string]string{"X-Trail": "trailer-one", "x-trail": "trailer-two"},
+		},
+	}, "metadata.yaml#0")
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	tests := []struct {
+		name   string
+		values []string
+		want   []string
+	}{
+		{name: "header", values: compiled.Plan().Header.Get("x-mock"), want: []string{"header-one", "header-two"}},
+		{name: "trailer", values: compiled.Plan().Trailer.Get("x-trail"), want: []string{"trailer-one", "trailer-two"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if len(tt.values) != len(tt.want) {
+				t.Fatalf("values = %#v, want both %#v", tt.values, tt.want)
+			}
+			for _, value := range tt.want {
+				if !slices.Contains(tt.values, value) {
+					t.Errorf("values = %#v, missing %q", tt.values, value)
+				}
+			}
+		})
 	}
 }
 
