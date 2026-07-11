@@ -206,7 +206,7 @@ func TestTemplateRenderedEnumStringMustFitSchema(t *testing.T) {
 }
 
 func TestCELToJSONUsesCanonicalProtobufDuration(t *testing.T) {
-	got, err := celToJSON(-1500 * time.Millisecond)
+	got, err := celToJSON(nil, -1500*time.Millisecond)
 	if err != nil {
 		t.Fatalf("celToJSON: %v", err)
 	}
@@ -227,5 +227,37 @@ func TestTemplateLeavesMalformedSiteDelimiterStatic(t *testing.T) {
 	}
 	if note := messageJSON(t, got, reg.Types())["note"]; note != literal {
 		t.Errorf("note = %#v, want literal malformed delimiter", note)
+	}
+}
+
+func TestCELToJSONUsesSchemaResolverForDynamicAny(t *testing.T) {
+	reg, method, _ := templateParts(t)
+	request := dynamicpb.NewMessage(method.Output())
+	requestJSON := []byte(`{
+		"extra": {
+			"@type": "type.googleapis.com/shop.v1.Customer",
+			"id": "customer-7",
+			"region": "EU"
+		}
+	}`)
+	if err := (protojson.UnmarshalOptions{Resolver: reg.Types()}).Unmarshal(requestJSON, request); err != nil {
+		t.Fatalf("unmarshaling dynamic Any request: %v", err)
+	}
+
+	got, err := celToJSON(reg.Types(), request)
+	if err != nil {
+		t.Fatalf("celToJSON dynamic Any: %v", err)
+	}
+	data, ok := got.(json.RawMessage)
+	if !ok {
+		t.Fatalf("celToJSON result = %T, want json.RawMessage", got)
+	}
+	var rendered map[string]any
+	if err := json.Unmarshal(data, &rendered); err != nil {
+		t.Fatalf("unmarshaling rendered message: %v", err)
+	}
+	extra, ok := rendered["extra"].(map[string]any)
+	if !ok || extra["@type"] != "type.googleapis.com/shop.v1.Customer" || extra["id"] != "customer-7" {
+		t.Errorf("rendered extra = %#v, want dynamically resolved Customer", rendered["extra"])
 	}
 }

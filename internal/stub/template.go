@@ -52,7 +52,7 @@ func newTemplate(env *cel.Env, types *schema.Types, desc protoreflect.MessageDes
 	if _, err := BuildMessage(types, desc, templateProjection(fields).(map[string]any)); err != nil {
 		return nil, fmt.Errorf("%s: %w", source, err)
 	}
-	root, err := compileTemplateNode(env, fields)
+	root, err := compileTemplateNode(env, types, fields)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", source, err)
 	}
@@ -112,6 +112,7 @@ func (n staticNode) render(map[string]any) (any, error) { return n.value, nil }
 type exprNode struct {
 	program cel.Program
 	source  string
+	types   *schema.Types
 }
 
 func (n exprNode) render(activation map[string]any) (any, error) {
@@ -119,7 +120,7 @@ func (n exprNode) render(activation map[string]any) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("site {{ %s }}: %w", n.source, err)
 	}
-	value, err := celToJSON(result)
+	value, err := celToJSON(n.types, result)
 	if err != nil {
 		return nil, fmt.Errorf("site {{ %s }}: %w", n.source, err)
 	}
@@ -186,14 +187,14 @@ func (n listNode) render(activation map[string]any) (any, error) {
 	return out, nil
 }
 
-func compileTemplateNode(env *cel.Env, value any) (templateNode, error) {
+func compileTemplateNode(env *cel.Env, types *schema.Types, value any) (templateNode, error) {
 	switch value := value.(type) {
 	case string:
-		return compileTemplateString(env, value)
+		return compileTemplateString(env, types, value)
 	case map[string]any:
 		entries := make(map[string]templateNode, len(value))
 		for key, child := range value {
-			node, err := compileTemplateNode(env, child)
+			node, err := compileTemplateNode(env, types, child)
 			if err != nil {
 				return nil, fmt.Errorf("field %q: %w", key, err)
 			}
@@ -203,7 +204,7 @@ func compileTemplateNode(env *cel.Env, value any) (templateNode, error) {
 	case []any:
 		entries := make([]templateNode, len(value))
 		for i, child := range value {
-			node, err := compileTemplateNode(env, child)
+			node, err := compileTemplateNode(env, types, child)
 			if err != nil {
 				return nil, fmt.Errorf("element %d: %w", i, err)
 			}
@@ -215,11 +216,11 @@ func compileTemplateNode(env *cel.Env, value any) (templateNode, error) {
 	}
 }
 
-func compileTemplateString(env *cel.Env, value string) (templateNode, error) {
+func compileTemplateString(env *cel.Env, types *schema.Types, value string) (templateNode, error) {
 	trimmed := strings.TrimSpace(value)
 	matches := templateSiteRE.FindAllStringSubmatchIndex(trimmed, -1)
 	if len(matches) == 1 && matches[0][0] == 0 && matches[0][1] == len(trimmed) {
-		return compileExpr(env, trimmed[matches[0][2]:matches[0][3]])
+		return compileExpr(env, types, trimmed[matches[0][2]:matches[0][3]])
 	}
 
 	matches = templateSiteRE.FindAllStringSubmatchIndex(value, -1)
@@ -232,7 +233,7 @@ func compileTemplateString(env *cel.Env, value string) (templateNode, error) {
 		if match[0] > last {
 			parts = append(parts, interpPart{literal: value[last:match[0]]})
 		}
-		expr, err := compileExpr(env, value[match[2]:match[3]])
+		expr, err := compileExpr(env, types, value[match[2]:match[3]])
 		if err != nil {
 			return nil, err
 		}
@@ -245,7 +246,7 @@ func compileTemplateString(env *cel.Env, value string) (templateNode, error) {
 	return interpNode{parts: parts}, nil
 }
 
-func compileExpr(env *cel.Env, source string) (templateNode, error) {
+func compileExpr(env *cel.Env, types *schema.Types, source string) (templateNode, error) {
 	trimmed := strings.TrimSpace(source)
 	ast, issues := env.Compile(trimmed)
 	if issues.Err() != nil {
@@ -255,13 +256,13 @@ func compileExpr(env *cel.Env, source string) (templateNode, error) {
 	if err != nil {
 		return nil, fmt.Errorf("template site {{ %s }}: %w", trimmed, err)
 	}
-	return &exprNode{program: program, source: trimmed}, nil
+	return &exprNode{program: program, source: trimmed, types: types}, nil
 }
 
 // celToJSON converts CEL's native scalar and protobuf values into values the
 // standard JSON encoder can pass to protojson. Composite CEL list/map values
 // are intentionally rejected: response structure belongs in YAML.
-func celToJSON(value any) (any, error) {
+func celToJSON(resolver *schema.Types, value any) (any, error) {
 	if celValue, ok := value.(ref.Val); ok {
 		if types.IsError(celValue) {
 			return nil, fmt.Errorf("CEL evaluation failed: %v", celValue)
@@ -283,7 +284,7 @@ func celToJSON(value any) (any, error) {
 	case time.Duration:
 		return durationJSON(value)
 	case proto.Message:
-		data, err := protojson.Marshal(value)
+		data, err := (protojson.MarshalOptions{Resolver: resolver}).Marshal(value)
 		if err != nil {
 			return nil, fmt.Errorf("marshaling protobuf value as JSON: %w", err)
 		}
