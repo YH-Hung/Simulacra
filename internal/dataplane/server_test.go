@@ -83,6 +83,11 @@ const stubsYAML = `
     expr: 'size(messages) == 2 && messages.exists(m, m.order_id == "o-1")'
   respond:
     message: { note: 'got {{ size(messages) }} orders' }
+- method: shop.v1.OrderService/UploadOrders
+  match:
+    expr: 'size(messages) == 0'
+  respond:
+    message: { note: 'got {{ size(messages) }} orders' }
 `
 
 func writeStubFile(dir, content string) error {
@@ -616,6 +621,29 @@ func TestClientStreamingMatchesAtClose(t *testing.T) {
 	}
 	if err := stream.RecvMsg(dynamicpb.NewMessage(method.Output())); err != io.EOF {
 		t.Fatalf("second RecvMsg = %v, want EOF", err)
+	}
+}
+
+func TestClientStreamingMatchesEmptyMessageList(t *testing.T) {
+	reg, conn := startServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stream, method := openStream(t, reg, conn, ctx, "/shop.v1.OrderService/UploadOrders")
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("CloseSend: %v", err)
+	}
+
+	response := dynamicpb.NewMessage(method.Output())
+	if err := stream.RecvMsg(response); err != nil {
+		t.Fatalf("RecvMsg: %v", err)
+	}
+	body, err := protojson.Marshal(response)
+	if err != nil {
+		t.Fatalf("Marshal response: %v", err)
+	}
+	if !strings.Contains(string(body), "got 0 orders") {
+		t.Fatalf("response = %s, want templated empty message count", body)
 	}
 }
 

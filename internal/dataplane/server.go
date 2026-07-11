@@ -104,6 +104,9 @@ func (s *Server) handleUnknown(_ any, stream grpc.ServerStream) error {
 }
 
 func (s *Server) clientStream(stream grpc.ServerStream, full string, method protoreflect.MethodDescriptor, in match.Input) error {
+	if in.Messages == nil {
+		in.Messages = []protoreflect.Message{}
+	}
 	for {
 		message := dynamicpb.NewMessage(method.Input())
 		err := stream.RecvMsg(message)
