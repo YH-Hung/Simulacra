@@ -47,7 +47,13 @@ message GetOrderResponse {
   google.protobuf.Any extra = 5;
 }
 
+message ChatMessage {
+  string text = 1;
+}
+
 service OrderService {
   rpc GetOrder(GetOrderRequest) returns (GetOrderResponse);
   rpc WatchOrder(GetOrderRequest) returns (stream GetOrderResponse);
+  rpc UploadOrders(stream GetOrderRequest) returns (GetOrderResponse);
+  rpc Chat(stream ChatMessage) returns (stream ChatMessage);
 }

@@ -58,20 +58,20 @@ func TestLoadDirsReportsAllErrors(t *testing.T) {
 }
 
 func TestLoadDirsRejectsUnknownKeys(t *testing.T) {
-	// Strict parsing: M2 syntax (e.g. `delay:`) must fail loudly in M1.
+	// Strict parsing: unknown response syntax must fail loudly.
 	reg := testRegistry(t)
 	dir := t.TempDir()
 	writeFile(t, dir, "future.yaml", `
 - method: shop.v1.OrderService/GetOrder
   respond:
     message: {}
-    delay: 50ms
+    fault: unavailable
 `)
 	_, errs := LoadDirs(reg, []string{dir})
 	if len(errs) == 0 {
-		t.Fatal("expected an error for unknown key 'delay'")
+		t.Fatal("expected an error for unknown key 'fault'")
 	}
-	if !strings.Contains(errs[0].Error(), "delay") {
+	if !strings.Contains(errs[0].Error(), "fault") {
 		t.Errorf("error %q should mention the unknown key", errs[0])
 	}
 }
@@ -110,13 +110,13 @@ func TestLoadDirsMultiDocumentStrictInLaterDocs(t *testing.T) {
 - method: shop.v1.OrderService/GetOrder
   respond:
     message: {}
-    delay: 50ms
+    fault: unavailable
 `)
 	_, errs := LoadDirs(reg, []string{dir})
 	if len(errs) == 0 {
 		t.Fatal("expected an error for unknown key in second document")
 	}
-	if !strings.Contains(errs[0].Error(), "delay") {
+	if !strings.Contains(errs[0].Error(), "fault") {
 		t.Errorf("error %q should mention the unknown key", errs[0])
 	}
 }

@@ -42,7 +42,11 @@ func TestCompileBuildsResponse(t *testing.T) {
 	if c.Method != "/shop.v1.OrderService/GetOrder" {
 		t.Errorf("Method = %q, want normalized /shop.v1.OrderService/GetOrder", c.Method)
 	}
-	out, err := protojson.Marshal(c.Response())
+	response, err := c.Plan().Message.Render(match.Input{})
+	if err != nil {
+		t.Fatalf("rendering response: %v", err)
+	}
+	out, err := protojson.Marshal(response)
 	if err != nil {
 		t.Fatalf("marshaling response: %v", err)
 	}
@@ -69,7 +73,7 @@ func TestCompileErrors(t *testing.T) {
 		want string // substring of the error
 	}{
 		{"unknown method", Stub{Method: "shop.v1.OrderService/Nope"}, "Nope"},
-		{"streaming method", Stub{Method: "shop.v1.OrderService/WatchOrder"}, "unary"},
+		{"server-streaming without stream script", Stub{Method: "shop.v1.OrderService/WatchOrder"}, "stream"},
 		{"response field not in schema", Stub{
 			Method:  "shop.v1.OrderService/GetOrder",
 			Respond: Respond{Message: map[string]any{"no_such_field": 1}},

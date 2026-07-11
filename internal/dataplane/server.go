@@ -99,7 +99,15 @@ func (s *Server) handleUnknown(_ any, stream grpc.ServerStream) error {
 	if selected == nil {
 		return s.noMatch(full, misses)
 	}
-	return stream.SendMsg(selected.Response())
+	plan := selected.Plan()
+	if plan.Status != nil {
+		return plan.Status.Err()
+	}
+	response, err := plan.Message.Render(in)
+	if err != nil {
+		return status.Errorf(codes.Internal, "simulacra: rendering response: %v", err)
+	}
+	return stream.SendMsg(response)
 }
 
 func (s *Server) noMatch(full string, misses []stub.Miss) error {
