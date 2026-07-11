@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -86,8 +87,8 @@ func hasSites(value any) bool {
 	case string:
 		return templateSiteRE.MatchString(value)
 	case map[string]any:
-		for _, child := range value {
-			if hasSites(child) {
+		for _, key := range sortedKeys(value) {
+			if hasSites(value[key]) {
 				return true
 			}
 		}
@@ -159,16 +160,21 @@ func (n interpNode) render(activation map[string]any) (any, error) {
 	return out.String(), nil
 }
 
-type mapNode struct{ entries map[string]templateNode }
+type mapEntry struct {
+	key  string
+	node templateNode
+}
+
+type mapNode struct{ entries []mapEntry }
 
 func (n mapNode) render(activation map[string]any) (any, error) {
 	out := make(map[string]any, len(n.entries))
-	for key, child := range n.entries {
-		value, err := child.render(activation)
+	for _, entry := range n.entries {
+		value, err := entry.node.render(activation)
 		if err != nil {
-			return nil, fmt.Errorf("field %q: %w", key, err)
+			return nil, fmt.Errorf("field %q: %w", entry.key, err)
 		}
-		out[key] = value
+		out[entry.key] = value
 	}
 	return out, nil
 }
@@ -192,13 +198,13 @@ func compileTemplateNode(env *cel.Env, types *schema.Types, value any) (template
 	case string:
 		return compileTemplateString(env, types, value)
 	case map[string]any:
-		entries := make(map[string]templateNode, len(value))
-		for key, child := range value {
-			node, err := compileTemplateNode(env, types, child)
+		entries := make([]mapEntry, 0, len(value))
+		for _, key := range sortedKeys(value) {
+			node, err := compileTemplateNode(env, types, value[key])
 			if err != nil {
 				return nil, fmt.Errorf("field %q: %w", key, err)
 			}
-			entries[key] = node
+			entries = append(entries, mapEntry{key: key, node: node})
 		}
 		return mapNode{entries: entries}, nil
 	case []any:
@@ -318,8 +324,8 @@ func templateProjection(value any) any {
 		return value
 	case map[string]any:
 		out := make(map[string]any, len(value))
-		for key, child := range value {
-			out[key] = templateProjection(child)
+		for _, key := range sortedKeys(value) {
+			out[key] = templateProjection(value[key])
 		}
 		return out
 	case []any:
@@ -337,7 +343,8 @@ func templateProjection(value any) any {
 }
 
 func validateTemplateFields(desc protoreflect.MessageDescriptor, fields map[string]any) error {
-	for name, value := range fields {
+	for _, name := range sortedKeys(fields) {
+		value := fields[name]
 		field := fieldByJSONOrProtoName(desc, name)
 		if field == nil {
 			return fmt.Errorf("response message does not fit %s: unknown field %q", desc.FullName(), name)
@@ -345,7 +352,8 @@ func validateTemplateFields(desc protoreflect.MessageDescriptor, fields map[stri
 		if field.IsMap() {
 			if childDesc := field.MapValue().Message(); childDesc != nil {
 				if entries, ok := value.(map[string]any); ok {
-					for _, entry := range entries {
+					for _, key := range sortedKeys(entries) {
+						entry := entries[key]
 						if child, ok := entry.(map[string]any); ok {
 							if err := validateTemplateFields(childDesc, child); err != nil {
 								return err
@@ -379,6 +387,15 @@ func validateTemplateFields(desc protoreflect.MessageDescriptor, fields map[stri
 		}
 	}
 	return nil
+}
+
+func sortedKeys[V any](values map[string]V) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func fieldByJSONOrProtoName(desc protoreflect.MessageDescriptor, name string) protoreflect.FieldDescriptor {

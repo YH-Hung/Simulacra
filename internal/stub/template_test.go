@@ -173,6 +173,24 @@ func TestTemplateRejectsUnknownCELSymbolAtCompileTime(t *testing.T) {
 	}
 }
 
+func TestTemplateCompileReportsFirstFieldDeterministically(t *testing.T) {
+	reg, method, env := templateParts(t)
+	fields := map[string]any{
+		"order_id": "{{ missing_order_id }}",
+		"note":     "{{ missing_note }}",
+	}
+
+	for i := 0; i < 100; i++ {
+		_, err := newTemplate(env, reg.Types(), method.Output(), fields, "orders.yaml#2")
+		if err == nil {
+			t.Fatal("newTemplate succeeded, want CEL compile error")
+		}
+		if got := err.Error(); !strings.Contains(got, `field "note"`) || !strings.Contains(got, "missing_note") {
+			t.Fatalf("iteration %d: error = %q, want deterministic diagnostic for field note", i, got)
+		}
+	}
+}
+
 func TestTemplateMissingMetadataReportsSiteAndSource(t *testing.T) {
 	tmpl, _ := templateFor(t, map[string]any{
 		"note": "owner={{ metadata['missing'][0] }}",
@@ -185,6 +203,23 @@ func TestTemplateMissingMetadataReportsSiteAndSource(t *testing.T) {
 	for _, want := range []string{"orders.yaml#2", "metadata['missing'][0]"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+func TestTemplateRenderReportsFirstFieldDeterministically(t *testing.T) {
+	tmpl, _ := templateFor(t, map[string]any{
+		"order_id": "{{ metadata['missing-order'][0] }}",
+		"note":     "{{ metadata['missing-note'][0] }}",
+	})
+
+	for i := 0; i < 100; i++ {
+		_, err := tmpl.Render(match.Input{})
+		if err == nil {
+			t.Fatal("Render succeeded, want missing metadata error")
+		}
+		if got := err.Error(); !strings.Contains(got, `field "note"`) || !strings.Contains(got, "missing-note") {
+			t.Fatalf("iteration %d: error = %q, want deterministic diagnostic for field note", i, got)
 		}
 	}
 }
