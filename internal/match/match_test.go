@@ -148,6 +148,113 @@ func TestCompileErrors(t *testing.T) {
 	}
 }
 
+func TestStructuredMatcherUnsupportedKindsDiagnostics(t *testing.T) {
+	reg := schema.NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), "../../conformance/protos"); err != nil {
+		t.Fatalf("AddProtoDir: %v", err)
+	}
+	method, err := reg.LookupMethod("conformance.v1.CorpusService/Echo")
+	if err != nil {
+		t.Fatalf("LookupMethod: %v", err)
+	}
+
+	cases := []struct {
+		name      string
+		field     string
+		op        string
+		raw       any
+		want      []string
+		forbidden string
+	}{
+		{
+			name:  "bytes eq recommends expr",
+			field: "blob",
+			op:    "eq",
+			raw:   "AAEC",
+			want:  []string{`message field "blob"`, `field "blob" has kind bytes`, "use expr for bytes/message/map matching"},
+		},
+		{
+			name:  "singular message eq recommends expr",
+			field: "tree",
+			op:    "eq",
+			raw:   map[string]any{"label": "root"},
+			want:  []string{`message field "tree"`, `field "tree" has kind message`, "use expr for bytes/message/map matching"},
+		},
+		{
+			name:      "map eq recommends expr",
+			field:     "items",
+			op:        "eq",
+			raw:       map[string]any{},
+			want:      []string{`message field "items"`, `operator "eq"`, `map field "items"`, "use expr"},
+			forbidden: "use contains",
+		},
+		{
+			name:      "map ne recommends expr",
+			field:     "items",
+			op:        "ne",
+			raw:       map[string]any{},
+			want:      []string{`message field "items"`, `operator "ne"`, `map field "items"`, "use expr"},
+			forbidden: "use contains",
+		},
+		{
+			name:      "map in recommends expr",
+			field:     "items",
+			op:        "in",
+			raw:       []any{map[string]any{}},
+			want:      []string{`message field "items"`, `operator "in"`, `map field "items"`, "use expr"},
+			forbidden: "use contains",
+		},
+		{
+			name:      "map matches recommends expr",
+			field:     "items",
+			op:        "matches",
+			raw:       ".*",
+			want:      []string{`message field "items"`, `operator "matches"`, `map field "items"`, "use expr"},
+			forbidden: "use contains",
+		},
+		{
+			name:      "map contains recommends expr",
+			field:     "items",
+			op:        "contains",
+			raw:       "key",
+			want:      []string{`message field "items"`, `operator "contains"`, `map field "items"`, "use expr"},
+			forbidden: "use contains",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := NewCompiler(nil).Compile(method.Input(), &Block{
+				Message: map[string]Rules{tc.field: {tc.op: tc.raw}},
+			}, Unary)
+			if err == nil {
+				t.Fatal("Compile error = nil, want unsupported structured matcher diagnostic")
+			}
+			got := err.Error()
+			for _, want := range tc.want {
+				if !strings.Contains(got, want) {
+					t.Errorf("Compile error = %q, want substring %q", got, want)
+				}
+			}
+			if tc.forbidden != "" && strings.Contains(got, tc.forbidden) {
+				t.Errorf("Compile error = %q, must not contain %q", got, tc.forbidden)
+			}
+		})
+	}
+}
+
+func TestStructuredMatcherRepeatedFieldDiagnosticRecommendsContains(t *testing.T) {
+	desc := requestDesc(t)
+	_, err := NewCompiler(nil).Compile(desc, &Block{
+		Message: map[string]Rules{"tags": {"eq": "prio"}},
+	}, Unary)
+	if err == nil {
+		t.Fatal("Compile error = nil, want repeated-field diagnostic")
+	}
+	if got := err.Error(); !strings.Contains(got, `eq requires a singular field, "tags" is repeated (use contains)`) {
+		t.Fatalf("Compile error = %q, want repeated-field contains guidance", got)
+	}
+}
+
 func TestShapeValidation(t *testing.T) {
 	desc := requestDesc(t)
 	withMsg := &Block{Message: map[string]Rules{"order_id": {"eq": "x"}}}

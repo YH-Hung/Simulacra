@@ -393,6 +393,9 @@ func resolvePath(md protoreflect.MessageDescriptor, path string) ([]protoreflect
 func compileMsgRule(path []protoreflect.FieldDescriptor, op string, raw any) (msgRule, error) {
 	leaf := path[len(path)-1]
 	r := msgRule{path: path, op: op}
+	if leaf.IsMap() && slices.Contains([]string{"matches", "contains", "eq", "ne", "in"}, op) {
+		return r, fmt.Errorf("operator %q does not support map field %q (use expr for map matching)", op, leaf.Name())
+	}
 	switch op {
 	case "present":
 		want, ok := raw.(bool)
@@ -426,8 +429,8 @@ func compileMsgRule(path []protoreflect.FieldDescriptor, op string, raw any) (ms
 		r.lit = lit
 		return r, nil
 	case "eq", "ne":
-		if leaf.IsList() || leaf.IsMap() {
-			return r, fmt.Errorf("%s requires a singular field, %q is repeated/map (use contains)", op, leaf.Name())
+		if leaf.IsList() {
+			return r, fmt.Errorf("%s requires a singular field, %q is repeated (use contains)", op, leaf.Name())
 		}
 		lit, err := literalFor(leaf, raw)
 		if err != nil {
@@ -436,8 +439,8 @@ func compileMsgRule(path []protoreflect.FieldDescriptor, op string, raw any) (ms
 		r.lit = lit
 		return r, nil
 	case "in":
-		if leaf.IsList() || leaf.IsMap() {
-			return r, fmt.Errorf("in requires a singular field, %q is repeated/map", leaf.Name())
+		if leaf.IsList() {
+			return r, fmt.Errorf("in requires a singular field, %q is repeated", leaf.Name())
 		}
 		items, ok := raw.([]any)
 		if !ok {
