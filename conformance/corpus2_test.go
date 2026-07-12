@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/dynamicpb"
@@ -17,11 +18,10 @@ import (
 	"github.com/yinghanhung/simulacra/internal/stub"
 )
 
-func TestCorpusHardCasesII(t *testing.T) {
-	cases := []corpusCase{
-		{
-			feature: "any.registered",
-			stub: `
+var corpusCasesII = []corpusCase{
+	{
+		feature: "any.registered",
+		stub: `
 - method: conformance.v1.CorpusService/Echo
   match:
     expr: message.payload.id == "in-1"
@@ -31,25 +31,77 @@ func TestCorpusHardCasesII(t *testing.T) {
         "@type": type.googleapis.com/conformance.v1.Inner
         id: out-1
 `,
-			req: `{
+		req: `{
   "payload": {
     "@type": "type.googleapis.com/conformance.v1.Inner",
     "id": "in-1"
   }
 }`,
-			want: []string{"out-1", "type.googleapis.com/conformance.v1.Inner"},
-			expect: `{
+		want: []string{"out-1", "type.googleapis.com/conformance.v1.Inner"},
+		expect: `{
   "payload": {
     "@type": "type.googleapis.com/conformance.v1.Inner",
     "id": "out-1"
   }
 }`,
-		},
-	}
+	},
+	{
+		feature: "proto2.required_and_defaults",
+		stub: `
+- method: conformance.v1.LegacyService/Fetch
+  match:
+    message:
+      name: { eq: thing }
+    expr: message.level == 7
+  respond:
+    message: { note: fetched }
+`,
+		req:    `{"name":"thing"}`,
+		want:   []string{"fetched"},
+		expect: `{"note":"fetched"}`,
+	},
+	{
+		feature: "proto2.extensions",
+		stub: `
+- method: conformance.v1.LegacyService/Fetch
+  respond:
+    message:
+      note: x
+      "[conformance.v1.ext_tag]": tagged
+`,
+		req:    `{"name":"thing"}`,
+		want:   []string{"[conformance.v1.ext_tag]", "tagged"},
+		expect: `{"note":"x","[conformance.v1.ext_tag]":"tagged"}`,
+	},
+}
 
-	for _, tc := range cases {
+func TestCorpusHardCasesII(t *testing.T) {
+	for _, tc := range corpusCasesII {
 		t.Run(tc.feature, func(t *testing.T) {
-			runCorpus(t, tc)
+			h := start(t, tc.stub)
+			methodName := corpusMethod
+			if strings.Contains(tc.stub, "LegacyService") {
+				methodName = "/conformance.v1.LegacyService/Fetch"
+			}
+			desc := h.method(t, methodName, match.Unary)
+			ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+			defer cancel()
+			response, err := h.invoke(t, ctx, methodName, h.jsonMessage(t, desc.Input(), tc.req))
+			if err != nil {
+				t.Fatalf("invoke %s: %v", tc.feature, err)
+			}
+			decoded := dynamicpb.NewMessage(desc.Output())
+			h.unmarshalWire(t, h.marshalWire(t, response), decoded)
+			data, err := (protojson.MarshalOptions{Resolver: h.reg.Types()}).Marshal(decoded)
+			if err != nil {
+				t.Fatalf("marshal %s response: %v", tc.feature, err)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(string(data), want) {
+					t.Errorf("response %s missing %q", data, want)
+				}
+			}
+			assertCorpusResponse(t, h, desc.Output(), decoded, tc.expect)
 		})
 	}
 }
@@ -90,11 +142,7 @@ func TestCorpusRegisteredAnyResponseUnpacksSemantically(t *testing.T) {
 	}
 }
 
-func TestCorpusProto2RequiredAndDefaults(t *testing.T) {
-	t.Run("proto2.required_and_defaults", testCorpusProto2RequiredAndDefaults)
-}
-
-func testCorpusProto2RequiredAndDefaults(t *testing.T) {
+func TestCorpusProto2DefaultPresenceSemantics(t *testing.T) {
 	h := newHarness(t, `
 - method: conformance.v1.LegacyService/Fetch
   match:
@@ -127,11 +175,7 @@ func testCorpusProto2RequiredAndDefaults(t *testing.T) {
 	}
 }
 
-func TestCorpusProto2Extensions(t *testing.T) {
-	t.Run("proto2.extensions", testCorpusProto2Extensions)
-}
-
-func testCorpusProto2Extensions(t *testing.T) {
+func TestCorpusProto2ExtensionDescriptorSemantics(t *testing.T) {
 	h := newHarness(t, `
 - method: conformance.v1.LegacyService/Fetch
   respond:
@@ -230,7 +274,7 @@ func TestCorpusMissingRequiredProto2ResponseFailsAtLoad(t *testing.T) {
 	if len(errs) == 0 {
 		t.Fatal("LegacyThing response missing required name unexpectedly loaded")
 	}
-	if got := errs[0].Error(); !strings.Contains(got, "name") && !strings.Contains(got, "required") {
+	if got := strings.ToLower(errs[0].Error()); !strings.Contains(got, "name") || !strings.Contains(got, "required") {
 		t.Fatalf("load error = %q, want missing required name", got)
 	}
 }
