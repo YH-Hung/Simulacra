@@ -29,7 +29,7 @@ func (c *Compiled) Explain(in Input) []string {
 		}
 	}
 	if c.expr != nil {
-		out, _, err := c.expr.prg.Eval(Activation(in))
+		out, _, err := c.expr.prg.Eval(activation(in, c.expr.adapter))
 		switch {
 		case err != nil:
 			reasons = append(reasons, fmt.Sprintf("expr errored: %v (%s)", err, c.expr.src))

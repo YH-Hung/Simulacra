@@ -219,6 +219,32 @@ func TestExprMatching(t *testing.T) {
 	}
 }
 
+func TestExprRegisteredDynamicAny(t *testing.T) {
+	reg := schema.NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), "../../testdata/protos"); err != nil {
+		t.Fatalf("AddProtoDir: %v", err)
+	}
+	method, err := reg.LookupMethod("shop.v1.OrderService/GetOrder")
+	if err != nil {
+		t.Fatalf("LookupMethod: %v", err)
+	}
+	request := dynamicpb.NewMessage(method.Input())
+	if err := (protojson.UnmarshalOptions{Resolver: reg.Types()}).Unmarshal([]byte(`{
+  "payload": {"@type":"type.googleapis.com/shop.v1.AnyInner", "id":"in-1"}
+}`), request); err != nil {
+		t.Fatalf("build registered Any request: %v", err)
+	}
+	compiled, err := NewCompiler(reg.Files()).Compile(method.Input(), &Block{
+		Expr: `message.payload.id == "in-1"`,
+	}, Unary)
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	if !compiled.Eval(Input{Message: request.ProtoReflect()}) {
+		t.Fatal("registered dynamic Any expression did not match")
+	}
+}
+
 func TestExprMessagesForClientStream(t *testing.T) {
 	desc := requestDesc(t)
 	mc := NewCompiler(testFiles(t))

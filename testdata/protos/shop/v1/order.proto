@@ -28,6 +28,10 @@ message Item {
   int64 qty = 2;
 }
 
+message AnyInner {
+  string id = 1;
+}
+
 message GetOrderRequest {
   string order_id = 1;
   Customer customer = 2;
@@ -37,6 +41,7 @@ message GetOrderRequest {
   int32 small = 6;
   float ratio = 7;
   double precise = 8;
+  google.protobuf.Any payload = 9;
 }
 
 message GetOrderResponse {

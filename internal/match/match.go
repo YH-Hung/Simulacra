@@ -97,8 +97,9 @@ type Compiled struct {
 }
 
 type exprRule struct {
-	prg cel.Program
-	src string
+	prg     cel.Program
+	src     string
+	adapter types.Adapter
 }
 
 func (c *Compiler) Env(input protoreflect.MessageDescriptor, shape Shape) (*cel.Env, error) {
@@ -114,9 +115,15 @@ func (c *Compiler) Env(input protoreflect.MessageDescriptor, shape Shape) (*cel.
 	if env, ok := c.envs[key]; ok {
 		return env, nil
 	}
+	provider, err := newCELProvider(c.files)
+	if err != nil {
+		return nil, fmt.Errorf("building CEL type provider for %s: %w", input.FullName(), err)
+	}
+	adapter := newProtoAdapter(provider, c.files)
 	obj := cel.ObjectType(string(input.FullName()))
 	opts := []cel.EnvOption{
-		cel.TypeDescs(c.files),
+		cel.CustomTypeProvider(provider),
+		cel.CustomTypeAdapter(adapter),
 		cel.Variable("metadata", cel.MapType(cel.StringType, cel.ListType(cel.StringType))),
 		cel.Variable("method", cel.StringType),
 		cel.Variable("now", cel.TimestampType),
@@ -220,7 +227,7 @@ func (c *Compiler) Compile(input protoreflect.MessageDescriptor, b *Block, shape
 		if err != nil {
 			return nil, fmt.Errorf("expr: %w", err)
 		}
-		cmp.expr = &exprRule{prg: prg, src: b.Expr}
+		cmp.expr = &exprRule{prg: prg, src: b.Expr, adapter: env.CELTypeAdapter()}
 	}
 	return cmp, nil
 }
@@ -249,7 +256,7 @@ func (c *Compiled) Eval(in Input) bool {
 		}
 	}
 	if c.expr != nil {
-		out, _, err := c.expr.prg.Eval(Activation(in))
+		out, _, err := c.expr.prg.Eval(activation(in, c.expr.adapter))
 		if err != nil || out != types.True {
 			return false
 		}
@@ -258,6 +265,10 @@ func (c *Compiled) Eval(in Input) bool {
 }
 
 func Activation(in Input) map[string]any {
+	return activation(in, nil)
+}
+
+func activation(in Input, adapter types.Adapter) map[string]any {
 	md := map[string][]string{}
 	for k, v := range in.Metadata {
 		md[k] = v
@@ -268,12 +279,19 @@ func Activation(in Input) map[string]any {
 	}
 	act := map[string]any{"metadata": md, "method": in.Method, "now": now}
 	if in.Message != nil {
-		act["message"] = in.Message.Interface()
+		message := any(in.Message.Interface())
+		if adapter != nil {
+			message = adapter.NativeToValue(message)
+		}
+		act["message"] = message
 	}
 	if in.Messages != nil {
 		msgs := make([]any, len(in.Messages))
 		for i, m := range in.Messages {
 			msgs[i] = m.Interface()
+			if adapter != nil {
+				msgs[i] = adapter.NativeToValue(msgs[i])
+			}
 		}
 		act["messages"] = msgs
 	}
