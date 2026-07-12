@@ -21,12 +21,6 @@ type corpusCase struct {
 	req     string
 	want    []string
 	expect  string
-	extra   []corpusRequest
-}
-
-type corpusRequest struct {
-	req    string
-	expect string
 }
 
 func start(t *testing.T, stub string) *harness {
@@ -34,25 +28,9 @@ func start(t *testing.T, stub string) *harness {
 	return newHarness(t, stub)
 }
 
-func (h *harness) buildMsg(t *testing.T, desc protoreflect.MessageDescriptor, body string) *dynamicpb.Message {
-	t.Helper()
-	return h.jsonMessage(t, desc, body)
-}
-
-func (h *harness) invokeMsg(t *testing.T, desc protoreflect.MethodDescriptor, body string) *dynamicpb.Message {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
-	defer cancel()
-	response, err := h.invoke(t, ctx, corpusMethod, h.buildMsg(t, desc.Input(), body))
-	if err != nil {
-		t.Fatalf("invoke %s: %v", corpusMethod, err)
-	}
-	return response
-}
-
 func assertCorpusResponse(t *testing.T, h *harness, desc protoreflect.MessageDescriptor, got *dynamicpb.Message, body string) {
 	t.Helper()
-	want := h.buildMsg(t, desc, body)
+	want := h.jsonMessage(t, desc, body)
 	if proto.Equal(got, want) {
 		return
 	}
@@ -69,9 +47,13 @@ func runCorpus(t *testing.T, tc corpusCase) {
 	t.Helper()
 	h := start(t, tc.stub)
 	desc := h.method(t, corpusMethod, match.Unary)
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+	defer cancel()
 
-	response := h.invokeMsg(t, desc, tc.req)
-	assertCorpusResponse(t, h, desc.Output(), response, tc.expect)
+	response, err := h.invoke(t, ctx, corpusMethod, h.jsonMessage(t, desc.Input(), tc.req))
+	if err != nil {
+		t.Fatalf("invoke %s: %v", tc.feature, err)
+	}
 	data, err := (protojson.MarshalOptions{Resolver: h.reg.Types()}).Marshal(response)
 	if err != nil {
 		t.Fatalf("marshal %s response: %v", tc.feature, err)
@@ -82,9 +64,11 @@ func runCorpus(t *testing.T, tc corpusCase) {
 			t.Errorf("response %s missing %q", got, want)
 		}
 	}
-	for _, extra := range tc.extra {
-		assertCorpusResponse(t, h, desc.Output(), h.invokeMsg(t, desc, extra.req), extra.expect)
+	parsed := dynamicpb.NewMessage(desc.Output())
+	if err := (protojson.UnmarshalOptions{Resolver: h.reg.Types()}).Unmarshal(data, parsed); err != nil {
+		t.Fatalf("parse %s response: %v", tc.feature, err)
 	}
+	assertCorpusResponse(t, h, desc.Output(), parsed, tc.expect)
 }
 
 func TestCorpusHardCasesI(t *testing.T) {
@@ -162,18 +146,10 @@ func TestCorpusHardCasesI(t *testing.T) {
       word: { present: true }
   respond:
     message: { text: word chosen }
-- method: conformance.v1.CorpusService/Echo
-  priority: -1
-  respond:
-    message: { text: word absent }
 `,
 			req:    `{"word":""}`,
 			want:   []string{"word chosen"},
 			expect: `{"text":"word chosen"}`,
-			extra: []corpusRequest{
-				{req: `{}`, expect: `{"text":"word absent"}`},
-				{req: `{"number":0}`, expect: `{"text":"word absent"}`},
-			},
 		},
 		{
 			feature: "wkt.timestamp",
@@ -296,6 +272,34 @@ func TestCorpusHardCasesI(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.feature, func(t *testing.T) {
 			runCorpus(t, tc)
+		})
+	}
+}
+
+func TestCorpusOneofPresenceRejectsUnsetAlternatives(t *testing.T) {
+	h := start(t, `
+- method: conformance.v1.CorpusService/Echo
+  match:
+    message:
+      word: { present: true }
+  respond:
+    message: { text: word chosen }
+- method: conformance.v1.CorpusService/Echo
+  priority: -1
+  respond:
+    message: { text: word absent }
+`)
+	desc := h.method(t, corpusMethod, match.Unary)
+
+	for _, req := range []string{`{}`, `{"number":0}`} {
+		t.Run(req, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+			defer cancel()
+			response, err := h.invoke(t, ctx, corpusMethod, h.jsonMessage(t, desc.Input(), req))
+			if err != nil {
+				t.Fatalf("invoke %s: %v", corpusMethod, err)
+			}
+			assertCorpusResponse(t, h, desc.Output(), response, `{"text":"word absent"}`)
 		})
 	}
 }
