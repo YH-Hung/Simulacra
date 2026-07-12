@@ -1,0 +1,11 @@
+edition = "2023";
+
+package conformance.v1e;
+
+message EditionThing {
+  string name = 1;
+}
+
+service EditionService {
+  rpc Get(EditionThing) returns (EditionThing);
+}

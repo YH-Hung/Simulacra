@@ -1,0 +1,22 @@
+syntax = "proto2";
+
+package conformance.v1;
+
+message LegacyThing {
+  required string name = 1;
+  optional int32 level = 2 [default = 7];
+}
+
+message LegacyReply {
+  optional string note = 1;
+  extensions 100 to 199;
+}
+
+extend LegacyReply {
+  optional string ext_tag = 100;
+}
+
+service LegacyService {
+  rpc Fetch(LegacyThing) returns (LegacyReply);
+  rpc Make(LegacyReply) returns (LegacyThing);
+}

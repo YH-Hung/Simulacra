@@ -170,6 +170,22 @@ func (h *harness) jsonMessage(t *testing.T, desc protoreflect.MessageDescriptor,
 	return h.message(t, desc, message)
 }
 
+func (h *harness) marshalWire(t *testing.T, message proto.Message) []byte {
+	t.Helper()
+	data, err := proto.Marshal(message)
+	if err != nil {
+		t.Fatalf("proto.Marshal %s: %v", message.ProtoReflect().Descriptor().FullName(), err)
+	}
+	return data
+}
+
+func (h *harness) unmarshalWire(t *testing.T, data []byte, message proto.Message) {
+	t.Helper()
+	if err := (proto.UnmarshalOptions{Resolver: h.reg.Types()}).Unmarshal(data, message); err != nil {
+		t.Fatalf("proto.Unmarshal %s: %v", message.ProtoReflect().Descriptor().FullName(), err)
+	}
+}
+
 func (h *harness) invoke(t *testing.T, ctx context.Context, method string, req *dynamicpb.Message, opts ...grpc.CallOption) (*dynamicpb.Message, error) {
 	t.Helper()
 	desc := h.method(t, method, match.Unary)
