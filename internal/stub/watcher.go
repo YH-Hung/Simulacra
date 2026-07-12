@@ -1,5 +1,4 @@
-// Package watch monitors directory trees for changes.
-package watch
+package stub
 
 import (
 	"context"
@@ -62,12 +61,9 @@ func Watch(ctx context.Context, dirs []string, debounce time.Duration, onChange 
 				continue
 			}
 			if event.Op&fsnotify.Create != 0 {
-				info, statErr := os.Stat(event.Name)
-				if statErr == nil && info.IsDir() {
-					if err := addRecursive(w, watched, event.Name); err != nil {
-						return err
-					}
-				}
+				attachCreatedDirectory(event.Name, os.Stat, func(path string) error {
+					return addRecursive(w, watched, path)
+				})
 			}
 			if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
 				forgetTree(w, watched, event.Name)
@@ -84,6 +80,17 @@ func Watch(ctx context.Context, dirs []string, debounce time.Duration, onChange 
 			onChange()
 		}
 	}
+}
+
+func attachCreatedDirectory(path string, stat func(string) (os.FileInfo, error), add func(string) error) {
+	info, err := stat(path)
+	if err != nil || !info.IsDir() {
+		return
+	}
+	// The directory may be renamed or removed between Stat and walking it.
+	// Create events still schedule a reload, so a failed dynamic attachment is
+	// transient and must not terminate the watcher.
+	_ = add(path)
 }
 
 func addRecursive(w *fsnotify.Watcher, watched map[string]struct{}, root string) error {

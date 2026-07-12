@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -14,7 +15,6 @@ import (
 	"github.com/yinghanhung/simulacra/internal/journal"
 	"github.com/yinghanhung/simulacra/internal/schema"
 	"github.com/yinghanhung/simulacra/internal/stub"
-	"github.com/yinghanhung/simulacra/internal/watch"
 )
 
 func newServeCmd() *cobra.Command {
@@ -50,22 +50,28 @@ func newServeCmd() *cobra.Command {
 			cmd.Printf("simulacra: data plane listening on %s\n", lis.Addr())
 			cmd.Printf("  %d service(s) registered, %d stub(s) loaded — reflection and health enabled\n",
 				len(reg.Services()), len(stubs))
+			watcher := watcherRun{}
 			if watchStubs && len(src.stubDirs) > 0 {
-				go func() {
-					err := watch.Watch(cmd.Context(), src.stubDirs, 200*time.Millisecond, func() {
+				watcher = startWatcher(cmd.Context(), func(ctx context.Context) error {
+					return stub.Watch(ctx, src.stubDirs, 200*time.Millisecond, func() {
 						reloadStubDirs(cmd, reg, store, src.stubDirs)
 					})
-					if err != nil {
-						cmd.PrintErrln("watch error:", err)
-					}
-				}()
+				}, func(err error) {
+					cmd.PrintErrln("watch error:", err)
+				})
 			}
 
 			sig := make(chan os.Signal, 2)
 			signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 			defer signal.Stop(sig)
-			go waitAndShutdown(sig, 10*time.Second, srv.GracefulStop, srv.Stop, cmd.Println)
-			return srv.Serve(lis)
+			go waitAndShutdown(sig, 10*time.Second, func() {
+				watcher.cancelNow()
+				srv.GracefulStop()
+			}, func() {
+				watcher.cancelNow()
+				srv.Stop()
+			}, cmd.Println)
+			return serveWithWatcher(watcher, func() error { return srv.Serve(lis) })
 		},
 	}
 	src.register(cmd)
@@ -73,6 +79,41 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().IntVar(&journalSize, "journal-size", 1024, "number of recent data-plane calls to retain")
 	cmd.Flags().BoolVar(&watchStubs, "watch", true, "watch stub directories and reload changes")
 	return cmd
+}
+
+type watcherRun struct {
+	cancel context.CancelFunc
+	done   <-chan struct{}
+}
+
+func startWatcher(parent context.Context, run func(context.Context) error, report func(error)) watcherRun {
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := run(ctx); err != nil {
+			report(err)
+		}
+	}()
+	return watcherRun{cancel: cancel, done: done}
+}
+
+func (w watcherRun) cancelNow() {
+	if w.cancel != nil {
+		w.cancel()
+	}
+}
+
+func (w watcherRun) stop() {
+	w.cancelNow()
+	if w.done != nil {
+		<-w.done
+	}
+}
+
+func serveWithWatcher(watcher watcherRun, serve func() error) error {
+	defer watcher.stop()
+	return serve()
 }
 
 func reloadStubDirs(cmd *cobra.Command, reg *schema.Registry, store *stub.Store, dirs []string) {

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -91,6 +92,70 @@ func TestReloadStubDirsKeepsInvalidStoreAndResetsValidBudget(t *testing.T) {
 	if !strings.Contains(output.String(), "1 stub(s) reloaded") {
 		t.Fatalf("valid reload output = %q, want count", output.String())
 	}
+}
+
+func TestServeWithWatcherStopsAndJoinsWatcherOnServeReturn(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	release := make(chan struct{})
+	watcher := startWatcher(context.Background(), func(ctx context.Context) error {
+		close(started)
+		<-ctx.Done()
+		close(canceled)
+		<-release
+		return nil
+	}, func(error) {})
+	<-started
+
+	returned := make(chan struct{})
+	go func() {
+		_ = serveWithWatcher(watcher, func() error { return nil })
+		close(returned)
+	}()
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("watcher was not canceled when Serve returned")
+	}
+	select {
+	case <-returned:
+		t.Fatal("serveWithWatcher returned before watcher goroutine exited")
+	default:
+	}
+	close(release)
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("serveWithWatcher did not join watcher goroutine")
+	}
+}
+
+func TestWatcherCanceledDuringSignalShutdown(t *testing.T) {
+	canceled := make(chan struct{})
+	watcher := startWatcher(context.Background(), func(ctx context.Context) error {
+		<-ctx.Done()
+		close(canceled)
+		return nil
+	}, func(error) {})
+
+	sig := make(chan os.Signal, 1)
+	shutdownDone := make(chan struct{})
+	go func() {
+		waitAndShutdown(sig, time.Second, watcher.cancelNow, func() {}, func(...any) {})
+		close(shutdownDone)
+	}()
+	sig <- os.Interrupt
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("watcher was not canceled during shutdown")
+	}
+	select {
+	case <-shutdownDone:
+	case <-time.After(time.Second):
+		t.Fatal("signal shutdown did not finish")
+	}
+	watcher.stop()
 }
 
 func TestServeRejectsNonPositiveJournalSize(t *testing.T) {

@@ -1,7 +1,8 @@
-package watch
+package stub
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -23,7 +24,6 @@ func TestWatchRecursivelyDebouncesAndAddsNewDirectories(t *testing.T) {
 			changes <- struct{}{}
 		})
 	}()
-	// Allow the initial recursive watches to be installed.
 	time.Sleep(50 * time.Millisecond)
 
 	file := filepath.Join(nested, "stub.yaml")
@@ -32,7 +32,7 @@ func TestWatchRecursivelyDebouncesAndAddsNewDirectories(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	waitForChange(t, changes)
+	waitForWatchedChange(t, changes)
 	select {
 	case <-changes:
 		t.Fatal("write burst produced more than one debounced callback")
@@ -43,12 +43,11 @@ func TestWatchRecursivelyDebouncesAndAddsNewDirectories(t *testing.T) {
 	if err := os.MkdirAll(created, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	waitForChange(t, changes) // directory creation itself is a change
-
+	waitForWatchedChange(t, changes)
 	if err := os.WriteFile(filepath.Join(created, "new.yaml"), []byte("stub"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	waitForChange(t, changes)
+	waitForWatchedChange(t, changes)
 
 	cancel()
 	select {
@@ -61,7 +60,33 @@ func TestWatchRecursivelyDebouncesAndAddsNewDirectories(t *testing.T) {
 	}
 }
 
-func waitForChange(t *testing.T, changes <-chan struct{}) {
+func TestAttachCreatedDirectoryToleratesTransientAddFailure(t *testing.T) {
+	dir := t.TempDir()
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("directory disappeared")
+	called := false
+	attachCreatedDirectory(dir, func(string) (os.FileInfo, error) {
+		return info, nil
+	}, func(string) error {
+		called = true
+		return wantErr
+	})
+	if !called {
+		t.Fatal("dynamic attach was not attempted")
+	}
+}
+
+func TestWatchReturnsInitialRootSetupError(t *testing.T) {
+	err := Watch(context.Background(), []string{filepath.Join(t.TempDir(), "missing")}, time.Millisecond, func() {})
+	if err == nil {
+		t.Fatal("Watch initial setup error = nil, want error")
+	}
+}
+
+func waitForWatchedChange(t *testing.T, changes <-chan struct{}) {
 	t.Helper()
 	select {
 	case <-changes:
