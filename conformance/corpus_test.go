@@ -87,7 +87,7 @@ func TestCorpusHardCasesI(t *testing.T) {
 - method: conformance.v1.CorpusService/Echo
   priority: -1
   respond:
-    message: { text: fallback }
+    message: { text: note is absent }
 `,
 			req:  `{"opt_note":""}`,
 			want: []string{"note is set"},
