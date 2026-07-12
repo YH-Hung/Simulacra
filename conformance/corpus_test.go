@@ -6,6 +6,9 @@ import (
 	"testing"
 
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/dynamicpb"
 
 	"github.com/yinghanhung/simulacra/internal/match"
 )
@@ -17,6 +20,13 @@ type corpusCase struct {
 	stub    string
 	req     string
 	want    []string
+	expect  string
+	extra   []corpusRequest
+}
+
+type corpusRequest struct {
+	req    string
+	expect string
 }
 
 func start(t *testing.T, stub string) *harness {
@@ -24,17 +34,44 @@ func start(t *testing.T, stub string) *harness {
 	return newHarness(t, stub)
 }
 
+func (h *harness) buildMsg(t *testing.T, desc protoreflect.MessageDescriptor, body string) *dynamicpb.Message {
+	t.Helper()
+	return h.jsonMessage(t, desc, body)
+}
+
+func (h *harness) invokeMsg(t *testing.T, desc protoreflect.MethodDescriptor, body string) *dynamicpb.Message {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+	defer cancel()
+	response, err := h.invoke(t, ctx, corpusMethod, h.buildMsg(t, desc.Input(), body))
+	if err != nil {
+		t.Fatalf("invoke %s: %v", corpusMethod, err)
+	}
+	return response
+}
+
+func assertCorpusResponse(t *testing.T, h *harness, desc protoreflect.MessageDescriptor, got *dynamicpb.Message, body string) {
+	t.Helper()
+	want := h.buildMsg(t, desc, body)
+	if proto.Equal(got, want) {
+		return
+	}
+	marshal := protojson.MarshalOptions{Resolver: h.reg.Types()}
+	gotJSON, gotErr := marshal.Marshal(got)
+	wantJSON, wantErr := marshal.Marshal(want)
+	if gotErr != nil || wantErr != nil {
+		t.Fatalf("response differs from expected; marshal got/want errors = %v/%v", gotErr, wantErr)
+	}
+	t.Fatalf("response = %s, want exactly %s", gotJSON, wantJSON)
+}
+
 func runCorpus(t *testing.T, tc corpusCase) {
 	t.Helper()
 	h := start(t, tc.stub)
 	desc := h.method(t, corpusMethod, match.Unary)
-	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
-	defer cancel()
 
-	response, err := h.invoke(t, ctx, corpusMethod, h.jsonMessage(t, desc.Input(), tc.req))
-	if err != nil {
-		t.Fatalf("invoke %s: %v", tc.feature, err)
-	}
+	response := h.invokeMsg(t, desc, tc.req)
+	assertCorpusResponse(t, h, desc.Output(), response, tc.expect)
 	data, err := (protojson.MarshalOptions{Resolver: h.reg.Types()}).Marshal(response)
 	if err != nil {
 		t.Fatalf("marshal %s response: %v", tc.feature, err)
@@ -44,6 +81,9 @@ func runCorpus(t *testing.T, tc corpusCase) {
 		if !strings.Contains(got, want) {
 			t.Errorf("response %s missing %q", got, want)
 		}
+	}
+	for _, extra := range tc.extra {
+		assertCorpusResponse(t, h, desc.Output(), h.invokeMsg(t, desc, extra.req), extra.expect)
 	}
 }
 
@@ -60,8 +100,9 @@ func TestCorpusHardCasesI(t *testing.T) {
     message:
       big: '{{ message.big + 1 }}'
 `,
-			req:  `{"big":"9007199254740993"}`,
-			want: []string{"9007199254740994"},
+			req:    `{"big":"9007199254740993"}`,
+			want:   []string{"9007199254740994"},
+			expect: `{"big":"9007199254740994"}`,
 		},
 		{
 			feature: "bytes.roundtrip",
@@ -72,8 +113,9 @@ func TestCorpusHardCasesI(t *testing.T) {
   respond:
     message: { blob: AAEC }
 `,
-			req:  `{"blob":"AAEC"}`,
-			want: []string{"AAEC"},
+			req:    `{"blob":"AAEC"}`,
+			want:   []string{"AAEC"},
+			expect: `{"blob":"AAEC"}`,
 		},
 		{
 			feature: "presence.optional.set",
@@ -89,8 +131,9 @@ func TestCorpusHardCasesI(t *testing.T) {
   respond:
     message: { text: note is absent }
 `,
-			req:  `{"opt_note":""}`,
-			want: []string{"note is set"},
+			req:    `{"opt_note":""}`,
+			want:   []string{"note is set"},
+			expect: `{"text":"note is set"}`,
 		},
 		{
 			feature: "presence.optional.unset",
@@ -106,8 +149,9 @@ func TestCorpusHardCasesI(t *testing.T) {
   respond:
     message: { text: note is absent }
 `,
-			req:  `{}`,
-			want: []string{"note is absent"},
+			req:    `{}`,
+			want:   []string{"note is absent"},
+			expect: `{"text":"note is absent"}`,
 		},
 		{
 			feature: "presence.oneof",
@@ -118,9 +162,18 @@ func TestCorpusHardCasesI(t *testing.T) {
       word: { present: true }
   respond:
     message: { text: word chosen }
+- method: conformance.v1.CorpusService/Echo
+  priority: -1
+  respond:
+    message: { text: word absent }
 `,
-			req:  `{"word":""}`,
-			want: []string{"word chosen"},
+			req:    `{"word":""}`,
+			want:   []string{"word chosen"},
+			expect: `{"text":"word chosen"}`,
+			extra: []corpusRequest{
+				{req: `{}`, expect: `{"text":"word absent"}`},
+				{req: `{"number":0}`, expect: `{"text":"word absent"}`},
+			},
 		},
 		{
 			feature: "wkt.timestamp",
@@ -131,8 +184,9 @@ func TestCorpusHardCasesI(t *testing.T) {
   respond:
     message: { when: '2026-07-10T12:00:00Z' }
 `,
-			req:  `{"when":"2026-07-10T00:00:00Z"}`,
-			want: []string{"2026-07-10T12:00:00Z"},
+			req:    `{"when":"2026-07-10T00:00:00Z"}`,
+			want:   []string{"2026-07-10T12:00:00Z"},
+			expect: `{"when":"2026-07-10T12:00:00Z"}`,
 		},
 		{
 			feature: "wkt.duration",
@@ -143,8 +197,9 @@ func TestCorpusHardCasesI(t *testing.T) {
   respond:
     message: { span: 120s }
 `,
-			req:  `{"span":"90s"}`,
-			want: []string{"120s"},
+			req:    `{"span":"90s"}`,
+			want:   []string{"120s"},
+			expect: `{"span":"120s"}`,
 		},
 		{
 			feature: "wkt.wrappers",
@@ -156,8 +211,9 @@ func TestCorpusHardCasesI(t *testing.T) {
   respond:
     message: { wrapped: gold }
 `,
-			req:  `{"wrapped":"vip"}`,
-			want: []string{"gold"},
+			req:    `{"wrapped":"vip"}`,
+			want:   []string{"gold"},
+			expect: `{"wrapped":"gold"}`,
 		},
 		{
 			feature: "wkt.struct",
@@ -169,8 +225,9 @@ func TestCorpusHardCasesI(t *testing.T) {
     message:
       attrs: { ok: true, tier: pro }
 `,
-			req:  `{"attrs":{"plan":"pro"}}`,
-			want: []string{`"ok":true`, `"tier":"pro"`},
+			req:    `{"attrs":{"plan":"pro"}}`,
+			want:   []string{`"ok":true`, `"tier":"pro"`},
+			expect: `{"attrs":{"ok":true,"tier":"pro"}}`,
 		},
 		{
 			feature: "wkt.fieldmask",
@@ -179,8 +236,9 @@ func TestCorpusHardCasesI(t *testing.T) {
   respond:
     message: { mask: 'text,optNote' }
 `,
-			req:  `{}`,
-			want: []string{"optNote"},
+			req:    `{}`,
+			want:   []string{"optNote"},
+			expect: `{"mask":"text,optNote"}`,
 		},
 		{
 			feature: "map.message_values",
@@ -193,8 +251,9 @@ func TestCorpusHardCasesI(t *testing.T) {
       items:
         b: { id: y }
 `,
-			req:  `{"items":{"a":{"id":"x"}}}`,
-			want: []string{`"y"`},
+			req:    `{"items":{"a":{"id":"x"}}}`,
+			want:   []string{`"y"`},
+			expect: `{"items":{"b":{"id":"y"}}}`,
 		},
 		{
 			feature: "repeated.packed",
@@ -205,8 +264,9 @@ func TestCorpusHardCasesI(t *testing.T) {
   respond:
     message: { packed: [4, 5, 6] }
 `,
-			req:  `{"packed":[1,2,3]}`,
-			want: []string{"4", "5", "6"},
+			req:    `{"packed":[1,2,3]}`,
+			want:   []string{"4", "5", "6"},
+			expect: `{"packed":[4,5,6]}`,
 		},
 		{
 			feature: "structural.recursive",
@@ -227,8 +287,9 @@ func TestCorpusHardCasesI(t *testing.T) {
               label: R4
               next: { label: R5 }
 `,
-			req:  `{"tree":{"label":"L1","next":{"label":"L2"}}}`,
-			want: []string{"R5"},
+			req:    `{"tree":{"label":"L1","next":{"label":"L2"}}}`,
+			want:   []string{"R5"},
+			expect: `{"tree":{"label":"R1","next":{"label":"R2","next":{"label":"R3","next":{"label":"R4","next":{"label":"R5"}}}}}}`,
 		},
 	}
 
