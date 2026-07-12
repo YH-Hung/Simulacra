@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package conformance.v1;
+
+import "google/protobuf/any.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+
+message Inner {
+  string id = 1;
+}
+
+message Node {
+  string label = 1;
+  Node next = 2;
+}
+
+message Everything {
+  int64 big = 1;
+  uint64 ubig = 2;
+  bytes blob = 3;
+  optional string opt_note = 4;
+
+  oneof choice {
+    string word = 5;
+    int32 number = 6;
+  }
+
+  google.protobuf.Timestamp when = 7;
+  google.protobuf.Duration span = 8;
+  google.protobuf.StringValue wrapped = 9;
+  google.protobuf.Struct attrs = 10;
+  google.protobuf.Value val = 11;
+  google.protobuf.FieldMask mask = 12;
+  google.protobuf.Any payload = 13;
+  map<string, Inner> items = 14;
+  repeated int32 packed = 15 [packed = true];
+  Node tree = 16;
+  string text = 17;
+}
+
+message WideEverything {
+  string text = 17;
+  string extra = 99;
+}
+
+service CorpusService {
+  rpc Echo(Everything) returns (WideEverything);
+  rpc Pull(Everything) returns (stream WideEverything);
+  rpc Push(stream Everything) returns (WideEverything);
+  rpc Converse(stream Everything) returns (stream WideEverything);
+}
