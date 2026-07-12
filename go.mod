@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/bufbuild/protocompile v0.14.1
+	github.com/fsnotify/fsnotify v1.10.1
 	github.com/google/cel-go v0.29.2
 	github.com/spf13/cobra v1.10.2
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478

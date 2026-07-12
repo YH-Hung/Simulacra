@@ -35,16 +35,28 @@ type candidateSnapshot struct {
 }
 
 func NewStore(stubs []*Compiled) *Store {
-	s := &Store{byMethod: make(map[string][]*entry)}
+	return &Store{byMethod: buildIndex(stubs)}
+}
+
+func buildIndex(stubs []*Compiled) map[string][]*entry {
+	byMethod := make(map[string][]*entry)
 	for _, c := range stubs {
-		s.byMethod[c.Method] = append(s.byMethod[c.Method], &entry{stub: c})
+		byMethod[c.Method] = append(byMethod[c.Method], &entry{stub: c})
 	}
-	for _, entries := range s.byMethod {
+	for _, entries := range byMethod {
 		sort.SliceStable(entries, func(i, j int) bool {
 			return entries[i].stub.Priority > entries[j].stub.Priority
 		})
 	}
-	return s
+	return byMethod
+}
+
+// Replace atomically swaps all registered stubs and resets their times budgets.
+func (s *Store) Replace(stubs []*Compiled) {
+	byMethod := buildIndex(stubs)
+	s.mu.Lock()
+	s.byMethod = byMethod
+	s.mu.Unlock()
 }
 
 // Select returns the first live matching stub for the method, or nil.

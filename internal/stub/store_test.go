@@ -84,6 +84,34 @@ func TestSelectNoMatch(t *testing.T) {
 	}
 }
 
+func TestReplaceAtomicallyResetsTimesBudget(t *testing.T) {
+	reg := testRegistry(t)
+	old := compiled(t, reg, Stub{
+		Method: "shop.v1.OrderService/GetOrder",
+		Times:  1,
+	})
+	fresh := compiled(t, reg, Stub{
+		Method: "shop.v1.OrderService/GetOrder",
+		Times:  1,
+	})
+	store := NewStore([]*Compiled{old})
+
+	if got := store.Select(method, match.Input{}); got != old {
+		t.Fatalf("first Select = %v, want old stub", got)
+	}
+	if got := store.Select(method, match.Input{}); got != nil {
+		t.Fatalf("second Select = %v, want exhausted budget", got)
+	}
+
+	store.Replace([]*Compiled{fresh})
+	if got := store.Select(method, match.Input{}); got != fresh {
+		t.Fatalf("Select after Replace = %v, want fresh stub", got)
+	}
+	if got := store.Select(method, match.Input{}); got != nil {
+		t.Fatalf("second Select after Replace = %v, want fresh budget exhausted", got)
+	}
+}
+
 func TestExplainRanksNearestMiss(t *testing.T) {
 	reg := testRegistry(t)
 	twoWrong := compiled(t, reg, Stub{

@@ -12,13 +12,16 @@ import (
 
 	"github.com/yinghanhung/simulacra/internal/dataplane"
 	"github.com/yinghanhung/simulacra/internal/journal"
+	"github.com/yinghanhung/simulacra/internal/schema"
 	"github.com/yinghanhung/simulacra/internal/stub"
+	"github.com/yinghanhung/simulacra/internal/watch"
 )
 
 func newServeCmd() *cobra.Command {
 	src := &sources{}
 	var listen string
 	var journalSize int
+	var watchStubs bool
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Start the mock gRPC server",
@@ -47,6 +50,16 @@ func newServeCmd() *cobra.Command {
 			cmd.Printf("simulacra: data plane listening on %s\n", lis.Addr())
 			cmd.Printf("  %d service(s) registered, %d stub(s) loaded — reflection and health enabled\n",
 				len(reg.Services()), len(stubs))
+			if watchStubs && len(src.stubDirs) > 0 {
+				go func() {
+					err := watch.Watch(cmd.Context(), src.stubDirs, 200*time.Millisecond, func() {
+						reloadStubDirs(cmd, reg, store, src.stubDirs)
+					})
+					if err != nil {
+						cmd.PrintErrln("watch error:", err)
+					}
+				}()
+			}
 
 			sig := make(chan os.Signal, 2)
 			signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
@@ -58,5 +71,18 @@ func newServeCmd() *cobra.Command {
 	src.register(cmd)
 	cmd.Flags().StringVar(&listen, "listen", ":6565", "data-plane listen address")
 	cmd.Flags().IntVar(&journalSize, "journal-size", 1024, "number of recent data-plane calls to retain")
+	cmd.Flags().BoolVar(&watchStubs, "watch", true, "watch stub directories and reload changes")
 	return cmd
+}
+
+func reloadStubDirs(cmd *cobra.Command, reg *schema.Registry, store *stub.Store, dirs []string) {
+	stubs, errs := stub.LoadDirs(reg, dirs)
+	if len(errs) > 0 {
+		for _, err := range errs {
+			cmd.PrintErrln("stub error:", err)
+		}
+		return
+	}
+	store.Replace(stubs)
+	cmd.Printf("simulacra: %d stub(s) reloaded\n", len(stubs))
 }
