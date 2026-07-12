@@ -3,6 +3,7 @@ package journal
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/yinghanhung/simulacra/internal/match"
 	"google.golang.org/grpc/metadata"
@@ -17,6 +18,26 @@ type Times struct {
 	AtLeast *int
 	AtMost  *int
 	Never   bool
+}
+
+// snapshotTimes makes verification independent of subsequent caller changes
+// to threshold values. Concurrent mutation while this copy is being made is
+// still a caller data race and must be synchronized by the caller.
+func snapshotTimes(times Times) Times {
+	snapshot := Times{Never: times.Never}
+	if times.Exactly != nil {
+		value := *times.Exactly
+		snapshot.Exactly = &value
+	}
+	if times.AtLeast != nil {
+		value := *times.AtLeast
+		snapshot.AtLeast = &value
+	}
+	if times.AtMost != nil {
+		value := *times.AtMost
+		snapshot.AtMost = &value
+	}
+	return snapshot
 }
 
 // Validate rejects ambiguous or impossible count assertions.
@@ -66,6 +87,17 @@ func (t Times) ok(count int) bool {
 	}
 }
 
+func (t Times) under(count int) bool {
+	switch {
+	case t.Exactly != nil:
+		return count < *t.Exactly
+	case t.AtLeast != nil:
+		return count < *t.AtLeast
+	default:
+		return false
+	}
+}
+
 // String returns a human-readable description of the assertion.
 func (t Times) String() string {
 	switch {
@@ -92,17 +124,19 @@ type Miss struct {
 
 // Report summarizes a journal verification.
 type Report struct {
-	Pass       bool
-	Matched    int
-	Considered int
-	Want       string
-	Misses     []Miss
+	Pass              bool
+	Matched           int
+	Considered        int
+	Want              string
+	Misses            []Miss
+	UnexpectedMatches []uint64
 }
 
 // Verify checks calls for method against matcher and the requested count.
 // The journal's List snapshot keeps evaluation isolated from concurrent writes
 // and from mutation of retained messages.
 func Verify(j *Journal, method string, matcher *match.Compiled, times Times) (Report, error) {
+	times = snapshotTimes(times)
 	if err := times.Validate(); err != nil {
 		return Report{}, fmt.Errorf("invalid times: %w", err)
 	}
@@ -117,20 +151,29 @@ func Verify(j *Journal, method string, matcher *match.Compiled, times Times) (Re
 		input match.Input
 	}
 	var mismatches []mismatch
+	var matchedSeqs []uint64
 	for _, call := range j.List() {
 		if call == nil || (wantMethod != "" && call.Method != wantMethod) {
 			continue
 		}
 		report.Considered++
-		input := callInput(call)
+		input, err := callInput(call)
+		if err != nil {
+			return Report{}, err
+		}
 		if matcher == nil || matcher.Eval(input) {
 			report.Matched++
+			matchedSeqs = append(matchedSeqs, call.Seq)
 			continue
 		}
 		mismatches = append(mismatches, mismatch{seq: call.Seq, input: input})
 	}
 	report.Pass = times.ok(report.Matched)
 	if report.Pass {
+		return report, nil
+	}
+	if !times.under(report.Matched) {
+		report.UnexpectedMatches = matchedSeqs
 		return report, nil
 	}
 	report.Misses = make([]Miss, 0, len(mismatches))
@@ -143,27 +186,35 @@ func Verify(j *Journal, method string, matcher *match.Compiled, times Times) (Re
 	return report, nil
 }
 
-func callInput(call *Call) match.Input {
+func callInput(call *Call) (match.Input, error) {
+	if call == nil {
+		return match.Input{}, fmt.Errorf("call is nil")
+	}
 	md := metadata.MD{}
 	for key, values := range call.Metadata {
 		key = strings.ToLower(key)
 		md[key] = append(md[key], values...)
 	}
 	messages := make([]protoreflect.Message, 0, len(call.Requests))
-	for _, request := range call.Requests {
-		if request != nil {
-			messages = append(messages, request.ProtoReflect())
+	for index, request := range call.Requests {
+		if request == nil {
+			return match.Input{}, fmt.Errorf("call %d request %d is nil", call.Seq, index)
 		}
+		messages = append(messages, request.ProtoReflect())
 	}
 	var message protoreflect.Message
-	if len(call.Requests) > 0 && call.Requests[0] != nil {
+	if len(call.Requests) > 0 {
 		message = call.Requests[0].ProtoReflect()
+	}
+	now := call.Start
+	if now.IsZero() {
+		now = time.Now()
 	}
 	return match.Input{
 		Method:   strings.TrimPrefix(normalizeMethod(call.Method), "/"),
 		Metadata: md,
 		Message:  message,
 		Messages: messages,
-		Now:      call.Start,
-	}
+		Now:      now,
+	}, nil
 }

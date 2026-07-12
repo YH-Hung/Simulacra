@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yinghanhung/simulacra/internal/match"
 	"google.golang.org/grpc/metadata"
@@ -75,23 +76,35 @@ func TestTimesOKAndString(t *testing.T) {
 	}
 }
 
+func TestSnapshotTimesCopiesThresholdValues(t *testing.T) {
+	exactly := 2
+	snapshot := snapshotTimes(Times{Exactly: &exactly})
+	exactly = 99
+	if got := snapshot.String(); got != "exactly 2" {
+		t.Fatalf("snapshot String = %q, want exactly 2", got)
+	}
+}
+
 func TestVerifyCountsMatchingCalls(t *testing.T) {
 	j, orderOne, orderNine := verificationFixture(t)
 	tests := []struct {
-		name    string
-		matcher *match.Compiled
-		times   Times
-		pass    bool
-		matched int
-		want    string
+		name       string
+		matcher    *match.Compiled
+		times      Times
+		pass       bool
+		matched    int
+		want       string
+		unexpected []uint64
 	}{
 		{name: "exactly", matcher: orderOne, times: Times{Exactly: intPtr(2)}, pass: true, matched: 2, want: "exactly 2"},
 		{name: "at least", matcher: orderOne, times: Times{AtLeast: intPtr(2)}, pass: true, matched: 2, want: "at least 2"},
-		{name: "at most", matcher: orderOne, times: Times{AtMost: intPtr(1)}, matched: 2, want: "at most 1"},
+		{name: "at most", matcher: orderOne, times: Times{AtMost: intPtr(1)}, matched: 2, want: "at most 1", unexpected: []uint64{1, 2}},
 		{name: "range", matcher: orderOne, times: Times{AtLeast: intPtr(1), AtMost: intPtr(2)}, pass: true, matched: 2, want: "at least 1 and at most 2"},
 		{name: "never pass", matcher: orderNine, times: Times{Never: true}, pass: true, matched: 0, want: "never"},
-		{name: "never fail", matcher: orderOne, times: Times{Never: true}, matched: 2, want: "never"},
+		{name: "never fail", matcher: orderOne, times: Times{Never: true}, matched: 2, want: "never", unexpected: []uint64{1, 2}},
+		{name: "exact overcount", matcher: orderOne, times: Times{Exactly: intPtr(1)}, matched: 2, want: "exactly 1", unexpected: []uint64{1, 2}},
 		{name: "nil matcher counts all", matcher: nil, times: Times{Exactly: intPtr(3)}, pass: true, matched: 3, want: "exactly 3"},
+		{name: "nil matcher overcount evidence", matcher: nil, times: Times{AtMost: intPtr(2)}, matched: 3, want: "at most 2", unexpected: []uint64{1, 2, 3}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -104,6 +117,15 @@ func TestVerifyCountsMatchingCalls(t *testing.T) {
 			}
 			if report.Pass && report.Misses != nil {
 				t.Errorf("passing report Misses = %#v, want nil", report.Misses)
+			}
+			if report.Pass && report.UnexpectedMatches != nil {
+				t.Errorf("passing report UnexpectedMatches = %#v, want nil", report.UnexpectedMatches)
+			}
+			if !reflect.DeepEqual(report.UnexpectedMatches, tt.unexpected) {
+				t.Errorf("UnexpectedMatches = %v, want %v", report.UnexpectedMatches, tt.unexpected)
+			}
+			if len(tt.unexpected) > 0 && report.Misses != nil {
+				t.Errorf("over-count report Misses = %#v, want nil", report.Misses)
 			}
 		})
 	}
@@ -128,9 +150,12 @@ func TestVerifyRejectsInvalidTimes(t *testing.T) {
 	}
 }
 
-func TestCallInputEmptyAndNilRequestsArePanicSafe(t *testing.T) {
+func TestCallInputSupportsEmptyStreamsAndRejectsNilRequests(t *testing.T) {
 	method := "shop.v1.OrderService/UploadOrders"
-	in := callInput(&Call{Method: method})
+	in, err := callInput(&Call{Method: method})
+	if err != nil {
+		t.Fatalf("callInput(empty): %v", err)
+	}
 	if in.Method != method || in.Message != nil || in.Messages == nil || len(in.Messages) != 0 {
 		t.Fatalf("callInput(empty) = %+v, want normalized method and non-nil empty messages", in)
 	}
@@ -147,14 +172,26 @@ func TestCallInputEmptyAndNilRequestsArePanicSafe(t *testing.T) {
 		t.Fatalf("Verify empty stream = %+v, %v", report, err)
 	}
 
-	nilInput := callInput(&Call{Method: method, Requests: []*dynamicpb.Message{nil}})
-	if nilInput.Message != nil || nilInput.Messages == nil || len(nilInput.Messages) != 0 {
-		t.Fatalf("callInput(nil request) = %+v, want nil skipped safely", nilInput)
+	_, err = callInput(&Call{Seq: 7, Method: method, Requests: []*dynamicpb.Message{nil}})
+	if err == nil || !strings.Contains(err.Error(), "call 7 request 0 is nil") {
+		t.Fatalf("callInput(nil request) error = %v, want indexed rejection", err)
 	}
 	j.Record(&Call{Method: method, Requests: []*dynamicpb.Message{nil}})
-	report, err = Verify(j, method, compiled, Times{Exactly: intPtr(2)})
-	if err != nil || !report.Pass {
-		t.Fatalf("Verify nil request = %+v, %v; want safe empty-stream match", report, err)
+	_, err = Verify(j, method, compiled, Times{Exactly: intPtr(2)})
+	if err == nil || !strings.Contains(err.Error(), "call 2 request 0 is nil") {
+		t.Fatalf("Verify nil request error = %v, want call 2 request 0", err)
+	}
+}
+
+func TestCallInputSetsStableNow(t *testing.T) {
+	fixed := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	in, err := callInput(&Call{Start: fixed})
+	if err != nil || !in.Now.Equal(fixed) {
+		t.Fatalf("callInput fixed Now = %v, %v; want %v", in.Now, err, fixed)
+	}
+	in, err = callInput(&Call{})
+	if err != nil || in.Now.IsZero() {
+		t.Fatalf("callInput zero Start Now = %v, %v; want non-zero snapshot", in.Now, err)
 	}
 }
 
@@ -168,11 +205,14 @@ func TestCallInputMatchesRuntimeMethodAndMetadataNormalization(t *testing.T) {
 		t.Fatalf("Compile: %v", err)
 	}
 	message := dynamicpb.NewMessage(desc)
-	in := callInput(&Call{
+	in, err := callInput(&Call{
 		Method:   "/shop.v1.OrderService/GetOrder",
 		Metadata: metadata.MD{"X-Tenant": {"acme"}},
 		Requests: []*dynamicpb.Message{message},
 	})
+	if err != nil {
+		t.Fatalf("callInput: %v", err)
+	}
 	if !compiled.Eval(in) {
 		t.Fatalf("normalized input did not match: %+v; reasons: %v", in, compiled.Explain(in))
 	}
