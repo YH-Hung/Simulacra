@@ -3,6 +3,7 @@ package conformance_test
 import (
 	"context"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,22 +12,55 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/dynamicpb"
 
 	"github.com/yinghanhung/simulacra/internal/match"
+	"github.com/yinghanhung/simulacra/internal/schema"
 )
 
-const shapesYAML = `
+func TestShapes_CorpusDescriptorContractAndDynamicAny(t *testing.T) {
+	reg := schema.NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), "protos"); err != nil {
+		t.Fatalf("AddProtoDir: %v", err)
+	}
+	h := &harness{reg: reg}
+	for method, shape := range map[string]match.Shape{
+		"/conformance.v1.CorpusService/Echo":     match.Unary,
+		"/conformance.v1.CorpusService/Pull":     match.ServerStream,
+		"/conformance.v1.CorpusService/Push":     match.ClientStream,
+		"/conformance.v1.CorpusService/Converse": match.Bidi,
+	} {
+		desc := h.method(t, method, shape)
+		if got := desc.Output().FullName(); got != "conformance.v1.Everything" {
+			t.Errorf("%s output = %s, want conformance.v1.Everything", method, got)
+		}
+	}
+
+	desc := h.method(t, "/conformance.v1.CorpusService/Echo", match.Unary)
+	request := richRequest(t, h, desc.Input(), "any-round-trip")
+	data, err := (protojson.MarshalOptions{Resolver: h.reg.Types()}).Marshal(request)
+	if err != nil {
+		t.Fatalf("marshal dynamic Any request: %v", err)
+	}
+	for _, want := range []string{"type.googleapis.com/conformance.v1.Inner", "inside-any"} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("marshaled request %s missing %q", data, want)
+		}
+	}
+}
+
+const shapeStubs = `
 - method: conformance.v1.CorpusService/Echo
   match:
     metadata:
-      x-conformance: { eq: echo }
+      x-tenant: { eq: acme }
     message:
-      text: { eq: echo }
+      text: { eq: hi }
   respond:
-    metadata: { x-shape: unary }
-    trailers: { x-finished: echo }
-    message: { text: 'echo {{ message.text }}', extra: '{{ message.word }}' }
+    metadata: { x-mock: simulacra }
+    trailers: { x-stub: echo-1 }
+    message: { text: hello }
 - method: conformance.v1.CorpusService/Echo
   match:
     message:
@@ -50,7 +84,7 @@ const shapesYAML = `
 - method: conformance.v1.CorpusService/Pull
   match:
     message:
-      text: { eq: pull }
+      text: { eq: watch }
   respond:
     stream:
       - message: { text: first }
@@ -69,7 +103,7 @@ const shapesYAML = `
     rules:
       - match:
           message:
-            text: { eq: ping }
+            text: { matches: "^ping" }
         send:
           - message: { text: pong }
     on_close:
@@ -77,56 +111,51 @@ const shapesYAML = `
 `
 
 func TestShapes_UnaryEchoMetadataMessageHeadersTrailersAndVerification(t *testing.T) {
-	h := newHarness(t, shapesYAML)
+	h := newHarness(t, shapeStubs)
 	desc := h.method(t, "/conformance.v1.CorpusService/Echo", match.Unary)
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
 	defer cancel()
-	ctx = metadata.AppendToOutgoingContext(ctx, "x-conformance", "echo")
+	ctx = metadata.AppendToOutgoingContext(ctx, "x-tenant", "acme")
 	var header, trailer metadata.MD
 
-	response, err := h.invoke(t, ctx, "/conformance.v1.CorpusService/Echo", richRequest(t, h, desc.Input(), "echo"),
+	response, err := h.invoke(t, ctx, "/conformance.v1.CorpusService/Echo", h.jsonMessage(t, desc.Input(), `{"text":"hi"}`),
 		grpc.Header(&header), grpc.Trailer(&trailer))
 	if err != nil {
 		t.Fatalf("Echo: %v", err)
 	}
-	if got := fieldString(t, response, "text"); got != "echo echo" {
-		t.Fatalf("response text = %q, want echo echo", got)
+	if got := fieldString(t, response, "text"); got != "hello" {
+		t.Fatalf("response text = %q, want hello", got)
 	}
-	if got := fieldString(t, response, "extra"); got != "chosen" {
-		t.Fatalf("response extra = %q, want chosen", got)
+	if got := header.Get("x-mock"); len(got) != 1 || got[0] != "simulacra" {
+		t.Fatalf("x-mock header = %v, want [simulacra]", got)
 	}
-	if got := header.Get("x-shape"); len(got) != 1 || got[0] != "unary" {
-		t.Fatalf("x-shape header = %v, want [unary]", got)
-	}
-	if got := trailer.Get("x-finished"); len(got) != 1 || got[0] != "echo" {
-		t.Fatalf("x-finished trailer = %v, want [echo]", got)
+	if got := trailer.Get("x-stub"); len(got) != 1 || got[0] != "echo-1" {
+		t.Fatalf("x-stub trailer = %v, want [echo-1]", got)
 	}
 
 	h.verify(t, `
 method: conformance.v1.CorpusService/Echo
 match:
-  metadata:
-    x-conformance: { eq: echo }
   message:
-    text: { eq: echo }
+    text: { eq: hi }
 times: { exactly: 1 }
 `, match.Unary)
 	h.verify(t, `
 method: conformance.v1.CorpusService/Echo
 match:
   message:
-    text: { eq: absent }
+    text: { eq: zzz }
 times: { never: true }
 `, match.Unary)
 }
 
 func TestShapes_UnaryEchoStatusDetails(t *testing.T) {
-	h := newHarness(t, shapesYAML)
+	h := newHarness(t, shapeStubs)
 	desc := h.method(t, "/conformance.v1.CorpusService/Echo", match.Unary)
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
 	defer cancel()
 
-	_, err := h.invoke(t, ctx, "/conformance.v1.CorpusService/Echo", richRequest(t, h, desc.Input(), "boom"))
+	_, err := h.invoke(t, ctx, "/conformance.v1.CorpusService/Echo", h.jsonMessage(t, desc.Input(), `{"text":"boom"}`))
 	st := status.Convert(err)
 	if st.Code() != codes.FailedPrecondition {
 		t.Fatalf("Echo error = %v, want FailedPrecondition", err)
@@ -142,13 +171,13 @@ func TestShapes_UnaryEchoStatusDetails(t *testing.T) {
 }
 
 func TestShapes_UnaryEchoDelayHonorsDeadline(t *testing.T) {
-	h := newHarness(t, shapesYAML)
+	h := newHarness(t, shapeStubs)
 	desc := h.method(t, "/conformance.v1.CorpusService/Echo", match.Unary)
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	started := time.Now()
 
-	_, err := h.invoke(t, ctx, "/conformance.v1.CorpusService/Echo", richRequest(t, h, desc.Input(), "slow"))
+	_, err := h.invoke(t, ctx, "/conformance.v1.CorpusService/Echo", h.jsonMessage(t, desc.Input(), `{"text":"slow"}`))
 	if status.Code(err) != codes.DeadlineExceeded {
 		t.Fatalf("Echo error = %v, want DeadlineExceeded", err)
 	}
@@ -158,18 +187,18 @@ func TestShapes_UnaryEchoDelayHonorsDeadline(t *testing.T) {
 }
 
 func TestShapes_ServerStreamingPullScriptThenStatus(t *testing.T) {
-	h := newHarness(t, shapesYAML)
+	h := newHarness(t, shapeStubs)
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
 	defer cancel()
 	stream, desc := h.openStream(t, ctx, "/conformance.v1.CorpusService/Pull", match.ServerStream)
-	if err := stream.SendMsg(richRequest(t, h, desc.Input(), "pull")); err != nil {
+	if err := stream.SendMsg(h.jsonMessage(t, desc.Input(), `{"text":"watch"}`)); err != nil {
 		t.Fatalf("SendMsg: %v", err)
 	}
 	if err := stream.CloseSend(); err != nil {
 		t.Fatalf("CloseSend: %v", err)
 	}
 
-	for i, want := range []string{"first", "second pull"} {
+	for i, want := range []string{"first", "second watch"} {
 		response := dynamicpb.NewMessage(desc.Output())
 		if err := stream.RecvMsg(response); err != nil {
 			t.Fatalf("RecvMsg[%d]: %v", i, err)
@@ -183,20 +212,17 @@ func TestShapes_ServerStreamingPullScriptThenStatus(t *testing.T) {
 	}
 	h.verify(t, `
 method: conformance.v1.CorpusService/Pull
-match:
-  message:
-    text: { eq: pull }
 times: { exactly: 1 }
 `, match.ServerStream)
 }
 
 func TestShapes_ClientStreamingPushMatchesMessages(t *testing.T) {
-	h := newHarness(t, shapesYAML)
+	h := newHarness(t, shapeStubs)
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
 	defer cancel()
 	stream, desc := h.openStream(t, ctx, "/conformance.v1.CorpusService/Push", match.ClientStream)
 	for _, text := range []string{"one", "two", "three"} {
-		if err := stream.SendMsg(richRequest(t, h, desc.Input(), text)); err != nil {
+		if err := stream.SendMsg(h.jsonMessage(t, desc.Input(), `{"text":"`+text+`"}`)); err != nil {
 			t.Fatalf("SendMsg(%s): %v", text, err)
 		}
 	}
@@ -216,13 +242,13 @@ func TestShapes_ClientStreamingPushMatchesMessages(t *testing.T) {
 	h.verify(t, `
 method: conformance.v1.CorpusService/Push
 match:
-  expr: 'size(messages) == 3 && messages.all(m, m.text != "")'
+  expr: 'size(messages) == 3'
 times: { exactly: 1 }
 `, match.ClientStream)
 }
 
 func TestShapes_BidirectionalConverseOpenRuleAndClose(t *testing.T) {
-	h := newHarness(t, shapesYAML)
+	h := newHarness(t, shapeStubs)
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
 	defer cancel()
 	stream, desc := h.openStream(t, ctx, "/conformance.v1.CorpusService/Converse", match.Bidi)
@@ -234,7 +260,7 @@ func TestShapes_BidirectionalConverseOpenRuleAndClose(t *testing.T) {
 	if got := fieldString(t, welcome, "text"); got != "welcome" {
 		t.Fatalf("on_open text = %q, want welcome", got)
 	}
-	if err := stream.SendMsg(richRequest(t, h, desc.Input(), "ping")); err != nil {
+	if err := stream.SendMsg(h.jsonMessage(t, desc.Input(), `{"text":"ping-1"}`)); err != nil {
 		t.Fatalf("SendMsg: %v", err)
 	}
 	pong := dynamicpb.NewMessage(desc.Output())

@@ -37,7 +37,7 @@ message Everything {
   google.protobuf.FieldMask mask = 12;
   google.protobuf.Any payload = 13;
   map<string, Inner> items = 14;
-  repeated int32 packed = 15 [packed = true];
+  repeated int32 packed = 15;
   Node tree = 16;
   string text = 17;
 }
@@ -48,8 +48,8 @@ message WideEverything {
 }
 
 service CorpusService {
-  rpc Echo(Everything) returns (WideEverything);
-  rpc Pull(Everything) returns (stream WideEverything);
-  rpc Push(stream Everything) returns (WideEverything);
-  rpc Converse(stream Everything) returns (stream WideEverything);
+  rpc Echo(Everything) returns (Everything);
+  rpc Pull(Everything) returns (stream Everything);
+  rpc Push(stream Everything) returns (Everything);
+  rpc Converse(stream Everything) returns (stream Everything);
 }
