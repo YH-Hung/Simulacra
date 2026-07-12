@@ -1,12 +1,28 @@
 package cli
 
 import (
+	"context"
 	"os"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 )
+
+func TestShutdownWaiterReturnsWhenContextCanceledWithoutSignal(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		waitAndShutdownContext(ctx, make(chan os.Signal), time.Minute, func() {}, func() {}, func(...any) {})
+		close(done)
+	}()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown waiter did not return after context cancellation")
+	}
+}
 
 func TestShutdownGracefulCompletes(t *testing.T) {
 	sig := make(chan os.Signal, 2)

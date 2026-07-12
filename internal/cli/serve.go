@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -47,31 +48,45 @@ func newServeCmd() *cobra.Command {
 				return fmt.Errorf("listening on %s: %w", listen, err)
 			}
 
-			cmd.Printf("simulacra: data plane listening on %s\n", lis.Addr())
-			cmd.Printf("  %d service(s) registered, %d stub(s) loaded — reflection and health enabled\n",
+			output := &commandOutput{cmd: cmd}
+			output.Printf("simulacra: data plane listening on %s\n", lis.Addr())
+			output.Printf("  %d service(s) registered, %d stub(s) loaded — reflection and health enabled\n",
 				len(reg.Services()), len(stubs))
 			watcher := watcherRun{}
 			if watchStubs && len(src.stubDirs) > 0 {
 				watcher = startWatcher(cmd.Context(), func(ctx context.Context) error {
-					return stub.Watch(ctx, src.stubDirs, 200*time.Millisecond, func() {
-						reloadStubDirs(cmd, reg, store, src.stubDirs)
+					return stub.WatchWithOptions(ctx, src.stubDirs, stub.WatchOptions{
+						Debounce: 200 * time.Millisecond,
+						OnChange: func(ctx context.Context) {
+							reloadStubDirsContext(ctx, output, reg, store, src.stubDirs)
+						},
+						OnError: func(err error) {
+							output.PrintErrln("watch error:", err)
+						},
 					})
 				}, func(err error) {
-					cmd.PrintErrln("watch error:", err)
+					output.PrintErrln("watch error:", err)
 				})
 			}
 
 			sig := make(chan os.Signal, 2)
 			signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 			defer signal.Stop(sig)
-			go waitAndShutdown(sig, 10*time.Second, func() {
-				watcher.cancelNow()
-				srv.GracefulStop()
-			}, func() {
-				watcher.cancelNow()
-				srv.Stop()
-			}, cmd.Println)
-			return serveWithWatcher(watcher, func() error { return srv.Serve(lis) })
+			shutdownCtx, cancelShutdown := context.WithCancel(cmd.Context())
+			shutdownDone := make(chan struct{})
+			go func() {
+				defer close(shutdownDone)
+				waitAndShutdownContext(shutdownCtx, sig, 10*time.Second, func() {
+					watcher.cancelNow()
+					srv.GracefulStop()
+				}, func() {
+					watcher.cancelNow()
+					srv.Stop()
+				}, output.Println)
+			}()
+			return serveWithRuntime(watcher, cancelShutdown, shutdownDone, func() error {
+				return srv.Serve(lis)
+			})
 		},
 	}
 	src.register(cmd)
@@ -111,19 +126,69 @@ func (w watcherRun) stop() {
 	}
 }
 
-func serveWithWatcher(watcher watcherRun, serve func() error) error {
+func serveWithRuntime(watcher watcherRun, cancelShutdown context.CancelFunc, shutdownDone <-chan struct{}, serve func() error) error {
 	defer watcher.stop()
+	defer func() {
+		cancelShutdown()
+		<-shutdownDone
+	}()
 	return serve()
 }
 
+type commandOutput struct {
+	mu  sync.Mutex
+	cmd *cobra.Command
+}
+
+func (o *commandOutput) Printf(format string, args ...any) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.cmd.Printf(format, args...)
+}
+
+func (o *commandOutput) Println(args ...any) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.cmd.Println(args...)
+}
+
+func (o *commandOutput) PrintErrln(args ...any) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.cmd.PrintErrln(args...)
+}
+
+type reloadOutput interface {
+	Printf(string, ...any)
+	PrintErrln(...any)
+}
+
 func reloadStubDirs(cmd *cobra.Command, reg *schema.Registry, store *stub.Store, dirs []string) {
+	reloadStubDirsContext(context.Background(), &commandOutput{cmd: cmd}, reg, store, dirs)
+}
+
+func reloadStubDirsContext(ctx context.Context, output reloadOutput, reg *schema.Registry, store *stub.Store, dirs []string) {
+	if ctx.Err() != nil {
+		return
+	}
 	stubs, errs := stub.LoadDirs(reg, dirs)
+	if ctx.Err() != nil {
+		return
+	}
 	if len(errs) > 0 {
 		for _, err := range errs {
-			cmd.PrintErrln("stub error:", err)
+			if ctx.Err() != nil {
+				return
+			}
+			output.PrintErrln("stub error:", err)
 		}
 		return
 	}
+	if ctx.Err() != nil {
+		return
+	}
 	store.Replace(stubs)
-	cmd.Printf("simulacra: %d stub(s) reloaded\n", len(stubs))
+	if ctx.Err() == nil {
+		output.Printf("simulacra: %d stub(s) reloaded\n", len(stubs))
+	}
 }
