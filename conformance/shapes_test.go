@@ -184,6 +184,19 @@ func TestShapes_UnaryEchoDelayHonorsDeadline(t *testing.T) {
 	if elapsed := time.Since(started); elapsed >= time.Second {
 		t.Fatalf("deadline returned after %s, want under 1s", elapsed)
 	}
+	call, err := waitForJournalCall(h.journal, "/conformance.v1.CorpusService/Echo", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(call.StubSource, "stubs.yaml#2") {
+		t.Errorf("Echo stub source = %q, want suffix stubs.yaml#2", call.StubSource)
+	}
+	if len(call.Requests) != 1 || fieldString(t, call.Requests[0], "text") != "slow" {
+		t.Fatalf("Echo journal requests = %v, want one request with text slow", call.Requests)
+	}
+	if call.Err == nil || call.Err.Code() != codes.DeadlineExceeded {
+		t.Errorf("Echo journal error = %v, want DeadlineExceeded", call.Err)
+	}
 }
 
 func TestShapes_ServerStreamingPullScriptThenStatus(t *testing.T) {

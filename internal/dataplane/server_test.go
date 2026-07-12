@@ -341,6 +341,16 @@ func TestUnaryDelayHonorsDeadline(t *testing.T) {
 	}
 }
 
+func TestContextErrorPrefersExpiredDeadlineOverTransportCancellation(t *testing.T) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	err := contextError(ctx, context.Canceled)
+	if status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("contextError = %v, want DeadlineExceeded", err)
+	}
+}
+
 func TestUnaryRejectsMissingRequestFrame(t *testing.T) {
 	reg, conn, _ := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

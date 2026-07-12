@@ -5,6 +5,7 @@ package dataplane
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -236,7 +237,7 @@ func (s *Server) serverStream(stream grpc.ServerStream, full string, method prot
 	}
 	if plan.Delay != nil {
 		if err := plan.Delay.Wait(stream.Context()); err != nil {
-			return status.FromContextError(err).Err()
+			return contextError(stream.Context(), err)
 		}
 	}
 	return runSteps(stream.Context(), stream, plan.Stream, in, call)
@@ -266,6 +267,13 @@ func receiveError(err error) error {
 	return status.Errorf(status.Convert(err).Code(), "simulacra: receiving request: %v", err)
 }
 
+func contextError(ctx context.Context, err error) error {
+	if deadline, ok := ctx.Deadline(); errors.Is(err, context.Canceled) && ok && !time.Now().Before(deadline) {
+		return status.FromContextError(context.DeadlineExceeded).Err()
+	}
+	return status.FromContextError(err).Err()
+}
+
 func applyMetadata(stream grpc.ServerStream, plan *stub.Plan) error {
 	if len(plan.Header) > 0 {
 		if err := stream.SetHeader(plan.Header); err != nil {
@@ -281,7 +289,7 @@ func applyMetadata(stream grpc.ServerStream, plan *stub.Plan) error {
 func sendSingle(stream grpc.ServerStream, plan *stub.Plan, in match.Input, call *journal.Call) error {
 	if plan.Delay != nil {
 		if err := plan.Delay.Wait(stream.Context()); err != nil {
-			return status.FromContextError(err).Err()
+			return contextError(stream.Context(), err)
 		}
 	}
 	if plan.Status != nil {
@@ -304,7 +312,7 @@ func runSteps(ctx context.Context, sender messageSender, steps []stub.Step, in m
 	for _, step := range steps {
 		if step.Delay != nil {
 			if err := step.Delay.Wait(ctx); err != nil {
-				return status.FromContextError(err).Err()
+				return contextError(ctx, err)
 			}
 		}
 		if step.Status != nil {

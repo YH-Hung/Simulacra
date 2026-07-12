@@ -3,6 +3,7 @@ package conformance_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -12,6 +13,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -33,6 +35,52 @@ type harness struct {
 	journal *journal.Journal
 }
 
+type healthChecker interface {
+	Check(context.Context, *healthpb.HealthCheckRequest, ...grpc.CallOption) (*healthpb.HealthCheckResponse, error)
+}
+
+func awaitServing(ctx context.Context, client healthChecker) error {
+	response, err := client.Check(ctx, &healthpb.HealthCheckRequest{})
+	if err != nil {
+		return fmt.Errorf("health Check: %w", err)
+	}
+	if response.GetStatus() != healthpb.HealthCheckResponse_SERVING {
+		return fmt.Errorf("health Check status = %s, want SERVING", response.GetStatus())
+	}
+	return nil
+}
+
+func waitForServe(serveDone <-chan error, timeout time.Duration) error {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-serveDone:
+		if err == nil || errors.Is(err, grpc.ErrServerStopped) {
+			return nil
+		}
+		return err
+	case <-timer.C:
+		return fmt.Errorf("gRPC Serve did not return after Stop")
+	}
+}
+
+func waitForJournalCall(calls *journal.Journal, method string, timeout time.Duration) (*journal.Call, error) {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	poll := time.NewTicker(time.Millisecond)
+	defer poll.Stop()
+	for {
+		if recorded := calls.Filter(journal.Filter{Method: method, Limit: 1}); len(recorded) == 1 {
+			return recorded[0], nil
+		}
+		select {
+		case <-poll.C:
+		case <-deadline.C:
+			return nil, fmt.Errorf("journal did not record %s within %s", method, timeout)
+		}
+	}
+}
+
 func newHarness(t *testing.T, stubsYAML string) *harness {
 	t.Helper()
 
@@ -42,7 +90,7 @@ func newHarness(t *testing.T, stubsYAML string) *harness {
 	}
 
 	dir := t.TempDir()
-	stubPath := filepath.Join(dir, "shapes.yaml")
+	stubPath := filepath.Join(dir, "stubs.yaml")
 	if err := os.WriteFile(stubPath, []byte(stubsYAML), 0o600); err != nil {
 		t.Fatalf("write stubs: %v", err)
 	}
@@ -76,12 +124,15 @@ func newHarness(t *testing.T, stubsYAML string) *harness {
 		_ = conn.Close()
 		server.Stop()
 		_ = listener.Close()
-		select {
-		case <-serveDone:
-		case <-time.After(time.Second):
-			t.Errorf("gRPC Serve did not return after Stop")
+		if err := waitForServe(serveDone, time.Second); err != nil {
+			t.Errorf("gRPC Serve shutdown: %v", err)
 		}
 	})
+	healthCtx, cancelHealth := context.WithTimeout(context.Background(), rpcTimeout)
+	defer cancelHealth()
+	if err := awaitServing(healthCtx, healthpb.NewHealthClient(conn)); err != nil {
+		t.Fatalf("gRPC server readiness: %v", err)
+	}
 	return &harness{reg: reg, conn: conn, journal: calls}
 }
 
