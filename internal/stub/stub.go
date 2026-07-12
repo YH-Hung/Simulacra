@@ -1,5 +1,5 @@
-// Package stub defines the YAML stub format (M1 subset), compiles stubs
-// against the schema registry, and selects them at request time.
+// Package stub defines the YAML stub format, compiles against the schema registry
+// into executable response plans, and selects them at request time.
 package stub
 
 import (

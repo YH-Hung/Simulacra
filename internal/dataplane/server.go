@@ -41,7 +41,7 @@ func New(reg *schema.Registry, store *stub.Store, calls *journal.Journal) (*Serv
 	s := &Server{reg: reg, store: store, calls: calls}
 	s.grpc = grpc.NewServer(grpc.UnknownServiceHandler(s.handleUnknown))
 
-	// Health: standard grpc.health.v1 protocol, always SERVING in M1.
+	// Health: standard grpc.health.v1 protocol, always SERVING.
 	hs := health.NewServer()
 	healthpb.RegisterHealthServer(s.grpc, hs)
 	hs.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)

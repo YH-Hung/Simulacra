@@ -80,7 +80,7 @@ type envKey struct {
 
 func NewCompiler(files *protoregistry.Files) *Compiler { return &Compiler{files: files} }
 
-// Block is the YAML shape of a stub's `match:` section (M1 structured subset).
+// Block is the YAML shape of a stub's `match:` section.
 type Block struct {
 	Metadata map[string]Rules `yaml:"metadata"`
 	Message  map[string]Rules `yaml:"message"`
@@ -542,7 +542,7 @@ func literalFor(fd protoreflect.FieldDescriptor, raw any) (literal, error) {
 			return l, fmt.Errorf("field %q is an enum, got %T literal", fd.Name(), raw)
 		}
 	default:
-		return l, fmt.Errorf("field %q has kind %s, which structured matchers do not support yet (bytes/message/map matching arrives with CEL in M2)", fd.Name(), k)
+		return l, fmt.Errorf("field %q has kind %s, which structured matchers do not support (use expr for bytes/message/map matching)", fd.Name(), k)
 	}
 	return l, nil
 }
