@@ -71,7 +71,7 @@ func (p *resolverProvider) FindStructFieldType(structType, fieldName string) (*c
 				return nil, fmt.Errorf("message %s has no field %s", value.Descriptor().FullName(), fieldName)
 			}
 			fieldValue := value.Get(targetField)
-			if targetField.Message() != nil && targetField.Message().FullName() == "google.protobuf.Any" && value.Has(targetField) {
+			if !targetField.IsList() && !targetField.IsMap() && targetField.Message() != nil && targetField.Message().FullName() == "google.protobuf.Any" && value.Has(targetField) {
 				return p.adapter.unpackAny(fieldValue.Message())
 			}
 			return fieldValue.Interface(), nil
@@ -93,11 +93,14 @@ func reflectedMessage(value any) (protoreflect.Message, bool) {
 
 type protoAdapter struct {
 	fallback *celtypes.Registry
-	dynamic  *dynamicpb.Types
+	resolver *registryFirstTypes
 }
 
 func newProtoAdapter(provider *resolverProvider, files *protoregistry.Files) *protoAdapter {
-	adapter := &protoAdapter{fallback: provider.Registry, dynamic: dynamicpb.NewTypes(files)}
+	adapter := &protoAdapter{
+		fallback: provider.Registry,
+		resolver: &registryFirstTypes{dynamic: dynamicpb.NewTypes(files)},
+	}
 	provider.adapter = adapter
 	return adapter
 }
@@ -106,11 +109,25 @@ func (a *protoAdapter) NativeToValue(value any) ref.Val {
 	switch value := value.(type) {
 	case proto.Message:
 		message := value.ProtoReflect()
-		if isOrdinaryDynamicMessage(message) {
+		if message.Descriptor().FullName() == "google.protobuf.Any" {
+			unpacked, err := a.unpackAny(message)
+			if err != nil {
+				return celtypes.NewErr("unmarshal dynamic any failed: %v", err)
+			}
+			return a.NativeToValue(unpacked)
+		}
+		if isOrdinaryMessage(message) {
 			return &protoValue{adapter: a, message: message}
 		}
 	case protoreflect.Message:
-		if isOrdinaryDynamicMessage(value) {
+		if value.Descriptor().FullName() == "google.protobuf.Any" {
+			unpacked, err := a.unpackAny(value)
+			if err != nil {
+				return celtypes.NewErr("unmarshal dynamic any failed: %v", err)
+			}
+			return a.NativeToValue(unpacked)
+		}
+		if isOrdinaryMessage(value) {
 			return &protoValue{adapter: a, message: value}
 		}
 		return a.NativeToValue(value.Interface())
@@ -129,9 +146,8 @@ func (a *protoAdapter) NativeToValue(value any) ref.Val {
 	return a.fallback.NativeToValue(value)
 }
 
-func isOrdinaryDynamicMessage(message protoreflect.Message) bool {
-	_, dynamic := message.Interface().(*dynamicpb.Message)
-	return dynamic && !strings.HasPrefix(string(message.Descriptor().FullName()), "google.protobuf.")
+func isOrdinaryMessage(message protoreflect.Message) bool {
+	return !strings.HasPrefix(string(message.Descriptor().FullName()), "google.protobuf.")
 }
 
 type protoValue struct {
@@ -181,7 +197,7 @@ func (v *protoValue) Get(index ref.Val) ref.Val {
 		return celtypes.NewErr("no such field '%s'", name)
 	}
 	value := v.message.Get(field)
-	if field.Message() != nil && field.Message().FullName() == "google.protobuf.Any" && v.message.Has(field) {
+	if !field.IsList() && !field.IsMap() && field.Message() != nil && field.Message().FullName() == "google.protobuf.Any" && v.message.Has(field) {
 		unpacked, err := v.adapter.unpackAny(value.Message())
 		if err != nil {
 			return celtypes.NewErr("unmarshal dynamic any failed: %v", err)
@@ -205,19 +221,48 @@ func (v *protoValue) IsSet(index ref.Val) ref.Val {
 
 func (a *protoAdapter) unpackAny(envelope protoreflect.Message) (proto.Message, error) {
 	typeURL := envelope.Get(envelope.Descriptor().Fields().ByName("type_url")).String()
-	messageType, err := a.dynamic.FindMessageByURL(typeURL)
+	messageType, err := a.resolver.FindMessageByURL(typeURL)
 	if err != nil {
-		messageType, err = protoregistry.GlobalTypes.FindMessageByURL(typeURL)
-		if err != nil {
-			return nil, fmt.Errorf("resolving %q: %w", typeURL, err)
-		}
+		return nil, fmt.Errorf("resolving %q: %w", typeURL, err)
 	}
 	message := messageType.New().Interface()
 	value := envelope.Get(envelope.Descriptor().Fields().ByName("value")).Bytes()
-	if err := (proto.UnmarshalOptions{Resolver: a.dynamic}).Unmarshal(value, message); err != nil {
+	if err := (proto.UnmarshalOptions{Resolver: a.resolver}).Unmarshal(value, message); err != nil {
 		return nil, fmt.Errorf("decoding %q: %w", typeURL, err)
 	}
 	return message, nil
+}
+
+type registryFirstTypes struct {
+	dynamic *dynamicpb.Types
+}
+
+func (r *registryFirstTypes) FindMessageByName(name protoreflect.FullName) (protoreflect.MessageType, error) {
+	if message, err := r.dynamic.FindMessageByName(name); err == nil {
+		return message, nil
+	}
+	return protoregistry.GlobalTypes.FindMessageByName(name)
+}
+
+func (r *registryFirstTypes) FindMessageByURL(url string) (protoreflect.MessageType, error) {
+	if message, err := r.dynamic.FindMessageByURL(url); err == nil {
+		return message, nil
+	}
+	return protoregistry.GlobalTypes.FindMessageByURL(url)
+}
+
+func (r *registryFirstTypes) FindExtensionByName(name protoreflect.FullName) (protoreflect.ExtensionType, error) {
+	if extension, err := r.dynamic.FindExtensionByName(name); err == nil {
+		return extension, nil
+	}
+	return protoregistry.GlobalTypes.FindExtensionByName(name)
+}
+
+func (r *registryFirstTypes) FindExtensionByNumber(message protoreflect.FullName, number protoreflect.FieldNumber) (protoreflect.ExtensionType, error) {
+	if extension, err := r.dynamic.FindExtensionByNumber(message, number); err == nil {
+		return extension, nil
+	}
+	return protoregistry.GlobalTypes.FindExtensionByNumber(message, number)
 }
 
 func fieldByName(message protoreflect.MessageDescriptor, name string) protoreflect.FieldDescriptor {
