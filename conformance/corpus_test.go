@@ -104,10 +104,10 @@ func TestCorpusHardCasesI(t *testing.T) {
 - method: conformance.v1.CorpusService/Echo
   priority: -1
   respond:
-    message: { text: note absent }
+    message: { text: note is absent }
 `,
 			req:  `{}`,
-			want: []string{"note absent"},
+			want: []string{"note is absent"},
 		},
 		{
 			feature: "presence.oneof",
