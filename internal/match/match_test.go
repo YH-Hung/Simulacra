@@ -2,6 +2,7 @@ package match
 
 import (
 	"context"
+	"errors"
 	"math"
 	"strings"
 	"testing"
@@ -324,6 +325,150 @@ func TestExprSchemaAnyWinsOverProcessGlobal(t *testing.T) {
 	if global.Descriptor().Fields().ByName("schema_value") != nil {
 		t.Fatal("schema-local collision mutated the process-global type registry")
 	}
+}
+
+func TestExprSchemaWrongKindDoesNotFallBackToProcessGlobalAny(t *testing.T) {
+	reg, method := anyExprRegistry(t)
+	file, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
+		Name:    proto.String("schema_wrong_kind.proto"),
+		Package: proto.String("google.rpc"),
+		Syntax:  proto.String("proto3"),
+		EnumType: []*descriptorpb.EnumDescriptorProto{{
+			Name: proto.String("ErrorInfo"),
+			Value: []*descriptorpb.EnumValueDescriptorProto{{
+				Name:   proto.String("ERROR_INFO_UNSPECIFIED"),
+				Number: proto.Int32(0),
+			}},
+		}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("build wrong-kind collision descriptor: %v", err)
+	}
+	if err := reg.AddFile(file); err != nil {
+		t.Fatalf("register wrong-kind collision descriptor: %v", err)
+	}
+	envelope, err := anypb.New(&errdetails.ErrorInfo{Reason: "global"})
+	if err != nil {
+		t.Fatalf("pack process-global ErrorInfo: %v", err)
+	}
+	compiled := compileAnyExpr(t, reg, method.Input(), `message.payload.reason == "global"`)
+	in := Input{Message: requestWithAny(t, method.Input(), envelope)}
+	if compiled.Eval(in) {
+		t.Fatal("schema-local enum collision silently fell back to process-global message")
+	}
+	diagnostic := strings.Join(compiled.Explain(in), "\n")
+	if !strings.Contains(diagnostic, "wrong type") || !strings.Contains(diagnostic, "want message") {
+		t.Fatalf("wrong-kind Any diagnostic = %q, want schema type error", diagnostic)
+	}
+}
+
+func TestRegistryFirstTypesFallbackOnlyOnNotFound(t *testing.T) {
+	files := new(protoregistry.Files)
+	file, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
+		Name:    proto.String("resolver_wrong_kinds.proto"),
+		Package: proto.String("google.rpc"),
+		Syntax:  proto.String("proto3"),
+		EnumType: []*descriptorpb.EnumDescriptorProto{{
+			Name: proto.String("ErrorInfo"),
+			Value: []*descriptorpb.EnumValueDescriptorProto{{
+				Name:   proto.String("ERROR_INFO_UNSPECIFIED"),
+				Number: proto.Int32(0),
+			}},
+		}},
+		MessageType: []*descriptorpb.DescriptorProto{{Name: proto.String("DebugInfo")}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("build resolver descriptors: %v", err)
+	}
+	if err := files.RegisterFile(file); err != nil {
+		t.Fatalf("register resolver descriptors: %v", err)
+	}
+	resolver := &registryFirstTypes{dynamic: dynamicpb.NewTypes(files)}
+	if _, err := resolver.FindMessageByName("google.rpc.ErrorInfo"); err == nil || errors.Is(err, protoregistry.NotFound) {
+		t.Fatalf("FindMessageByName wrong-kind error = %v, want non-NotFound error", err)
+	}
+	if _, err := resolver.FindMessageByURL("type.googleapis.com/google.rpc.ErrorInfo"); err == nil || errors.Is(err, protoregistry.NotFound) {
+		t.Fatalf("FindMessageByURL wrong-kind error = %v, want non-NotFound error", err)
+	}
+	if _, err := resolver.FindExtensionByName("google.rpc.DebugInfo"); err == nil || errors.Is(err, protoregistry.NotFound) {
+		t.Fatalf("FindExtensionByName wrong-kind error = %v, want non-NotFound error", err)
+	}
+	if _, err := resolver.FindMessageByName("google.rpc.DebugInfo"); err != nil {
+		t.Fatalf("FindMessageByName schema message: %v", err)
+	}
+	if _, err := resolver.FindMessageByName("google.rpc.Status"); err != nil {
+		t.Fatalf("FindMessageByName global fallback: %v", err)
+	}
+}
+
+func TestExprDynamicProto2Extension(t *testing.T) {
+	reg := schema.NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), "../../conformance/protos"); err != nil {
+		t.Fatalf("AddProtoDir: %v", err)
+	}
+	method, err := reg.LookupMethod("conformance.v1.LegacyService/Make")
+	if err != nil {
+		t.Fatalf("LookupMethod: %v", err)
+	}
+	extensionType, err := reg.Types().FindExtensionByName("conformance.v1.ext_tag")
+	if err != nil {
+		t.Fatalf("FindExtensionByName: %v", err)
+	}
+	extension := extensionType.TypeDescriptor()
+
+	t.Run("set", func(t *testing.T) {
+		message := dynamicpb.NewMessage(method.Input())
+		message.Set(extension, protoreflect.ValueOfString("tagged"))
+		compiled := compileAnyExpr(t, reg, method.Input(), "message.`conformance.v1.ext_tag` == 'tagged' && has(message.`conformance.v1.ext_tag`)")
+		if !compiled.Eval(Input{Message: message}) {
+			t.Fatalf("set extension expression did not match: %v", compiled.Explain(Input{Message: message}))
+		}
+	})
+
+	t.Run("unset", func(t *testing.T) {
+		message := dynamicpb.NewMessage(method.Input())
+		compiled := compileAnyExpr(t, reg, method.Input(), "message.`conformance.v1.ext_tag` == '' && !has(message.`conformance.v1.ext_tag`)")
+		if !compiled.Eval(Input{Message: message}) {
+			t.Fatalf("unset extension expression did not match: %v", compiled.Explain(Input{Message: message}))
+		}
+	})
+
+	t.Run("runtime descriptor copy", func(t *testing.T) {
+		fileProto := protodesc.ToFileDescriptorProto(method.Input().ParentFile())
+		fileCopy, err := protodesc.NewFile(fileProto, nil)
+		if err != nil {
+			t.Fatalf("clone legacy descriptor: %v", err)
+		}
+		messageDesc := fileCopy.Messages().ByName("LegacyReply")
+		runtimeExtension := dynamicpb.NewExtensionType(fileCopy.Extensions().ByName("ext_tag")).TypeDescriptor()
+		message := dynamicpb.NewMessage(messageDesc)
+		message.Set(runtimeExtension, protoreflect.ValueOfString("copied"))
+		compiled := compileAnyExpr(t, reg, method.Input(), "message.`conformance.v1.ext_tag` == 'copied' && has(message.`conformance.v1.ext_tag`)")
+		if !compiled.Eval(Input{Message: message}) {
+			t.Fatalf("copied-descriptor extension expression did not match: %v", compiled.Explain(Input{Message: message}))
+		}
+	})
+
+	t.Run("inside registered Any", func(t *testing.T) {
+		if err := reg.AddProtoDir(context.Background(), "../../testdata/protos"); err != nil {
+			t.Fatalf("AddProtoDir test schema: %v", err)
+		}
+		orderMethod, err := reg.LookupMethod("shop.v1.OrderService/GetOrder")
+		if err != nil {
+			t.Fatalf("LookupMethod OrderService/GetOrder: %v", err)
+		}
+		legacyReply := dynamicpb.NewMessage(method.Input())
+		legacyReply.Set(extension, protoreflect.ValueOfString("in-any"))
+		envelope := &anypb.Any{
+			TypeUrl: "type.googleapis.com/conformance.v1.LegacyReply",
+			Value:   mustMarshal(t, legacyReply),
+		}
+		compiled := compileAnyExpr(t, reg, orderMethod.Input(), "message.payload.`conformance.v1.ext_tag` == 'in-any' && has(message.payload.`conformance.v1.ext_tag`)")
+		in := Input{Message: requestWithAny(t, orderMethod.Input(), envelope)}
+		if !compiled.Eval(in) {
+			t.Fatalf("registered Any extension expression did not match: %v", compiled.Explain(in))
+		}
+	})
 }
 
 func TestExprUnknownAnyIsNonMatchWithDiagnostic(t *testing.T) {

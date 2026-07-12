@@ -1,6 +1,7 @@
 package match
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -43,12 +44,8 @@ func (p *resolverProvider) FindStructFieldType(structType, fieldName string) (*c
 	if err != nil {
 		return base, true
 	}
-	message, ok := descriptor.(protoreflect.MessageDescriptor)
+	_, ok = descriptor.(protoreflect.MessageDescriptor)
 	if !ok {
-		return base, true
-	}
-	field := fieldByName(message, fieldName)
-	if field == nil {
 		return base, true
 	}
 	return &celtypes.FieldType{
@@ -58,17 +55,17 @@ func (p *resolverProvider) FindStructFieldType(structType, fieldName string) (*c
 			if !ok {
 				return false
 			}
-			targetField := fieldByName(value.Descriptor(), fieldName)
-			return targetField != nil && value.Has(targetField)
+			targetField, err := p.adapter.fieldByName(value, fieldName)
+			return err == nil && value.Has(targetField)
 		},
 		GetFrom: func(target any) (any, error) {
 			value, ok := reflectedMessage(target)
 			if !ok {
 				return nil, fmt.Errorf("field %s.%s target has type %T, want protobuf message", structType, fieldName, target)
 			}
-			targetField := fieldByName(value.Descriptor(), fieldName)
-			if targetField == nil {
-				return nil, fmt.Errorf("message %s has no field %s", value.Descriptor().FullName(), fieldName)
+			targetField, err := p.adapter.fieldByName(value, fieldName)
+			if err != nil {
+				return nil, err
 			}
 			fieldValue := value.Get(targetField)
 			if !targetField.IsList() && !targetField.IsMap() && targetField.Message() != nil && targetField.Message().FullName() == "google.protobuf.Any" && value.Has(targetField) {
@@ -192,9 +189,9 @@ func (v *protoValue) Get(index ref.Val) ref.Val {
 	if !ok {
 		return celtypes.MaybeNoSuchOverloadErr(index)
 	}
-	field := fieldByName(v.message.Descriptor(), string(name))
-	if field == nil {
-		return celtypes.NewErr("no such field '%s'", name)
+	field, err := v.adapter.fieldByName(v.message, string(name))
+	if err != nil {
+		return celtypes.NewErr("%v", err)
 	}
 	value := v.message.Get(field)
 	if !field.IsList() && !field.IsMap() && field.Message() != nil && field.Message().FullName() == "google.protobuf.Any" && v.message.Has(field) {
@@ -212,9 +209,9 @@ func (v *protoValue) IsSet(index ref.Val) ref.Val {
 	if !ok {
 		return celtypes.MaybeNoSuchOverloadErr(index)
 	}
-	field := fieldByName(v.message.Descriptor(), string(name))
-	if field == nil {
-		return celtypes.NewErr("no such field '%s'", name)
+	field, err := v.adapter.fieldByName(v.message, string(name))
+	if err != nil {
+		return celtypes.NewErr("%v", err)
 	}
 	return celtypes.Bool(v.message.Has(field))
 }
@@ -238,31 +235,77 @@ type registryFirstTypes struct {
 }
 
 func (r *registryFirstTypes) FindMessageByName(name protoreflect.FullName) (protoreflect.MessageType, error) {
-	if message, err := r.dynamic.FindMessageByName(name); err == nil {
+	message, err := r.dynamic.FindMessageByName(name)
+	if err == nil {
 		return message, nil
+	}
+	if !errors.Is(err, protoregistry.NotFound) {
+		return nil, err
 	}
 	return protoregistry.GlobalTypes.FindMessageByName(name)
 }
 
 func (r *registryFirstTypes) FindMessageByURL(url string) (protoreflect.MessageType, error) {
-	if message, err := r.dynamic.FindMessageByURL(url); err == nil {
+	message, err := r.dynamic.FindMessageByURL(url)
+	if err == nil {
 		return message, nil
+	}
+	if !errors.Is(err, protoregistry.NotFound) {
+		return nil, err
 	}
 	return protoregistry.GlobalTypes.FindMessageByURL(url)
 }
 
 func (r *registryFirstTypes) FindExtensionByName(name protoreflect.FullName) (protoreflect.ExtensionType, error) {
-	if extension, err := r.dynamic.FindExtensionByName(name); err == nil {
+	extension, err := r.dynamic.FindExtensionByName(name)
+	if err == nil {
 		return extension, nil
+	}
+	if !errors.Is(err, protoregistry.NotFound) {
+		return nil, err
 	}
 	return protoregistry.GlobalTypes.FindExtensionByName(name)
 }
 
 func (r *registryFirstTypes) FindExtensionByNumber(message protoreflect.FullName, number protoreflect.FieldNumber) (protoreflect.ExtensionType, error) {
-	if extension, err := r.dynamic.FindExtensionByNumber(message, number); err == nil {
+	extension, err := r.dynamic.FindExtensionByNumber(message, number)
+	if err == nil {
 		return extension, nil
 	}
+	if !errors.Is(err, protoregistry.NotFound) {
+		return nil, err
+	}
 	return protoregistry.GlobalTypes.FindExtensionByNumber(message, number)
+}
+
+func (a *protoAdapter) fieldByName(message protoreflect.Message, name string) (protoreflect.FieldDescriptor, error) {
+	if field := fieldByName(message.Descriptor(), name); field != nil {
+		return field, nil
+	}
+	extensionType, err := a.resolver.FindExtensionByName(protoreflect.FullName(name))
+	if err != nil {
+		return nil, fmt.Errorf("no such field '%s': %w", name, err)
+	}
+	extension := extensionType.TypeDescriptor()
+	if extension.ContainingMessage().FullName() != message.Descriptor().FullName() {
+		return nil, fmt.Errorf("extension '%s' extends %s, not %s", name, extension.ContainingMessage().FullName(), message.Descriptor().FullName())
+	}
+
+	// A populated dynamic extension is keyed by the exact descriptor used to
+	// set or decode it. Reuse that runtime descriptor when schemas were built
+	// independently; passing the provider's descriptor would report it unset.
+	var runtimeExtension protoreflect.FieldDescriptor
+	message.Range(func(field protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+		if field.IsExtension() && field.FullName() == extension.FullName() {
+			runtimeExtension = field
+			return false
+		}
+		return true
+	})
+	if runtimeExtension != nil {
+		return runtimeExtension, nil
+	}
+	return extension, nil
 }
 
 func fieldByName(message protoreflect.MessageDescriptor, name string) protoreflect.FieldDescriptor {
