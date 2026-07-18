@@ -651,6 +651,58 @@ func TestTemplateDynamicRequiredFieldsInNonStringMapsAndExtensions(t *testing.T)
 	}
 }
 
+func TestTemplateDynamicRequiredFieldsWithNoncanonicalMapKeys(t *testing.T) {
+	reg, method, env := conformanceMethodParts(t, "conformance.v1.LegacyService/Container")
+	tests := []struct {
+		name  string
+		field string
+		key   string
+		want  string
+	}{
+		{name: "signed leading zero", field: "by_number", key: "07", want: `{"byNumber":{"7":{"name":"dynamic-required"}}}`},
+		{name: "signed leading plus", field: "by_number", key: "+7", want: `{"byNumber":{"7":{"name":"dynamic-required"}}}`},
+		{name: "signed negative control", field: "by_number", key: "-7", want: `{"byNumber":{"-7":{"name":"dynamic-required"}}}`},
+		{name: "unsigned leading zero", field: "by_unsigned", key: "07", want: `{"byUnsigned":{"7":{"name":"dynamic-required"}}}`},
+		{name: "unsigned canonical control", field: "by_unsigned", key: "7", want: `{"byUnsigned":{"7":{"name":"dynamic-required"}}}`},
+		{name: "bool true control", field: "by_flag", key: "true", want: `{"byFlag":{"true":{"name":"dynamic-required"}}}`},
+		{name: "bool false control", field: "by_flag", key: "false", want: `{"byFlag":{"false":{"name":"dynamic-required"}}}`},
+	}
+	request := msgForResolver(t, method.Input(), `{"note":"dynamic-required"}`, reg.Types())
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpl, err := newTemplate(env, reg.Types(), method.Output(), map[string]any{
+				tt.field: map[string]any{tt.key: map[string]any{"name": "{{ message.note }}"}},
+			}, "required-container.yaml#noncanonical")
+			if err != nil {
+				t.Fatalf("newTemplate: %v", err)
+			}
+			got, err := tmpl.Render(match.Input{Message: request.ProtoReflect()})
+			if err != nil {
+				t.Fatalf("Render: %v", err)
+			}
+			want := msgForResolver(t, method.Output(), tt.want, reg.Types())
+			if !proto.Equal(got, want) {
+				t.Fatalf("response = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestTemplateRejectsInvalidUnsignedMapKey(t *testing.T) {
+	reg, method, env := conformanceMethodParts(t, "conformance.v1.LegacyService/Container")
+	_, err := newTemplate(env, reg.Types(), method.Output(), map[string]any{
+		"by_unsigned": map[string]any{"+7": map[string]any{"name": "{{ message.note }}"}},
+	}, "required-container.yaml#invalid-unsigned")
+	if err == nil {
+		t.Fatal("newTemplate accepted an invalid unsigned protobuf JSON map key")
+	}
+	for _, want := range []string{"required-container.yaml#invalid-unsigned", "uint32", "+7"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
 func TestTemplateStaticMissingRequiredFieldsInMapsAndExtensionsStillFail(t *testing.T) {
 	reg, method, _ := conformanceMethodParts(t, "conformance.v1.LegacyService/Container")
 	tests := []struct {
@@ -737,6 +789,68 @@ func TestTemplateAllowsNullForRequiredValueAndNullValueDestinations(t *testing.T
 		t.Fatalf("Render: %v", err)
 	}
 	want := msgForResolver(t, method.Output(), `{"value":null,"nullEnum":null}`, reg.Types())
+	if !proto.Equal(got, want) {
+		t.Fatalf("response = %v, want %v", got, want)
+	}
+}
+
+func TestTemplateRejectsStaticallyNullRepeatedAndMapElementsAtLoad(t *testing.T) {
+	reg, method, env := conformanceMethodParts(t, "conformance.v1.NullService/Nulls")
+	tests := []struct {
+		name  string
+		field string
+		value any
+	}{
+		{name: "repeated scalar", field: "numbers", value: []any{"{{ null }}"}},
+		{name: "repeated message", field: "payloads", value: []any{"{{ null }}"}},
+		{name: "scalar map value", field: "number_map", value: map[string]any{"key": "{{ null }}"}},
+		{name: "message map value", field: "payload_map", value: map[string]any{"key": "{{ null }}"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := newTemplate(env, reg.Types(), method.Output(), map[string]any{
+				"value":     "{{ null }}",
+				"null_enum": "{{ null }}",
+				tt.field:    tt.value,
+			}, "container-null.yaml#0")
+			if err == nil {
+				t.Fatal("newTemplate accepted statically null repeated element or map value")
+			}
+			for _, want := range []string{"container-null.yaml#0", "{{ null }}", "null", tt.field} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not mention %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+func TestTemplateAllowsNullForOptionalAndContainerValueDestinations(t *testing.T) {
+	reg, method, env := conformanceMethodParts(t, "conformance.v1.NullService/Nulls")
+	tmpl, err := newTemplate(env, reg.Types(), method.Output(), map[string]any{
+		"value":            "{{ null }}",
+		"null_enum":        "{{ null }}",
+		"optional_payload": "{{ null }}",
+		"values":           []any{"{{ null }}"},
+		"null_enums":       []any{"{{ null }}"},
+		"value_map":        map[string]any{"value": "{{ null }}"},
+		"null_enum_map":    map[string]any{"enum": "{{ null }}"},
+	}, "container-null.yaml#semantics")
+	if err != nil {
+		t.Fatalf("newTemplate: %v", err)
+	}
+	got, err := tmpl.Render(match.Input{})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	want := msgForResolver(t, method.Output(), `{
+		"value": null,
+		"nullEnum": null,
+		"values": [null],
+		"nullEnums": [null],
+		"valueMap": {"value": null},
+		"nullEnumMap": {"enum": null}
+	}`, reg.Types())
 	if !proto.Equal(got, want) {
 		t.Fatalf("response = %v, want %v", got, want)
 	}

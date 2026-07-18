@@ -590,8 +590,15 @@ func validateCELResultType(resolver *schema.Types, result *cel.Type, field proto
 	case cel.DynKind, cel.AnyKind, types.UnknownKind, cel.TypeParamKind:
 		return nil
 	case cel.NullTypeKind:
-		if field != nil && !listElement && field.Cardinality() == protoreflect.Required && !protobufNullIsValue(field) {
-			return fmt.Errorf("statically null CEL result cannot satisfy required protobuf field %s (%s)", field.FullName(), protobufFieldType(field))
+		if field != nil && !protobufNullIsValue(field) {
+			switch {
+			case listElement:
+				return fmt.Errorf("statically null CEL result cannot populate repeated protobuf element %s (%s)", field.FullName(), protobufFieldType(field))
+			case protobufMapValueDescriptor(field):
+				return fmt.Errorf("statically null CEL result cannot populate protobuf map value %s (%s)", field.FullName(), protobufFieldType(field))
+			case field.Cardinality() == protoreflect.Required:
+				return fmt.Errorf("statically null CEL result cannot satisfy required protobuf field %s (%s)", field.FullName(), protobufFieldType(field))
+			}
 		}
 		return nil
 	}
@@ -606,6 +613,11 @@ func protobufNullIsValue(field protoreflect.FieldDescriptor) bool {
 		return true
 	}
 	return field.Kind() == protoreflect.EnumKind && field.Enum() != nil && field.Enum().FullName() == "google.protobuf.NullValue"
+}
+
+func protobufMapValueDescriptor(field protoreflect.FieldDescriptor) bool {
+	container := field.ContainingMessage()
+	return container != nil && container.IsMapEntry() && field.Name() == "value"
 }
 
 func celResultFitsField(resolver *schema.Types, result *cel.Type, field protoreflect.FieldDescriptor, listElement bool) bool {
@@ -1148,22 +1160,24 @@ func seedDynamicRequiredFields(types *schema.Types, message protoreflect.Message
 				continue
 			}
 			values := message.Get(field).Map()
-			var seedErr error
-			values.Range(func(key protoreflect.MapKey, value protoreflect.Value) bool {
-				entry, ok := entries[protobufJSONMapKey(key, field.MapKey().Kind())]
-				if !ok {
-					return true
+			for _, sourceKey := range sortedKeys(entries) {
+				key, err := parseProtobufJSONMapKey(sourceKey, field.MapKey())
+				if err != nil {
+					return fmt.Errorf("field %s: %w", field.FullName(), err)
 				}
+				if !values.Has(key) {
+					continue
+				}
+				entry := entries[sourceKey]
+				value := values.Get(key)
 				child, ok := entry.(map[string]any)
 				if ok {
-					seedErr = seedDynamicRequiredFields(types, value.Message(), child)
+					if err := seedDynamicRequiredFields(types, value.Message(), child); err != nil {
+						return err
+					}
 				} else if hasSites(entry) {
 					seedAllRequiredFields(value.Message())
 				}
-				return seedErr == nil
-			})
-			if seedErr != nil {
-				return seedErr
 			}
 		case field.IsList():
 			entries, ok := raw.([]any)
@@ -1194,19 +1208,36 @@ func seedDynamicRequiredFields(types *schema.Types, message protoreflect.Message
 	return nil
 }
 
-func protobufJSONMapKey(key protoreflect.MapKey, kind protoreflect.Kind) string {
-	switch kind {
+func parseProtobufJSONMapKey(text string, field protoreflect.FieldDescriptor) (protoreflect.MapKey, error) {
+	const base10 = 10
+	switch field.Kind() {
+	case protoreflect.StringKind:
+		return protoreflect.ValueOfString(text).MapKey(), nil
 	case protoreflect.BoolKind:
-		return strconv.FormatBool(key.Bool())
-	case protoreflect.Int32Kind, protoreflect.Sint32Kind, protoreflect.Sfixed32Kind,
-		protoreflect.Int64Kind, protoreflect.Sint64Kind, protoreflect.Sfixed64Kind:
-		return strconv.FormatInt(key.Int(), 10)
-	case protoreflect.Uint32Kind, protoreflect.Fixed32Kind,
-		protoreflect.Uint64Kind, protoreflect.Fixed64Kind:
-		return strconv.FormatUint(key.Uint(), 10)
-	default:
-		return key.String()
+		switch text {
+		case "true":
+			return protoreflect.ValueOfBool(true).MapKey(), nil
+		case "false":
+			return protoreflect.ValueOfBool(false).MapKey(), nil
+		}
+	case protoreflect.Int32Kind, protoreflect.Sint32Kind, protoreflect.Sfixed32Kind:
+		if value, err := strconv.ParseInt(text, base10, 32); err == nil {
+			return protoreflect.ValueOfInt32(int32(value)).MapKey(), nil
+		}
+	case protoreflect.Int64Kind, protoreflect.Sint64Kind, protoreflect.Sfixed64Kind:
+		if value, err := strconv.ParseInt(text, base10, 64); err == nil {
+			return protoreflect.ValueOfInt64(value).MapKey(), nil
+		}
+	case protoreflect.Uint32Kind, protoreflect.Fixed32Kind:
+		if value, err := strconv.ParseUint(text, base10, 32); err == nil {
+			return protoreflect.ValueOfUint32(uint32(value)).MapKey(), nil
+		}
+	case protoreflect.Uint64Kind, protoreflect.Fixed64Kind:
+		if value, err := strconv.ParseUint(text, base10, 64); err == nil {
+			return protoreflect.ValueOfUint64(value).MapKey(), nil
+		}
 	}
+	return protoreflect.MapKey{}, fmt.Errorf("invalid value for %s key: %q", field.Kind(), text)
 }
 
 func seedRequiredField(message protoreflect.Message, field protoreflect.FieldDescriptor) {

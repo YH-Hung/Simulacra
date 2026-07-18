@@ -26,6 +26,7 @@ message RequiredPayload {
 message RequiredContainer {
   map<int32, RequiredPayload> by_number = 1;
   map<bool, RequiredPayload> by_flag = 2;
+  map<uint32, RequiredPayload> by_unsigned = 3;
   extensions 100 to 199;
 }
 
