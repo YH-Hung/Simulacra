@@ -3,10 +3,14 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,6 +43,83 @@ func TestServeWatchFlagDefaultsTrue(t *testing.T) {
 	if err := cmd.Flags().Set("watch", "false"); err != nil {
 		t.Fatalf("set --watch=false: %v", err)
 	}
+}
+
+func TestServeExecuteContextCancellationReturnsWithinBound(t *testing.T) {
+	listener := newBlockingListener()
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := newServeCmdWithListen(func(string, string) (net.Listener, error) { return listener, nil })
+	ready := make(chan struct{})
+	writer := &notifyWriter{needle: "data plane listening", seen: ready}
+	cmd.SetOut(writer)
+	cmd.SetErr(writer)
+	cmd.SetArgs([]string{
+		"--proto", "../../testdata/protos",
+		"--listen", "127.0.0.1:0",
+		"--watch=false",
+	})
+	result := make(chan error, 1)
+	go func() { result <- cmd.ExecuteContext(ctx) }()
+	select {
+	case <-ready:
+	case err := <-result:
+		t.Fatalf("serve returned before becoming ready: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("serve did not become ready")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("ExecuteContext returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ExecuteContext did not return within one second of cancellation")
+	}
+}
+
+type blockingListener struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newBlockingListener() *blockingListener {
+	return &blockingListener{closed: make(chan struct{})}
+}
+
+func (l *blockingListener) Accept() (net.Conn, error) {
+	<-l.closed
+	return nil, net.ErrClosed
+}
+
+func (l *blockingListener) Close() error {
+	l.once.Do(func() { close(l.closed) })
+	return nil
+}
+
+func (l *blockingListener) Addr() net.Addr { return fixedAddr("test-listener") }
+
+type fixedAddr string
+
+func (a fixedAddr) Network() string { return "test" }
+func (a fixedAddr) String() string  { return string(a) }
+
+type notifyWriter struct {
+	mu     sync.Mutex
+	buf    bytes.Buffer
+	needle string
+	seen   chan struct{}
+	once   sync.Once
+}
+
+func (w *notifyWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n, err := w.buf.Write(p)
+	if strings.Contains(w.buf.String(), w.needle) {
+		w.once.Do(func() { close(w.seen) })
+	}
+	return n, err
 }
 
 func TestReloadStubDirsKeepsInvalidStoreAndResetsValidBudget(t *testing.T) {
@@ -153,6 +234,165 @@ func TestCommandOutputSerializesConcurrentWrites(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestStartStubWatcherReconcilesMutationBeforeReady(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stub.yaml")
+	write := func(times int) {
+		t.Helper()
+		body := `
+- method: shop.v1.OrderService/GetOrder
+  times: ` + fmt.Sprint(times) + `
+  respond: { message: {} }
+`
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(1)
+	src := &sources{protoDirs: []string{"../../testdata/protos"}}
+	reg, err := src.buildRegistry(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, loadErrs := stub.LoadDirs(reg, []string{dir})
+	if len(loadErrs) != 0 {
+		t.Fatal(loadErrs)
+	}
+	store := stub.NewStore(initial)
+	const method = "/shop.v1.OrderService/GetOrder"
+	if store.Select(method, match.Input{}) == nil {
+		t.Fatal("initial limited stub did not select")
+	}
+
+	cmd := &cobra.Command{}
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	ctx, cancel := context.WithCancel(context.Background())
+	watch := func(ctx context.Context, _ []string, opts stub.WatchOptions) error {
+		write(2) // mutation after the initial load but before watches report ready
+		opts.Ready()
+		<-ctx.Done()
+		return nil
+	}
+	reconcile := func(reloadCtx context.Context) {
+		reloadStubDirsContext(reloadCtx, &commandOutput{cmd: cmd}, reg, store, []string{dir})
+	}
+	watcher, err := startStubWatcher(ctx, []string{dir}, &commandOutput{cmd: cmd}, reconcile, reconcile, watch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.Select(method, match.Input{}) == nil {
+		t.Fatal("startup reconciliation did not install mutation made before watcher readiness")
+	}
+	cancel()
+	watcher.stop()
+}
+
+func TestStartStubWatcherReturnsInitialAttachError(t *testing.T) {
+	want := errors.New("attach denied")
+	watch := func(context.Context, []string, stub.WatchOptions) error { return want }
+	_, err := startStubWatcher(context.Background(), []string{"stubs"}, discardReloadOutput{}, func(context.Context) {}, func(context.Context) {}, watch)
+	if !errors.Is(err, want) {
+		t.Fatalf("startStubWatcher error = %v, want attach error", err)
+	}
+}
+
+func TestStartStubWatcherCancellationDuringStartupJoinsWatcher(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	entered := make(chan struct{})
+	exited := make(chan struct{})
+	watch := func(ctx context.Context, _ []string, _ stub.WatchOptions) error {
+		close(entered)
+		<-ctx.Done()
+		close(exited)
+		return nil
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := startStubWatcher(ctx, []string{"stubs"}, discardReloadOutput{}, func(context.Context) {}, func(context.Context) {}, watch)
+		result <- err
+	}()
+	<-entered
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("startStubWatcher error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("startStubWatcher did not return after startup cancellation")
+	}
+	select {
+	case <-exited:
+	default:
+		t.Fatal("startStubWatcher returned without joining watcher goroutine")
+	}
+}
+
+func TestStartStubWatcherSerializesStartupReconcileBeforeCallbacks(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startupEntered := make(chan struct{})
+	releaseStartup := make(chan struct{})
+	triggerChange := make(chan struct{})
+	callbackDone := make(chan struct{})
+	var installed atomic.Int32
+	watch := func(ctx context.Context, _ []string, opts stub.WatchOptions) error {
+		opts.Ready()
+		<-triggerChange
+		opts.OnChange(ctx)
+		close(callbackDone)
+		<-ctx.Done()
+		return nil
+	}
+	result := make(chan watcherRun, 1)
+	errs := make(chan error, 1)
+	go func() {
+		watcher, err := startStubWatcher(ctx, []string{"stubs"}, discardReloadOutput{}, func(context.Context) {
+			installed.Store(2)
+		}, func(context.Context) {
+			close(startupEntered)
+			<-releaseStartup
+			installed.Store(1)
+		}, watch)
+		if err != nil {
+			errs <- err
+			return
+		}
+		result <- watcher
+	}()
+	<-startupEntered
+	close(triggerChange)
+	select {
+	case <-callbackDone:
+		t.Fatal("watch callback overlapped startup reconciliation")
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(releaseStartup)
+	var watcher watcherRun
+	select {
+	case watcher = <-result:
+	case err := <-errs:
+		t.Fatal(err)
+	case <-time.After(time.Second):
+		t.Fatal("startStubWatcher did not return")
+	}
+	select {
+	case <-callbackDone:
+	case <-time.After(time.Second):
+		t.Fatal("queued watch callback did not run after startup reconciliation")
+	}
+	if got := installed.Load(); got != 2 {
+		t.Fatalf("installed version = %d, want newer callback version 2", got)
+	}
+	watcher.stop()
+}
+
+type discardReloadOutput struct{}
+
+func (discardReloadOutput) Printf(string, ...any) {}
+func (discardReloadOutput) PrintErrln(...any)     {}
 
 func TestServeWithRuntimeStopsAndJoinsWatcherOnServeReturn(t *testing.T) {
 	started := make(chan struct{})
