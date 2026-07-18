@@ -43,6 +43,8 @@ message Everything {
   google.protobuf.ListValue list_value = 18;
   Inner child = 19;
   int32 count = 20;
+  map<bool, int32> flags = 21;
+  map<int32, Inner> numbered_items = 22;
 }
 
 message WideEverything {
@@ -55,4 +57,7 @@ service CorpusService {
   rpc Pull(Everything) returns (stream Everything);
   rpc Push(stream Everything) returns (Everything);
   rpc Converse(stream Everything) returns (stream Everything);
+  rpc StructRoot(Everything) returns (google.protobuf.Struct);
+  rpc ValueRoot(Everything) returns (google.protobuf.Value);
+  rpc AnyRoot(Everything) returns (google.protobuf.Any);
 }

@@ -234,6 +234,64 @@ func TestCorpusTemplatedProtobufJSONSpecialForms(t *testing.T) {
 	})
 }
 
+func TestCorpusTopLevelSpecialResponseRoots(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		stub   string
+		want   string
+	}{
+		{
+			name:   "Struct",
+			method: "/conformance.v1.CorpusService/StructRoot",
+			stub: `
+- method: conformance.v1.CorpusService/StructRoot
+  respond:
+    message: { echo: "{{ message.text }}" }
+`,
+			want: `{"echo":"top-level"}`,
+		},
+		{
+			name:   "Value object",
+			method: "/conformance.v1.CorpusService/ValueRoot",
+			stub: `
+- method: conformance.v1.CorpusService/ValueRoot
+  respond:
+    message: { echo: "{{ message.text }}" }
+`,
+			want: `{"echo":"top-level"}`,
+		},
+		{
+			name:   "Any",
+			method: "/conformance.v1.CorpusService/AnyRoot",
+			stub: `
+- method: conformance.v1.CorpusService/AnyRoot
+  respond:
+    message:
+      "@type": type.googleapis.com/conformance.v1.Inner
+      id: "{{ message.text }}"
+`,
+			want: `{"@type":"type.googleapis.com/conformance.v1.Inner","id":"top-level"}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t, tt.stub)
+			method := h.method(t, tt.method, match.Unary)
+			ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+			defer cancel()
+			response, err := h.invoke(t, ctx, tt.method, h.jsonMessage(t, method.Input(), `{"text":"top-level"}`))
+			if err != nil {
+				t.Fatalf("invoke: %v", err)
+			}
+			want := h.jsonMessage(t, method.Output(), tt.want)
+			if !proto.Equal(response, want) {
+				t.Fatalf("response = %v, want %v", response, want)
+			}
+		})
+	}
+}
+
 func TestCorpusProto2Group(t *testing.T) {
 	t.Run("proto2.groups", func(t *testing.T) {
 		h := newHarness(t, `

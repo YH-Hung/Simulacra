@@ -19,7 +19,22 @@ extend LegacyReply {
   optional string ext_tag = 100;
 }
 
+message RequiredPayload {
+  required string name = 1;
+}
+
+message RequiredContainer {
+  map<int32, RequiredPayload> by_number = 1;
+  map<bool, RequiredPayload> by_flag = 2;
+  extensions 100 to 199;
+}
+
+extend RequiredContainer {
+  optional RequiredPayload ext_payload = 100;
+}
+
 service LegacyService {
   rpc Fetch(LegacyThing) returns (LegacyReply);
   rpc Make(LegacyReply) returns (LegacyThing);
+  rpc Container(LegacyReply) returns (RequiredContainer);
 }
