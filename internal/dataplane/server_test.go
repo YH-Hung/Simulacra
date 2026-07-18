@@ -684,6 +684,48 @@ func TestServerStreamingScript(t *testing.T) {
 	}
 }
 
+func TestServerStreamingTopLevelDelayHonorsStreamContext(t *testing.T) {
+	const delayedStream = `
+- method: shop.v1.OrderService/WatchOrder
+  respond:
+    delay: 1h
+    stream:
+      - message: { order_id: "o-123", status: ORDER_STATUS_PENDING }
+`
+
+	t.Run("deadline", func(t *testing.T) {
+		reg, conn, _ := startServerWithStubs(t, delayedStream)
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+
+		stream, method := openStream(t, reg, conn, ctx, "/shop.v1.OrderService/WatchOrder")
+		sendJSON(t, stream, method.Input(), `{"order_id":"o-123"}`)
+		if err := stream.CloseSend(); err != nil {
+			t.Fatalf("CloseSend: %v", err)
+		}
+		err := stream.RecvMsg(dynamicpb.NewMessage(method.Output()))
+		if got := status.Code(err); got != codes.DeadlineExceeded {
+			t.Fatalf("RecvMsg code = %s, want DeadlineExceeded (err %v)", got, err)
+		}
+	})
+
+	t.Run("cancellation", func(t *testing.T) {
+		reg, conn, _ := startServerWithStubs(t, delayedStream)
+		ctx, cancel := context.WithCancel(context.Background())
+
+		stream, method := openStream(t, reg, conn, ctx, "/shop.v1.OrderService/WatchOrder")
+		sendJSON(t, stream, method.Input(), `{"order_id":"o-123"}`)
+		if err := stream.CloseSend(); err != nil {
+			t.Fatalf("CloseSend: %v", err)
+		}
+		cancel()
+		err := stream.RecvMsg(dynamicpb.NewMessage(method.Output()))
+		if got := status.Code(err); got != codes.Canceled {
+			t.Fatalf("RecvMsg code = %s, want Canceled (err %v)", got, err)
+		}
+	})
+}
+
 func TestServerStreamingRejectsMissingRequestFrame(t *testing.T) {
 	reg, conn, _ := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

@@ -180,8 +180,8 @@ func (c *Compiler) compilePlan(method protoreflect.MethodDescriptor, shape match
 		return plan, nil
 
 	case match.ServerStream:
-		if spec.Message != nil || spec.Status != nil || spec.Delay != "" || spec.OnOpen != nil || spec.Rules != nil || spec.OnClose != nil {
-			return nil, fmt.Errorf("%s: respond: message, status, delay, on_open, rules, and on_close are not valid for server-streaming methods; use stream", source)
+		if spec.Message != nil || spec.Status != nil || spec.OnOpen != nil || spec.Rules != nil || spec.OnClose != nil {
+			return nil, fmt.Errorf("%s: respond: message, status, on_open, rules, and on_close are not valid for server-streaming methods; use stream", source)
 		}
 		if len(spec.Stream) == 0 {
 			return nil, fmt.Errorf("%s: respond.stream: server-streaming methods require a non-empty stream script", source)
@@ -286,6 +286,10 @@ func (c *Compiler) compileTemplate(method protoreflect.MethodDescriptor, shape m
 // names, nested/repeated/map fields, 64-bit ints, and well-known types
 // (e.g. Timestamp as RFC 3339 strings) all behave per spec.
 func BuildMessage(types *schema.Types, desc protoreflect.MessageDescriptor, fields map[string]any) (*dynamicpb.Message, error) {
+	return buildMessage(types, desc, fields, false)
+}
+
+func buildMessage(types *schema.Types, desc protoreflect.MessageDescriptor, fields map[string]any, allowPartial bool) (*dynamicpb.Message, error) {
 	if fields == nil {
 		fields = map[string]any{}
 	}
@@ -294,7 +298,7 @@ func BuildMessage(types *schema.Types, desc protoreflect.MessageDescriptor, fiel
 		return nil, fmt.Errorf("encoding response message as JSON: %w", err)
 	}
 	msg := dynamicpb.NewMessage(desc)
-	if err := (protojson.UnmarshalOptions{Resolver: types}).Unmarshal(data, msg); err != nil {
+	if err := (protojson.UnmarshalOptions{Resolver: types, AllowPartial: allowPartial}).Unmarshal(data, msg); err != nil {
 		return nil, fmt.Errorf("response message does not fit %s: %w", desc.FullName(), err)
 	}
 	return msg, nil

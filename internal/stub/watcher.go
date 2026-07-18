@@ -66,6 +66,15 @@ type watchState struct {
 }
 
 func watchWithBackend(ctx context.Context, dirs []string, opts WatchOptions, backend watchBackend) error {
+	return watchWithBackendHooks(ctx, dirs, opts, backend, watchWorkerHooks{})
+}
+
+type watchWorkerHooks struct {
+	started func()
+	stopped func()
+}
+
+func watchWithBackendHooks(ctx context.Context, dirs []string, opts WatchOptions, backend watchBackend, hooks watchWorkerHooks) error {
 	if opts.OnChange == nil {
 		_ = backend.Close()
 		return errors.New("watch callback must not be nil")
@@ -104,7 +113,7 @@ func watchWithBackend(ctx context.Context, dirs []string, opts WatchOptions, bac
 	defer cancelWorker()
 	reloads := make(chan struct{}, 1)
 	callbackErrs := make(chan error, 1)
-	go callbackWorker(workerCtx, reloads, callbackErrs, opts.OnChange)
+	startCallbackWorker(workerCtx, reloads, callbackErrs, opts.OnChange, hooks)
 
 	reloadTimer := time.NewTimer(opts.Debounce)
 	stopTimer(reloadTimer)
@@ -164,6 +173,18 @@ func watchWithBackend(ctx context.Context, dirs []string, opts WatchOptions, bac
 			}
 		}
 	}
+}
+
+func startCallbackWorker(ctx context.Context, reloads <-chan struct{}, callbackErrs chan<- error, onChange func(context.Context), hooks watchWorkerHooks) {
+	if hooks.started != nil {
+		hooks.started()
+	}
+	go func() {
+		if hooks.stopped != nil {
+			defer hooks.stopped()
+		}
+		callbackWorker(ctx, reloads, callbackErrs, onChange)
+	}()
 }
 
 func callbackWorker(ctx context.Context, reloads <-chan struct{}, callbackErrs chan<- error, onChange func(context.Context)) {

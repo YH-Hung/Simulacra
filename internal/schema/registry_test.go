@@ -9,7 +9,9 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/descriptorpb"
+	"google.golang.org/protobuf/types/dynamicpb"
 )
 
 const testProtoDir = "../../testdata/protos"
@@ -152,5 +154,108 @@ func TestTypesResolvesRegistrySchemas(t *testing.T) {
 	}
 	if _, err := types.FindMessageByName("google.protobuf.FileDescriptorSet"); err != nil {
 		t.Errorf("FindMessageByName(FileDescriptorSet): %v", err)
+	}
+}
+
+func TestTypesWrongKindDoesNotFallbackForMessages(t *testing.T) {
+	file, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
+		Name:    proto.String("local_message_collision.proto"),
+		Package: proto.String("google.protobuf"),
+		Syntax:  proto.String("proto3"),
+		EnumType: []*descriptorpb.EnumDescriptorProto{{
+			Name: proto.String("FileDescriptorSet"),
+			Value: []*descriptorpb.EnumValueDescriptorProto{{
+				Name:   proto.String("FILE_DESCRIPTOR_SET_UNSPECIFIED"),
+				Number: proto.Int32(0),
+			}},
+		}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("protodesc.NewFile: %v", err)
+	}
+	reg := NewRegistry()
+	if err := reg.AddFile(file); err != nil {
+		t.Fatalf("AddFile: %v", err)
+	}
+	types := reg.Types()
+
+	if got, err := reg.LookupMessage("google.protobuf.FileDescriptorSet"); err == nil {
+		t.Errorf("LookupMessage resolved global %v despite local wrong-kind collision", got.FullName())
+	}
+	if got, err := types.FindMessageByName("google.protobuf.FileDescriptorSet"); err == nil {
+		t.Errorf("FindMessageByName resolved global %v despite local wrong-kind collision", got.Descriptor().FullName())
+	}
+	if got, err := types.FindMessageByURL("type.googleapis.com/google.protobuf.FileDescriptorSet"); err == nil {
+		t.Errorf("FindMessageByURL resolved global %v despite local wrong-kind collision", got.Descriptor().FullName())
+	}
+}
+
+func TestTypesWrongKindDoesNotFallbackForExtension(t *testing.T) {
+	const (
+		pkg           = "simulacra.schemafallback"
+		hostName      = protoreflect.FullName(pkg + ".Host")
+		extensionName = protoreflect.FullName(pkg + ".ext_tag")
+		extensionNum  = protoreflect.FieldNumber(123)
+	)
+	global, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
+		Name:    proto.String("global_extension_collision.proto"),
+		Package: proto.String(pkg),
+		Syntax:  proto.String("proto2"),
+		MessageType: []*descriptorpb.DescriptorProto{{
+			Name: proto.String("Host"),
+			ExtensionRange: []*descriptorpb.DescriptorProto_ExtensionRange{{
+				Start: proto.Int32(100),
+				End:   proto.Int32(200),
+			}},
+		}},
+		Extension: []*descriptorpb.FieldDescriptorProto{{
+			Name:     proto.String("ext_tag"),
+			Number:   proto.Int32(int32(extensionNum)),
+			Label:    descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+			Type:     descriptorpb.FieldDescriptorProto_TYPE_STRING.Enum(),
+			Extendee: proto.String("." + string(hostName)),
+		}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("global protodesc.NewFile: %v", err)
+	}
+	if _, err := protoregistry.GlobalTypes.FindExtensionByName(extensionName); err != nil {
+		if err := protoregistry.GlobalTypes.RegisterExtension(dynamicpb.NewExtensionType(global.Extensions().Get(0))); err != nil {
+			t.Fatalf("RegisterExtension: %v", err)
+		}
+	}
+
+	local, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
+		Name:    proto.String("local_extension_collision.proto"),
+		Package: proto.String(pkg),
+		Syntax:  proto.String("proto3"),
+		EnumType: []*descriptorpb.EnumDescriptorProto{{
+			Name: proto.String("Host"),
+			Value: []*descriptorpb.EnumValueDescriptorProto{{
+				Name:   proto.String("HOST_UNSPECIFIED"),
+				Number: proto.Int32(0),
+			}},
+		}},
+		MessageType: []*descriptorpb.DescriptorProto{{Name: proto.String("ext_tag")}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("local protodesc.NewFile: %v", err)
+	}
+	reg := NewRegistry()
+	if err := reg.AddFile(local); err != nil {
+		t.Fatalf("AddFile: %v", err)
+	}
+
+	if got, err := reg.Types().FindExtensionByName(extensionName); err == nil {
+		t.Fatalf("FindExtensionByName resolved global %v despite local wrong-kind collision", got.TypeDescriptor().FullName())
+	}
+
+	// A genuine local miss still falls back to the registered global extension.
+	empty := NewRegistry().Types()
+	if got, err := empty.FindExtensionByName(extensionName); err != nil || got.TypeDescriptor().Number() != extensionNum {
+		t.Fatalf("global extension name fallback = %v, %v", got, err)
+	}
+	if got, err := empty.FindExtensionByNumber(hostName, extensionNum); err != nil || got.TypeDescriptor().FullName() != extensionName {
+		t.Fatalf("global extension number fallback = %v, %v", got, err)
 	}
 }

@@ -14,7 +14,7 @@ func TestCompileServerStreamingPlan(t *testing.T) {
 	reg := testRegistry(t)
 	c, err := Compile(reg, Stub{
 		Method: "shop.v1.OrderService/WatchOrder",
-		Respond: Respond{Stream: []StepSpec{
+		Respond: Respond{Delay: "2s", Stream: []StepSpec{
 			{Message: map[string]any{"status": "ORDER_STATUS_PENDING"}},
 			{Delay: "25ms", Message: map[string]any{"status": "ORDER_STATUS_SHIPPED"}},
 			{Status: &StatusSpec{Code: "UNAVAILABLE", Message: "backend hiccup"}},
@@ -28,6 +28,9 @@ func TestCompileServerStreamingPlan(t *testing.T) {
 	}
 	if got := c.Plan().Stream[1].Delay; got == nil || got.Min != 25*time.Millisecond {
 		t.Errorf("second delay = %#v, want 25ms", got)
+	}
+	if got := c.Plan().Delay; got == nil || got.Min != 2*time.Second || got.Max != 2*time.Second {
+		t.Errorf("top-level delay = %#v, want 2s", got)
 	}
 	if got := c.Plan().Stream[2].Status; got == nil || got.Code() != codes.Unavailable {
 		t.Errorf("terminal status = %v, want UNAVAILABLE", got)

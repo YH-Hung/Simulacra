@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -181,17 +180,18 @@ func TestWatchCancellationDoesNotWaitForBlockedCallback(t *testing.T) {
 	ready := make(chan struct{})
 	entered := make(chan struct{})
 	release := make(chan struct{})
+	workerStopped := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- watchWithBackend(ctx, []string{root}, WatchOptions{
+		done <- watchWithBackendHooks(ctx, []string{root}, WatchOptions{
 			Debounce: time.Millisecond,
 			OnChange: func(context.Context) {
 				close(entered)
 				<-release
 			},
 			Ready: func() { close(ready) },
-		}, backend)
+		}, backend, watchWorkerHooks{stopped: func() { close(workerStopped) }})
 	}()
 	<-ready
 	backend.events <- fsnotify.Event{Name: filepath.Join(root, "stub.yaml"), Op: fsnotify.Write}
@@ -203,6 +203,7 @@ func TestWatchCancellationDoesNotWaitForBlockedCallback(t *testing.T) {
 	cancel()
 	waitForWatchReturn(t, done)
 	close(release)
+	waitForWorkerStop(t, workerStopped)
 }
 
 func TestWatchDoesNotStartCallbackWorkerWhileReadyIsBlocked(t *testing.T) {
@@ -210,32 +211,53 @@ func TestWatchDoesNotStartCallbackWorkerWhileReadyIsBlocked(t *testing.T) {
 	backend := newFakeWatchBackend()
 	readyEntered := make(chan struct{})
 	releaseReady := make(chan struct{})
+	workerStarted := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- watchWithBackend(ctx, []string{root}, WatchOptions{
+		done <- watchWithBackendHooks(ctx, []string{root}, WatchOptions{
 			Debounce: time.Millisecond,
 			OnChange: func(context.Context) {},
 			Ready: func() {
 				close(readyEntered)
 				<-releaseReady
 			},
-		}, backend)
+		}, backend, watchWorkerHooks{started: func() { close(workerStarted) }})
 	}()
 	<-readyEntered
-
-	stack := make([]byte, 1<<20)
-	n := runtime.Stack(stack, true)
-	if strings.Contains(string(stack[:n]), "created by github.com/yinghanhung/simulacra/internal/stub.watchWithBackend") {
-		cancel()
-		close(releaseReady)
-		waitForWatchReturn(t, done)
-		t.Fatal("callback worker started before watcher readiness completed")
-	}
 
 	cancel()
 	close(releaseReady)
 	waitForWatchReturn(t, done)
+	select {
+	case <-workerStarted:
+		t.Fatal("callback worker started before watcher readiness completed or after startup cancellation")
+	default:
+	}
+}
+
+func TestWatchStartupFailureDoesNotStartCallbackWorker(t *testing.T) {
+	root := t.TempDir()
+	backend := newFakeWatchBackend()
+	backend.addErr = func(path string, _ int) error {
+		if path == root {
+			return syscall.EACCES
+		}
+		return nil
+	}
+	workerStarted := make(chan struct{})
+	err := watchWithBackendHooks(context.Background(), []string{root}, WatchOptions{
+		Debounce: time.Millisecond,
+		OnChange: func(context.Context) {},
+	}, backend, watchWorkerHooks{started: func() { close(workerStarted) }})
+	if !errors.Is(err, syscall.EACCES) {
+		t.Fatalf("watch startup error = %v, want EACCES", err)
+	}
+	select {
+	case <-workerStarted:
+		t.Fatal("callback worker started despite watcher startup failure")
+	default:
+	}
 }
 
 func TestWatchRecoversCallbackPanicAndReportsIt(t *testing.T) {
@@ -351,5 +373,14 @@ func waitForWatchReturn(t *testing.T, done <-chan error) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Watch did not return")
+	}
+}
+
+func waitForWorkerStop(t *testing.T, stopped <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("callback worker did not stop")
 	}
 }

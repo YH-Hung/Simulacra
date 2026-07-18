@@ -381,7 +381,7 @@ func resolvePath(md protoreflect.MessageDescriptor, path string) ([]protoreflect
 		}
 		out = append(out, fd)
 		if i < len(parts)-1 {
-			if fd.Kind() != protoreflect.MessageKind || fd.IsList() || fd.IsMap() {
+			if (fd.Kind() != protoreflect.MessageKind && fd.Kind() != protoreflect.GroupKind) || fd.IsList() || fd.IsMap() {
 				return nil, fmt.Errorf("cannot descend into %q in path %q: not a singular message field", p, path)
 			}
 			cur = fd.Message()

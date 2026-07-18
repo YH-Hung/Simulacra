@@ -3,6 +3,8 @@ package conformance_test
 import (
 	"context"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -13,10 +15,12 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/dynamicpb"
 
 	"github.com/yinghanhung/simulacra/internal/match"
 	"github.com/yinghanhung/simulacra/internal/schema"
+	"github.com/yinghanhung/simulacra/internal/stub"
 )
 
 func TestShapes_CorpusDescriptorContractAndDynamicAny(t *testing.T) {
@@ -60,7 +64,7 @@ const shapeStubs = `
   respond:
     metadata: { x-mock: simulacra }
     trailers: { x-stub: echo-1 }
-    message: { text: hello }
+    message: { text: 'hello {{ message.text }}' }
 - method: conformance.v1.CorpusService/Echo
   match:
     message:
@@ -110,6 +114,37 @@ const shapeStubs = `
       status: { code: OK }
 `
 
+func TestShapes_UnaryFixtureTemplateContract(t *testing.T) {
+	reg := schema.NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), "protos"); err != nil {
+		t.Fatalf("AddProtoDir: %v", err)
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "stubs.yaml"), []byte(shapeStubs), 0o600); err != nil {
+		t.Fatalf("write stubs: %v", err)
+	}
+	compiled, errs := stub.LoadDirs(reg, []string{dir})
+	if len(errs) != 0 {
+		t.Fatalf("LoadDirs: %v", errs)
+	}
+	if len(compiled) == 0 || compiled[0].Plan().Message == nil {
+		t.Fatal("unary fixture compiled without a response message")
+	}
+	method, err := reg.LookupMethod("conformance.v1.CorpusService/Echo")
+	if err != nil {
+		t.Fatalf("LookupMethod: %v", err)
+	}
+	request := dynamicpb.NewMessage(method.Input())
+	request.Set(method.Input().Fields().ByName("text"), protoreflect.ValueOfString("hi"))
+	response, err := compiled[0].Plan().Message.Render(match.Input{Message: request.ProtoReflect()})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if got := fieldString(t, response, "text"); got != "hello hi" {
+		t.Fatalf("response text = %q, want hello hi", got)
+	}
+}
+
 func TestShapes_UnaryEchoMetadataMessageHeadersTrailersAndVerification(t *testing.T) {
 	h := newHarness(t, shapeStubs)
 	desc := h.method(t, "/conformance.v1.CorpusService/Echo", match.Unary)
@@ -123,8 +158,8 @@ func TestShapes_UnaryEchoMetadataMessageHeadersTrailersAndVerification(t *testin
 	if err != nil {
 		t.Fatalf("Echo: %v", err)
 	}
-	if got := fieldString(t, response, "text"); got != "hello" {
-		t.Fatalf("response text = %q, want hello", got)
+	if got := fieldString(t, response, "text"); got != "hello hi" {
+		t.Fatalf("response text = %q, want hello hi", got)
 	}
 	if got := header.Get("x-mock"); len(got) != 1 || got[0] != "simulacra" {
 		t.Fatalf("x-mock header = %v, want [simulacra]", got)

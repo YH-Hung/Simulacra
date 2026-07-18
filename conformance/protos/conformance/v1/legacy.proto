@@ -5,6 +5,9 @@ package conformance.v1;
 message LegacyThing {
   required string name = 1;
   optional int32 level = 2 [default = 7];
+  optional group Detail = 3 {
+    required string code = 4;
+  }
 }
 
 message LegacyReply {

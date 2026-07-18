@@ -142,6 +142,128 @@ func TestCorpusRegisteredAnyResponseUnpacksSemantically(t *testing.T) {
 	}
 }
 
+func TestCorpusTemplatedProtobufJSONSpecialForms(t *testing.T) {
+	t.Run("wkt.struct_value_listvalue.template", func(t *testing.T) {
+		h := newHarness(t, `
+- method: conformance.v1.CorpusService/Echo
+  respond:
+    message:
+      when: "{{ message.when }}"
+      span: "{{ message.span }}"
+      wrapped: "{{ message.text }}"
+      attrs:
+        label: "{{ message.text }}"
+        nested: { enabled: "{{ true }}" }
+      val: { echoed: "{{ message.text }}" }
+      mask: "{{ message.mask }}"
+      list_value: ["{{ message.text }}", { enabled: "{{ true }}" }]
+      payload:
+        "@type": type.googleapis.com/conformance.v1.Inner
+        id: "{{ message.text }}"
+`)
+		method := h.method(t, corpusMethod, match.Unary)
+		request := h.jsonMessage(t, method.Input(), `{
+  "when":"2026-07-18T01:02:03Z",
+  "span":"1.500s",
+  "mask":"text,optNote",
+  "text":"templated"
+}`)
+		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+		defer cancel()
+		response, err := h.invoke(t, ctx, corpusMethod, request)
+		if err != nil {
+			t.Fatalf("Echo: %v", err)
+		}
+		want := h.jsonMessage(t, method.Output(), `{
+  "when":"2026-07-18T01:02:03Z",
+  "span":"1.500s",
+  "wrapped":"templated",
+  "attrs":{"label":"templated","nested":{"enabled":true}},
+  "val":{"echoed":"templated"},
+  "mask":"text,optNote",
+  "listValue":["templated",{"enabled":true}],
+  "payload":{"@type":"type.googleapis.com/conformance.v1.Inner","id":"templated"}
+}`)
+		if !proto.Equal(response, want) {
+			t.Fatalf("response = %v, want %v", response, want)
+		}
+	})
+
+	t.Run("any.registered.templated", func(t *testing.T) {
+		h := newHarness(t, `
+- method: conformance.v1.CorpusService/Echo
+  respond:
+    message:
+      payload: "{{ message.payload }}"
+`)
+		method := h.method(t, corpusMethod, match.Unary)
+		request := h.jsonMessage(t, method.Input(), `{
+  "payload":{"@type":"type.googleapis.com/conformance.v1.Inner","id":"whole-site"}
+}`)
+		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+		defer cancel()
+		response, err := h.invoke(t, ctx, corpusMethod, request)
+		if err != nil {
+			t.Fatalf("Echo: %v", err)
+		}
+		if !proto.Equal(response, request) {
+			t.Fatalf("response = %v, want repacked Any %v", response, request)
+		}
+	})
+
+	t.Run("proto2.extensions.template", func(t *testing.T) {
+		h := newHarness(t, `
+- method: conformance.v1.LegacyService/Fetch
+  respond:
+    message:
+      note: static
+      "[conformance.v1.ext_tag]": "{{ message.name }}"
+`)
+		methodName := "/conformance.v1.LegacyService/Fetch"
+		method := h.method(t, methodName, match.Unary)
+		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+		defer cancel()
+		response, err := h.invoke(t, ctx, methodName, h.jsonMessage(t, method.Input(), `{"name":"extension-value"}`))
+		if err != nil {
+			t.Fatalf("Fetch: %v", err)
+		}
+		want := h.jsonMessage(t, method.Output(), `{"note":"static","[conformance.v1.ext_tag]":"extension-value"}`)
+		if !proto.Equal(response, want) {
+			t.Fatalf("response = %v, want %v", response, want)
+		}
+	})
+}
+
+func TestCorpusProto2Group(t *testing.T) {
+	t.Run("proto2.groups", func(t *testing.T) {
+		h := newHarness(t, `
+- method: conformance.v1.LegacyService/Fetch
+  match:
+    message:
+      detail.code: { eq: in-group }
+  respond:
+    message: { note: group-matched }
+`)
+		methodName := "/conformance.v1.LegacyService/Fetch"
+		method := h.method(t, methodName, match.Unary)
+		detail := method.Input().Fields().ByName("detail")
+		if detail == nil || detail.Kind() != protoreflect.GroupKind {
+			t.Fatalf("detail descriptor = %v, want proto2 group", detail)
+		}
+		request := h.jsonMessage(t, method.Input(), `{"name":"thing","detail":{"code":"in-group"}}`)
+		if !request.Has(detail) || request.Get(detail).Message().Get(detail.Message().Fields().ByName("code")).String() != "in-group" {
+			t.Fatalf("decoded group = %v, want present code in-group", request.Get(detail))
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+		defer cancel()
+		response, err := h.invoke(t, ctx, methodName, request)
+		if err != nil {
+			t.Fatalf("Fetch: %v", err)
+		}
+		assertCorpusResponse(t, h, method.Output(), response, `{"note":"group-matched"}`)
+	})
+}
+
 func TestCorpusProto2DefaultPresenceSemantics(t *testing.T) {
 	h := newHarness(t, `
 - method: conformance.v1.LegacyService/Fetch

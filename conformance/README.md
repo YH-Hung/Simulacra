@@ -24,13 +24,18 @@ The policy is one line: **if it isn't tested, it isn't claimed.**
 - `shapes.*` — stub + call + verify across unary, server-, client-, and
   bidirectional streaming; typed error details; metadata; deadlines
 - `int64.precision`, `bytes.roundtrip`
-- `presence.optional.set` / `presence.optional.unset` / `presence.oneof`
-- `wkt.timestamp` / `wkt.duration` / `wkt.wrappers` / `wkt.struct` / `wkt.fieldmask`
-- `map.message_values`, `repeated.packed`, `structural.recursive`
-- `any.registered`, `any.unregistered` (type-URL matching + opaque bytes,
-  load-time rejection when building)
+- `presence.optional.set` / `presence.optional.unset` / `presence.oneof` /
+  `presence.message_vs_scalar`
+- `wkt.timestamp` / `wkt.duration` / `wkt.wrappers` / `wkt.struct` /
+  `wkt.value` / `wkt.fieldmask`; templated natural Struct/Value/ListValue
+  forms are covered by `wkt.struct_value_listvalue.template`
+- `map.message_values`, `repeated.packed`, `structural.recursive`,
+  `structural.large_message`
+- `any.registered`, `any.registered.templated`, `any.unregistered`
+  (registry-first type resolution, template repacking, type-URL matching +
+  opaque bytes, and load-time rejection when building)
 - `unknown_fields.preserved`
-- `proto2.required_and_defaults`, `proto2.extensions`
+- `proto2.required_and_defaults`, `proto2.extensions`, `proto2.groups`
 - `editions.basic`
 
 Known M2 limits (documented, not silent): no `messages` templating of

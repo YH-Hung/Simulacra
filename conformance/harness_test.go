@@ -191,6 +191,15 @@ func (h *harness) invoke(t *testing.T, ctx context.Context, method string, req *
 	desc := h.method(t, method, match.Unary)
 	response := dynamicpb.NewMessage(desc.Output())
 	err := h.conn.Invoke(ctx, method, req, response, opts...)
+	if err == nil {
+		// gRPC's default protobuf codec resolves extensions only through the
+		// process-global registry. Re-decode successful dynamic responses with
+		// the schema registry used by this real-client harness so local
+		// extensions participate in semantic protobuf equality and reflection.
+		resolved := dynamicpb.NewMessage(desc.Output())
+		h.unmarshalWire(t, h.marshalWire(t, response), resolved)
+		response = resolved
+	}
 	return response, err
 }
 

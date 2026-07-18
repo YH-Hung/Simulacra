@@ -16,6 +16,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/dynamicpb"
+	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/yinghanhung/simulacra/internal/match"
@@ -47,11 +48,17 @@ func newTemplate(env *cel.Env, types *schema.Types, desc protoreflect.MessageDes
 	if env == nil {
 		return nil, fmt.Errorf("%s: response templates require a CEL environment", source)
 	}
-	if err := validateTemplateFields(desc, fields); err != nil {
+	projection, err := projectTemplateMessage(types, desc, fields)
+	if err != nil {
 		return nil, fmt.Errorf("%s: %w", source, err)
 	}
-	if _, err := BuildMessage(types, desc, templateProjection(fields).(map[string]any)); err != nil {
+	projected, err := buildMessage(types, desc, projection, true)
+	if err != nil {
 		return nil, fmt.Errorf("%s: %w", source, err)
+	}
+	seedDynamicRequiredFields(projected.ProtoReflect(), fields)
+	if err := proto.CheckInitialized(projected); err != nil {
+		return nil, fmt.Errorf("%s: response message does not fit %s: %w", source, desc.FullName(), err)
 	}
 	root, err := compileTemplateMap(env, types, desc, fields)
 	if err != nil {
@@ -111,9 +118,13 @@ type staticNode struct{ value any }
 func (n staticNode) render(map[string]any) (any, error) { return n.value, nil }
 
 type exprNode struct {
-	program cel.Program
-	source  string
-	types   *schema.Types
+	program     cel.Program
+	source      string
+	types       *schema.Types
+	field       protoreflect.FieldDescriptor
+	messageDesc protoreflect.MessageDescriptor
+	listElement bool
+	packAny     bool
 }
 
 func (n exprNode) render(activation map[string]any) (any, error) {
@@ -121,9 +132,24 @@ func (n exprNode) render(activation map[string]any) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("site {{ %s }}: %w", n.source, err)
 	}
-	value, err := celToJSON(n.types, result)
+	var value any
+	if n.packAny {
+		value, err = celToAnyJSON(n.types, result)
+	} else {
+		value, err = celToJSON(n.types, result)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("site {{ %s }}: %w", n.source, err)
+	}
+	if n.field != nil {
+		if err := validateRenderedFieldSite(n.types, n.field, n.listElement, value); err != nil {
+			return nil, fmt.Errorf("site {{ %s }}: %w", n.source, err)
+		}
+	}
+	if n.messageDesc != nil {
+		if err := validateRenderedMessageSite(n.types, n.messageDesc, value); err != nil {
+			return nil, fmt.Errorf("site {{ %s }}: %w", n.source, err)
+		}
 	}
 	return value, nil
 }
@@ -193,10 +219,42 @@ func (n listNode) render(activation map[string]any) (any, error) {
 	return out, nil
 }
 
+// anyEnvelopeNode restores the protobuf-JSON Any envelope around a payload
+// whose fields may contain template sites. Payload WKTs use Any's canonical
+// `value` member; ordinary payload messages inline their JSON fields.
+type anyEnvelopeNode struct {
+	typeURL    string
+	payload    templateNode
+	valueField bool
+}
+
+func (n anyEnvelopeNode) render(activation map[string]any) (any, error) {
+	payload, err := n.payload.render(activation)
+	if err != nil {
+		return nil, err
+	}
+	if n.valueField {
+		return map[string]any{"@type": n.typeURL, "value": payload}, nil
+	}
+	fields, ok := payload.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("Any payload %q rendered as %T, want JSON object", n.typeURL, payload)
+	}
+	out := make(map[string]any, len(fields)+1)
+	out["@type"] = n.typeURL
+	for key, value := range fields {
+		out[key] = value
+	}
+	return out, nil
+}
+
 func compileTemplateMap(env *cel.Env, types *schema.Types, desc protoreflect.MessageDescriptor, value map[string]any) (templateNode, error) {
 	entries := make([]mapEntry, 0, len(value))
 	for _, key := range sortedKeys(value) {
-		field := fieldByJSONOrProtoName(desc, key)
+		field, err := templateField(types, desc, key)
+		if err != nil {
+			return nil, err
+		}
 		if field == nil {
 			return nil, fmt.Errorf("unknown field %q", key)
 		}
@@ -214,34 +272,201 @@ func compileTemplateNode(env *cel.Env, types *schema.Types, value any, field pro
 	case string:
 		return compileTemplateString(env, types, value, field, listElement)
 	case map[string]any:
-		if !field.IsMap() {
-			if field.Message() == nil {
-				return staticNode{value: value}, nil
+		if field.IsMap() && !listElement {
+			entries := make([]mapEntry, 0, len(value))
+			for _, key := range sortedKeys(value) {
+				node, err := compileTemplateNode(env, types, value[key], field.MapValue(), false)
+				if err != nil {
+					return nil, fmt.Errorf("field %q: %w", key, err)
+				}
+				entries = append(entries, mapEntry{key: key, node: node})
 			}
-			return compileTemplateMap(env, types, field.Message(), value)
+			return mapNode{entries: entries}, nil
 		}
-		entries := make([]mapEntry, 0, len(value))
-		for _, key := range sortedKeys(value) {
-			node, err := compileTemplateNode(env, types, value[key], field.MapValue(), false)
-			if err != nil {
-				return nil, fmt.Errorf("field %q: %w", key, err)
-			}
-			entries = append(entries, mapEntry{key: key, node: node})
+		if field.Message() != nil {
+			return compileTemplateMessageValue(env, types, field.Message(), value)
 		}
-		return mapNode{entries: entries}, nil
+		return staticNode{value: value}, nil
 	case []any:
-		entries := make([]templateNode, len(value))
-		for i, child := range value {
-			node, err := compileTemplateNode(env, types, child, field, true)
-			if err != nil {
-				return nil, fmt.Errorf("element %d: %w", i, err)
+		if field.IsList() && !listElement {
+			entries := make([]templateNode, len(value))
+			for i, child := range value {
+				node, err := compileTemplateNode(env, types, child, field, true)
+				if err != nil {
+					return nil, fmt.Errorf("element %d: %w", i, err)
+				}
+				entries[i] = node
 			}
-			entries[i] = node
+			return listNode{entries: entries}, nil
 		}
-		return listNode{entries: entries}, nil
+		if field.Message() != nil {
+			return compileTemplateMessageValue(env, types, field.Message(), value)
+		}
+		return staticNode{value: value}, nil
 	default:
 		return staticNode{value: value}, nil
 	}
+}
+
+func compileTemplateMessageValue(env *cel.Env, types *schema.Types, desc protoreflect.MessageDescriptor, value any) (templateNode, error) {
+	if text, ok := value.(string); ok {
+		return compileTemplateMessageString(env, types, desc, text)
+	}
+	switch desc.FullName() {
+	case "google.protobuf.Any":
+		envelope, ok := value.(map[string]any)
+		if !ok {
+			return staticNode{value: value}, nil
+		}
+		return compileAnyEnvelope(env, types, envelope)
+	case "google.protobuf.Struct":
+		object, ok := value.(map[string]any)
+		if !ok {
+			return staticNode{value: value}, nil
+		}
+		return compileNaturalJSONMap(env, types, object)
+	case "google.protobuf.Value":
+		return compileNaturalJSONNode(env, types, value)
+	case "google.protobuf.ListValue":
+		list, ok := value.([]any)
+		if !ok {
+			return staticNode{value: value}, nil
+		}
+		return compileNaturalJSONList(env, types, list)
+	default:
+		object, ok := value.(map[string]any)
+		if !ok {
+			return staticNode{value: value}, nil
+		}
+		return compileTemplateMap(env, types, desc, object)
+	}
+}
+
+func compileNaturalJSONNode(env *cel.Env, types *schema.Types, value any) (templateNode, error) {
+	switch value := value.(type) {
+	case string:
+		return compileTemplateString(env, types, value, nil, false)
+	case map[string]any:
+		return compileNaturalJSONMap(env, types, value)
+	case []any:
+		return compileNaturalJSONList(env, types, value)
+	default:
+		return staticNode{value: value}, nil
+	}
+}
+
+func compileNaturalJSONMap(env *cel.Env, types *schema.Types, value map[string]any) (templateNode, error) {
+	entries := make([]mapEntry, 0, len(value))
+	for _, key := range sortedKeys(value) {
+		node, err := compileNaturalJSONNode(env, types, value[key])
+		if err != nil {
+			return nil, fmt.Errorf("field %q: %w", key, err)
+		}
+		entries = append(entries, mapEntry{key: key, node: node})
+	}
+	return mapNode{entries: entries}, nil
+}
+
+func compileNaturalJSONList(env *cel.Env, types *schema.Types, value []any) (templateNode, error) {
+	entries := make([]templateNode, len(value))
+	for i, child := range value {
+		node, err := compileNaturalJSONNode(env, types, child)
+		if err != nil {
+			return nil, fmt.Errorf("element %d: %w", i, err)
+		}
+		entries[i] = node
+	}
+	return listNode{entries: entries}, nil
+}
+
+func compileAnyEnvelope(env *cel.Env, types *schema.Types, envelope map[string]any) (templateNode, error) {
+	typeURL, payloadDesc, err := resolveAnyTemplateType(types, envelope)
+	if err != nil {
+		return nil, err
+	}
+	if anyPayloadUsesValueField(payloadDesc) {
+		for _, key := range sortedKeys(envelope) {
+			if key != "@type" && key != "value" {
+				return nil, fmt.Errorf("Any payload %q uses protobuf JSON field %q, not %q", typeURL, "value", key)
+			}
+		}
+		value, ok := envelope["value"]
+		if !ok {
+			return nil, fmt.Errorf("Any payload %q requires protobuf JSON field %q", typeURL, "value")
+		}
+		payload, err := compileTemplateMessageValue(env, types, payloadDesc, value)
+		if err != nil {
+			return nil, fmt.Errorf("Any payload %q: %w", typeURL, err)
+		}
+		return anyEnvelopeNode{typeURL: typeURL, payload: payload, valueField: true}, nil
+	}
+	payloadFields := make(map[string]any, len(envelope)-1)
+	for key, value := range envelope {
+		if key != "@type" {
+			payloadFields[key] = value
+		}
+	}
+	payload, err := compileTemplateMap(env, types, payloadDesc, payloadFields)
+	if err != nil {
+		return nil, fmt.Errorf("Any payload %q: %w", typeURL, err)
+	}
+	return anyEnvelopeNode{typeURL: typeURL, payload: payload}, nil
+}
+
+func compileTemplateMessageString(env *cel.Env, types *schema.Types, desc protoreflect.MessageDescriptor, value string) (templateNode, error) {
+	trimmed := strings.TrimSpace(value)
+	matches := templateSiteRE.FindAllStringSubmatchIndex(trimmed, -1)
+	if len(matches) == 1 && matches[0][0] == 0 && matches[0][1] == len(trimmed) {
+		return compileMessageExpr(env, types, trimmed[matches[0][2]:matches[0][3]], desc)
+	}
+
+	matches = templateSiteRE.FindAllStringSubmatchIndex(value, -1)
+	if len(matches) == 0 {
+		return staticNode{value: value}, nil
+	}
+	parts := make([]interpPart, 0, len(matches)*2+1)
+	last := 0
+	for _, match := range matches {
+		if match[0] > last {
+			parts = append(parts, interpPart{literal: value[last:match[0]]})
+		}
+		expr, err := compileExpr(env, types, value[match[2]:match[3]], nil, false)
+		if err != nil {
+			return nil, err
+		}
+		parts = append(parts, interpPart{expr: expr})
+		last = match[1]
+	}
+	if last < len(value) {
+		parts = append(parts, interpPart{literal: value[last:]})
+	}
+	if !celResultFitsMessage(types, cel.StringType, desc) {
+		return nil, fmt.Errorf("interpolated template string is incompatible with protobuf message %s", desc.FullName())
+	}
+	return interpNode{parts: parts}, nil
+}
+
+func compileMessageExpr(env *cel.Env, resolver *schema.Types, source string, desc protoreflect.MessageDescriptor) (*exprNode, error) {
+	trimmed := strings.TrimSpace(source)
+	ast, issues := env.Compile(trimmed)
+	if issues.Err() != nil {
+		return nil, fmt.Errorf("template site {{ %s }}: %w", trimmed, issues.Err())
+	}
+	result := ast.OutputType()
+	switch result.Kind() {
+	case cel.ListKind, cel.MapKind:
+		return nil, fmt.Errorf("template site {{ %s }}: unsupported CEL result type %s; supported values are bool, string, numeric scalars, bytes, timestamp, duration, null, and protobuf messages (not lists or maps)", trimmed, result)
+	case cel.DynKind, cel.AnyKind, types.UnknownKind, cel.TypeParamKind, cel.NullTypeKind:
+	default:
+		if !celResultFitsMessage(resolver, result, desc) {
+			return nil, fmt.Errorf("template site {{ %s }}: CEL result type %s is incompatible with protobuf message %s", trimmed, result, desc.FullName())
+		}
+	}
+	program, err := env.Program(ast)
+	if err != nil {
+		return nil, fmt.Errorf("template site {{ %s }}: %w", trimmed, err)
+	}
+	return &exprNode{program: program, source: trimmed, types: resolver, messageDesc: desc, packAny: desc.FullName() == "google.protobuf.Any"}, nil
 }
 
 func compileTemplateString(env *cel.Env, types *schema.Types, value string, field protoreflect.FieldDescriptor, listElement bool) (templateNode, error) {
@@ -271,7 +496,7 @@ func compileTemplateString(env *cel.Env, types *schema.Types, value string, fiel
 	if last < len(value) {
 		parts = append(parts, interpPart{literal: value[last:]})
 	}
-	if err := validateCELResultType(cel.StringType, field, listElement); err != nil {
+	if err := validateCELResultType(types, cel.StringType, field, listElement); err != nil {
 		return nil, fmt.Errorf("interpolated template string: %w", err)
 	}
 	return interpNode{parts: parts}, nil
@@ -283,17 +508,17 @@ func compileExpr(env *cel.Env, types *schema.Types, source string, field protore
 	if issues.Err() != nil {
 		return nil, fmt.Errorf("template site {{ %s }}: %w", trimmed, issues.Err())
 	}
-	if err := validateCELResultType(ast.OutputType(), field, listElement); err != nil {
+	if err := validateCELResultType(types, ast.OutputType(), field, listElement); err != nil {
 		return nil, fmt.Errorf("template site {{ %s }}: %w", trimmed, err)
 	}
 	program, err := env.Program(ast)
 	if err != nil {
 		return nil, fmt.Errorf("template site {{ %s }}: %w", trimmed, err)
 	}
-	return &exprNode{program: program, source: trimmed, types: types}, nil
+	return &exprNode{program: program, source: trimmed, types: types, field: field, listElement: listElement, packAny: isAnyDestination(field)}, nil
 }
 
-func validateCELResultType(result *cel.Type, field protoreflect.FieldDescriptor, listElement bool) error {
+func validateCELResultType(resolver *schema.Types, result *cel.Type, field protoreflect.FieldDescriptor, listElement bool) error {
 	switch result.Kind() {
 	case cel.ListKind, cel.MapKind:
 		return fmt.Errorf("unsupported CEL result type %s; supported values are bool, string, numeric scalars, bytes, timestamp, duration, null, and protobuf messages (not lists or maps)", result)
@@ -302,13 +527,13 @@ func validateCELResultType(result *cel.Type, field protoreflect.FieldDescriptor,
 	case cel.NullTypeKind:
 		return nil
 	}
-	if field == nil || celResultFitsField(result, field, listElement) {
+	if field == nil || celResultFitsField(resolver, result, field, listElement) {
 		return nil
 	}
 	return fmt.Errorf("CEL result type %s is incompatible with protobuf field %s (%s)", result, field.FullName(), protobufFieldType(field))
 }
 
-func celResultFitsField(result *cel.Type, field protoreflect.FieldDescriptor, listElement bool) bool {
+func celResultFitsField(resolver *schema.Types, result *cel.Type, field protoreflect.FieldDescriptor, listElement bool) bool {
 	if !listElement && (field.IsList() || field.IsMap()) {
 		return false
 	}
@@ -326,27 +551,38 @@ func celResultFitsField(result *cel.Type, field protoreflect.FieldDescriptor, li
 	case protoreflect.EnumKind:
 		return result.Kind() == cel.IntKind || result.Kind() == cel.UintKind || result.Kind() == cel.DoubleKind || result.Kind() == cel.StringKind
 	case protoreflect.MessageKind, protoreflect.GroupKind:
-		fullName := field.Message().FullName()
-		if kind, ok := protobufWrapperKind(fullName); ok {
-			return celResultFitsScalarKind(result, kind)
-		}
-		switch fullName {
-		case "google.protobuf.Timestamp":
-			return result.Kind() == cel.TimestampKind || result.Kind() == cel.StringKind
-		case "google.protobuf.Duration":
-			return result.Kind() == cel.DurationKind || result.Kind() == cel.StringKind
-		case "google.protobuf.Any":
-			return result.Kind() == cel.AnyKind || result.TypeName() == string(fullName)
-		case "google.protobuf.Value":
-			return celResultFitsValue(result)
-		case "google.protobuf.FieldMask":
-			return result.Kind() == cel.StringKind || result.Kind() == cel.BytesKind ||
-				(result.Kind() == cel.StructKind && result.TypeName() == string(fullName))
-		default:
-			return result.Kind() == cel.StructKind && result.TypeName() == string(fullName)
-		}
+		return celResultFitsMessage(resolver, result, field.Message())
 	default:
 		return false
+	}
+}
+
+func celResultFitsMessage(resolver *schema.Types, result *cel.Type, desc protoreflect.MessageDescriptor) bool {
+	fullName := desc.FullName()
+	if kind, ok := protobufWrapperKind(fullName); ok {
+		return celResultFitsScalarKind(result, kind)
+	}
+	switch fullName {
+	case "google.protobuf.Timestamp":
+		return result.Kind() == cel.TimestampKind || result.Kind() == cel.StringKind
+	case "google.protobuf.Duration":
+		return result.Kind() == cel.DurationKind || result.Kind() == cel.StringKind
+	case "google.protobuf.Any":
+		if result.Kind() == cel.AnyKind || result.TypeName() == string(fullName) {
+			return true
+		}
+		if result.Kind() != cel.StructKind || result.TypeName() == "" || resolver == nil {
+			return false
+		}
+		_, err := resolver.FindMessageByName(protoreflect.FullName(result.TypeName()))
+		return err == nil
+	case "google.protobuf.Value":
+		return celResultFitsValue(result)
+	case "google.protobuf.FieldMask":
+		return result.Kind() == cel.StringKind || result.Kind() == cel.BytesKind ||
+			(result.Kind() == cel.StructKind && result.TypeName() == string(fullName))
+	default:
+		return result.Kind() == cel.StructKind && result.TypeName() == string(fullName)
 	}
 }
 
@@ -421,6 +657,48 @@ func protobufFieldType(field protoreflect.FieldDescriptor) string {
 	return field.Kind().String()
 }
 
+func isAnyDestination(field protoreflect.FieldDescriptor) bool {
+	return field != nil && field.Message() != nil && field.Message().FullName() == "google.protobuf.Any"
+}
+
+func validateRenderedFieldSite(types *schema.Types, field protoreflect.FieldDescriptor, listElement bool, value any) error {
+	rendered := value
+	if field.IsList() && listElement {
+		rendered = []any{value}
+	}
+	name := field.JSONName()
+	if field.IsExtension() {
+		name = "[" + string(field.FullName()) + "]"
+	}
+	data, err := json.Marshal(map[string]any{name: rendered})
+	if err != nil {
+		return fmt.Errorf("encoding rendered value for protobuf field %s: %w", field.FullName(), err)
+	}
+	message := dynamicpb.NewMessage(field.ContainingMessage())
+	if err := (protojson.UnmarshalOptions{Resolver: types, AllowPartial: true}).Unmarshal(data, message); err != nil {
+		return fmt.Errorf("rendered value does not fit protobuf field %s: %w", field.FullName(), err)
+	}
+	if field.Cardinality() == protoreflect.Required && !message.Has(field) {
+		return fmt.Errorf("rendered value leaves required protobuf field %s unset", field.FullName())
+	}
+	return nil
+}
+
+func validateRenderedMessageSite(types *schema.Types, desc protoreflect.MessageDescriptor, value any) error {
+	if value == nil {
+		return nil
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("encoding rendered value for protobuf message %s: %w", desc.FullName(), err)
+	}
+	message := dynamicpb.NewMessage(desc)
+	if err := (protojson.UnmarshalOptions{Resolver: types}).Unmarshal(data, message); err != nil {
+		return fmt.Errorf("rendered value does not fit protobuf message %s: %w", desc.FullName(), err)
+	}
+	return nil
+}
+
 // celToJSON converts CEL's native scalar and protobuf values into values the
 // standard JSON encoder can pass to protojson. Composite CEL list/map values
 // are intentionally rejected: response structure belongs in YAML.
@@ -456,6 +734,47 @@ func celToJSON(resolver *schema.Types, value any) (any, error) {
 	}
 }
 
+// celToAnyJSON preserves Any's envelope when CEL exposes the registered
+// payload message directly. The adapter deliberately unwraps Any for field
+// access, so rendering into an Any destination must explicitly repack it.
+func celToAnyJSON(resolver *schema.Types, value any) (any, error) {
+	if celValue, ok := value.(ref.Val); ok {
+		if types.IsError(celValue) {
+			return nil, fmt.Errorf("CEL evaluation failed: %v", celValue)
+		}
+		if celValue == types.NullValue {
+			return nil, nil
+		}
+		value = celValue.Value()
+	}
+	if reflected, ok := value.(protoreflect.Message); ok {
+		value = reflected.Interface()
+	}
+	message, ok := value.(proto.Message)
+	if !ok {
+		return nil, fmt.Errorf("Any destination requires a registered protobuf message, got %T", value)
+	}
+	fullName := message.ProtoReflect().Descriptor().FullName()
+	if fullName != "google.protobuf.Any" {
+		if resolver == nil {
+			return nil, fmt.Errorf("Any destination cannot resolve protobuf message %s without a type registry", fullName)
+		}
+		if _, err := resolver.FindMessageByName(fullName); err != nil {
+			return nil, fmt.Errorf("Any destination protobuf message %s is not registered: %w", fullName, err)
+		}
+		packed, err := anypb.New(message)
+		if err != nil {
+			return nil, fmt.Errorf("packing protobuf message %s into Any: %w", fullName, err)
+		}
+		message = packed
+	}
+	data, err := (protojson.MarshalOptions{Resolver: resolver}).Marshal(message)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling Any protobuf JSON: %w", err)
+	}
+	return json.RawMessage(data), nil
+}
+
 func durationJSON(value time.Duration) (string, error) {
 	data, err := protojson.Marshal(durationpb.New(value))
 	if err != nil {
@@ -468,10 +787,117 @@ func durationJSON(value time.Duration) (string, error) {
 	return out, nil
 }
 
-// templateProjection preserves static values for load-time schema validation
-// while replacing dynamic sites with JSON null, which protojson accepts for a
-// singular field of any protobuf type.
-func templateProjection(value any) any {
+// projectTemplateMessage preserves static values for load-time protojson
+// validation while replacing dynamic sites with JSON null. Unlike a generic
+// tree walk, it follows the destination descriptor so protobuf JSON's natural
+// WKT forms, Any envelopes, and extension names are interpreted correctly.
+func projectTemplateMessage(types *schema.Types, desc protoreflect.MessageDescriptor, fields map[string]any) (map[string]any, error) {
+	switch desc.FullName() {
+	case "google.protobuf.Struct", "google.protobuf.Value":
+		projected, _ := projectNaturalJSON(fields).(map[string]any)
+		return projected, nil
+	case "google.protobuf.Any":
+		return projectAnyEnvelope(types, fields)
+	default:
+		return projectMessageMap(types, desc, fields)
+	}
+}
+
+func projectMessageMap(types *schema.Types, desc protoreflect.MessageDescriptor, fields map[string]any) (map[string]any, error) {
+	out := make(map[string]any, len(fields))
+	for _, name := range sortedKeys(fields) {
+		field, err := templateField(types, desc, name)
+		if err != nil {
+			return nil, fmt.Errorf("response message does not fit %s: %w", desc.FullName(), err)
+		}
+		if field == nil {
+			return nil, fmt.Errorf("response message does not fit %s: unknown field %q", desc.FullName(), name)
+		}
+		projected, err := projectFieldValue(types, field, fields[name], false)
+		if err != nil {
+			return nil, fmt.Errorf("response message does not fit %s field %q: %w", desc.FullName(), name, err)
+		}
+		out[name] = projected
+	}
+	return out, nil
+}
+
+func projectFieldValue(types *schema.Types, field protoreflect.FieldDescriptor, value any, listElement bool) (any, error) {
+	if text, ok := value.(string); ok {
+		if hasSites(text) {
+			return nil, nil
+		}
+		return text, nil
+	}
+	switch value := value.(type) {
+	case map[string]any:
+		if field.IsMap() && !listElement {
+			out := make(map[string]any, len(value))
+			for _, key := range sortedKeys(value) {
+				projected, err := projectFieldValue(types, field.MapValue(), value[key], false)
+				if err != nil {
+					return nil, fmt.Errorf("map key %q: %w", key, err)
+				}
+				out[key] = projected
+			}
+			return out, nil
+		}
+		if field.Message() != nil {
+			return projectMessageValue(types, field.Message(), value)
+		}
+		return value, nil
+	case []any:
+		if field.IsList() && !listElement {
+			out := make([]any, 0, len(value))
+			for _, child := range value {
+				if text, ok := child.(string); ok && hasSites(text) {
+					continue
+				}
+				projected, err := projectFieldValue(types, field, child, true)
+				if err != nil {
+					return nil, err
+				}
+				out = append(out, projected)
+			}
+			return out, nil
+		}
+		if field.Message() != nil {
+			return projectMessageValue(types, field.Message(), value)
+		}
+		return value, nil
+	default:
+		return value, nil
+	}
+}
+
+func projectMessageValue(types *schema.Types, desc protoreflect.MessageDescriptor, value any) (any, error) {
+	if text, ok := value.(string); ok {
+		if hasSites(text) {
+			return nil, nil
+		}
+		return text, nil
+	}
+	switch desc.FullName() {
+	case "google.protobuf.Any":
+		envelope, ok := value.(map[string]any)
+		if !ok {
+			return value, nil
+		}
+		return projectAnyEnvelope(types, envelope)
+	case "google.protobuf.Struct", "google.protobuf.Value":
+		return projectNaturalJSON(value), nil
+	case "google.protobuf.ListValue":
+		return projectNaturalJSON(value), nil
+	default:
+		object, ok := value.(map[string]any)
+		if !ok {
+			return value, nil
+		}
+		return projectMessageMap(types, desc, object)
+	}
+}
+
+func projectNaturalJSON(value any) any {
 	switch value := value.(type) {
 	case string:
 		if hasSites(value) {
@@ -481,16 +907,13 @@ func templateProjection(value any) any {
 	case map[string]any:
 		out := make(map[string]any, len(value))
 		for _, key := range sortedKeys(value) {
-			out[key] = templateProjection(value[key])
+			out[key] = projectNaturalJSON(value[key])
 		}
 		return out
 	case []any:
-		out := make([]any, 0, len(value))
-		for _, child := range value {
-			if text, ok := child.(string); ok && hasSites(text) {
-				continue
-			}
-			out = append(out, templateProjection(child))
+		out := make([]any, len(value))
+		for i, child := range value {
+			out[i] = projectNaturalJSON(child)
 		}
 		return out
 	default:
@@ -498,51 +921,151 @@ func templateProjection(value any) any {
 	}
 }
 
-func validateTemplateFields(desc protoreflect.MessageDescriptor, fields map[string]any) error {
-	for _, name := range sortedKeys(fields) {
-		value := fields[name]
-		field := fieldByJSONOrProtoName(desc, name)
-		if field == nil {
-			return fmt.Errorf("response message does not fit %s: unknown field %q", desc.FullName(), name)
+func projectAnyEnvelope(types *schema.Types, envelope map[string]any) (map[string]any, error) {
+	typeURL, payloadDesc, err := resolveAnyTemplateType(types, envelope)
+	if err != nil {
+		return nil, err
+	}
+	if anyPayloadUsesValueField(payloadDesc) {
+		for _, key := range sortedKeys(envelope) {
+			if key != "@type" && key != "value" {
+				return nil, fmt.Errorf("Any payload %q uses protobuf JSON field %q, not %q", typeURL, "value", key)
+			}
 		}
-		if field.IsMap() {
-			if childDesc := field.MapValue().Message(); childDesc != nil {
-				if entries, ok := value.(map[string]any); ok {
-					for _, key := range sortedKeys(entries) {
-						entry := entries[key]
-						if child, ok := entry.(map[string]any); ok {
-							if err := validateTemplateFields(childDesc, child); err != nil {
-								return err
-							}
-						}
-					}
+		value, ok := envelope["value"]
+		if !ok {
+			return nil, fmt.Errorf("Any payload %q requires protobuf JSON field %q", typeURL, "value")
+		}
+		projected, err := projectMessageValue(types, payloadDesc, value)
+		if err != nil {
+			return nil, fmt.Errorf("Any payload %q: %w", typeURL, err)
+		}
+		return map[string]any{"@type": typeURL, "value": projected}, nil
+	}
+	payloadFields := make(map[string]any, len(envelope)-1)
+	for key, value := range envelope {
+		if key != "@type" {
+			payloadFields[key] = value
+		}
+	}
+	projected, err := projectMessageMap(types, payloadDesc, payloadFields)
+	if err != nil {
+		return nil, fmt.Errorf("Any payload %q: %w", typeURL, err)
+	}
+	projected["@type"] = typeURL
+	return projected, nil
+}
+
+func resolveAnyTemplateType(types *schema.Types, envelope map[string]any) (string, protoreflect.MessageDescriptor, error) {
+	raw, ok := envelope["@type"]
+	if !ok {
+		return "", nil, fmt.Errorf("Any protobuf JSON object requires a static %q field", "@type")
+	}
+	typeURL, ok := raw.(string)
+	if !ok || typeURL == "" || hasSites(typeURL) {
+		return "", nil, fmt.Errorf("Any protobuf JSON field %q must be a non-empty static string", "@type")
+	}
+	messageType, err := types.FindMessageByURL(typeURL)
+	if err != nil {
+		return "", nil, fmt.Errorf("Any type %q is not registered: %w", typeURL, err)
+	}
+	return typeURL, messageType.Descriptor(), nil
+}
+
+func anyPayloadUsesValueField(desc protoreflect.MessageDescriptor) bool {
+	if _, ok := protobufWrapperKind(desc.FullName()); ok {
+		return true
+	}
+	switch desc.FullName() {
+	case "google.protobuf.Any", "google.protobuf.Duration", "google.protobuf.FieldMask",
+		"google.protobuf.ListValue", "google.protobuf.Struct", "google.protobuf.Timestamp",
+		"google.protobuf.Value":
+		return true
+	default:
+		return false
+	}
+}
+
+// seedDynamicRequiredFields makes only the load-time projection initialized.
+// A compatible dynamic site is known to provide the required field at render
+// time, but JSON null deliberately leaves it absent in the projected message.
+// The real rendered message is still unmarshaled without AllowPartial.
+func seedDynamicRequiredFields(message protoreflect.Message, source map[string]any) {
+	desc := message.Descriptor()
+	fields := desc.Fields()
+	for i := 0; i < fields.Len(); i++ {
+		field := fields.Get(i)
+		raw, present := sourceTemplateField(source, field)
+		if field.Cardinality() == protoreflect.Required && !message.Has(field) && present && hasSites(raw) {
+			seedRequiredField(message, field)
+			continue
+		}
+		if !present || field.Message() == nil || !message.Has(field) {
+			continue
+		}
+		switch {
+		case field.IsMap() && field.MapValue().Message() != nil:
+			entries, ok := raw.(map[string]any)
+			if !ok || field.MapKey().Kind() != protoreflect.StringKind {
+				continue
+			}
+			values := message.Get(field).Map()
+			for key, entry := range entries {
+				child, ok := entry.(map[string]any)
+				mapKey := protoreflect.ValueOfString(key).MapKey()
+				if ok && values.Has(mapKey) {
+					seedDynamicRequiredFields(values.Get(mapKey).Message(), child)
 				}
 			}
-			continue
-		}
-		childDesc := field.Message()
-		if childDesc == nil {
-			continue
-		}
-		if field.IsList() {
-			if entries, ok := value.([]any); ok {
-				for _, entry := range entries {
-					if child, ok := entry.(map[string]any); ok {
-						if err := validateTemplateFields(childDesc, child); err != nil {
-							return err
-						}
-					}
-				}
+		case field.IsList():
+			entries, ok := raw.([]any)
+			if !ok {
+				continue
 			}
-			continue
-		}
-		if child, ok := value.(map[string]any); ok {
-			if err := validateTemplateFields(childDesc, child); err != nil {
-				return err
+			values := message.Get(field).List()
+			projectedIndex := 0
+			for _, entry := range entries {
+				if text, ok := entry.(string); ok && hasSites(text) {
+					continue
+				}
+				if child, ok := entry.(map[string]any); ok && projectedIndex < values.Len() {
+					seedDynamicRequiredFields(values.Get(projectedIndex).Message(), child)
+				}
+				projectedIndex++
+			}
+		default:
+			if child, ok := raw.(map[string]any); ok {
+				seedDynamicRequiredFields(message.Get(field).Message(), child)
 			}
 		}
 	}
-	return nil
+}
+
+func sourceTemplateField(source map[string]any, field protoreflect.FieldDescriptor) (any, bool) {
+	if value, ok := source[string(field.Name())]; ok {
+		return value, true
+	}
+	value, ok := source[field.JSONName()]
+	return value, ok
+}
+
+func seedRequiredField(message protoreflect.Message, field protoreflect.FieldDescriptor) {
+	if field.Message() == nil {
+		message.Set(field, field.Default())
+		return
+	}
+	child := message.Mutable(field).Message()
+	seedAllRequiredFields(child)
+}
+
+func seedAllRequiredFields(message protoreflect.Message) {
+	fields := message.Descriptor().Fields()
+	for i := 0; i < fields.Len(); i++ {
+		field := fields.Get(i)
+		if field.Cardinality() == protoreflect.Required && !message.Has(field) {
+			seedRequiredField(message, field)
+		}
+	}
 }
 
 func sortedKeys[V any](values map[string]V) []string {
@@ -554,15 +1077,30 @@ func sortedKeys[V any](values map[string]V) []string {
 	return keys
 }
 
-func fieldByJSONOrProtoName(desc protoreflect.MessageDescriptor, name string) protoreflect.FieldDescriptor {
+func templateField(types *schema.Types, desc protoreflect.MessageDescriptor, name string) (protoreflect.FieldDescriptor, error) {
+	if strings.HasPrefix(name, "[") || strings.HasSuffix(name, "]") {
+		if len(name) < 3 || name[0] != '[' || name[len(name)-1] != ']' {
+			return nil, fmt.Errorf("malformed extension JSON name %q", name)
+		}
+		extensionName := protoreflect.FullName(name[1 : len(name)-1])
+		extensionType, err := types.FindExtensionByName(extensionName)
+		if err != nil {
+			return nil, fmt.Errorf("unknown extension JSON name %q: %w", name, err)
+		}
+		extension := extensionType.TypeDescriptor()
+		if extension.ContainingMessage().FullName() != desc.FullName() {
+			return nil, fmt.Errorf("extension %q extends %s, not %s", extensionName, extension.ContainingMessage().FullName(), desc.FullName())
+		}
+		return extension, nil
+	}
 	if field := desc.Fields().ByName(protoreflect.Name(name)); field != nil {
-		return field
+		return field, nil
 	}
 	fields := desc.Fields()
 	for i := 0; i < fields.Len(); i++ {
 		if fields.Get(i).JSONName() == name {
-			return fields.Get(i)
+			return fields.Get(i), nil
 		}
 	}
-	return nil
+	return nil, nil
 }

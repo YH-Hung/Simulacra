@@ -1,7 +1,10 @@
 package conformance_test
 
 import (
+	"bytes"
 	"context"
+	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -14,6 +17,33 @@ import (
 )
 
 const corpusMethod = "/conformance.v1.CorpusService/Echo"
+
+func TestCorpusSection7FeatureIDInventory(t *testing.T) {
+	var sources strings.Builder
+	for _, name := range []string{"corpus_test.go", "corpus2_test.go"} {
+		data, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("ReadFile(%s): %v", name, err)
+		}
+		sources.Write(data)
+	}
+	featurePattern := regexp.MustCompile(`(?:feature:\s*|t\.Run\()"([^"]+)"`)
+	declared := make(map[string]bool)
+	for _, match := range featurePattern.FindAllStringSubmatch(sources.String(), -1) {
+		declared[match[1]] = true
+	}
+	for _, required := range []string{
+		"wkt.value",
+		"presence.message_vs_scalar",
+		"proto2.groups",
+		"structural.large_message",
+		"any.registered.templated",
+	} {
+		if !declared[required] {
+			t.Errorf("PROPOSAL §7 feature ID %q has no explicit corpus case", required)
+		}
+	}
+}
 
 type corpusCase struct {
 	feature string
@@ -206,6 +236,20 @@ func TestCorpusHardCasesI(t *testing.T) {
 			expect: `{"attrs":{"ok":true,"tier":"pro"}}`,
 		},
 		{
+			feature: "wkt.value",
+			stub: `
+- method: conformance.v1.CorpusService/Echo
+  respond:
+    message:
+      val:
+        supported: true
+        nested: [natural, 7]
+`,
+			req:    `{"val":{"input":"natural"}}`,
+			want:   []string{`"supported":true`, `"natural"`},
+			expect: `{"val":{"supported":true,"nested":["natural",7]}}`,
+		},
+		{
 			feature: "wkt.fieldmask",
 			stub: `
 - method: conformance.v1.CorpusService/Echo
@@ -274,6 +318,71 @@ func TestCorpusHardCasesI(t *testing.T) {
 			runCorpus(t, tc)
 		})
 	}
+}
+
+func TestCorpusMessageVsScalarPresence(t *testing.T) {
+	t.Run("presence.message_vs_scalar", func(t *testing.T) {
+		h := start(t, `
+- method: conformance.v1.CorpusService/Echo
+  match:
+    message:
+      child: { present: true }
+      count: { present: false }
+  respond:
+    message: { text: message-present-scalar-default }
+`)
+		desc := h.method(t, corpusMethod, match.Unary)
+		child := desc.Input().Fields().ByName("child")
+		count := desc.Input().Fields().ByName("count")
+		if child == nil || child.Message() == nil || !child.HasPresence() {
+			t.Fatalf("child descriptor = %v, want presence-bearing message field", child)
+		}
+		if count == nil || count.Kind() != protoreflect.Int32Kind || count.HasPresence() {
+			t.Fatalf("count descriptor = %v, want implicit-presence int32 field", count)
+		}
+		request := h.jsonMessage(t, desc.Input(), `{"child":{},"count":0}`)
+		if !request.Has(child) || request.Has(count) {
+			t.Fatalf("request presence child/count = %v/%v, want true/false", request.Has(child), request.Has(count))
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+		defer cancel()
+		response, err := h.invoke(t, ctx, corpusMethod, request)
+		if err != nil {
+			t.Fatalf("Echo: %v", err)
+		}
+		assertCorpusResponse(t, h, desc.Output(), response, `{"text":"message-present-scalar-default"}`)
+	})
+}
+
+func TestCorpusLargeMessage(t *testing.T) {
+	t.Run("structural.large_message", func(t *testing.T) {
+		const size = 1 << 20
+		h := start(t, `
+- method: conformance.v1.CorpusService/Echo
+  match:
+    expr: size(message.blob) == 1048576
+  respond:
+    message:
+      blob: "{{ message.blob }}"
+`)
+		desc := h.method(t, corpusMethod, match.Unary)
+		blob := desc.Input().Fields().ByName("blob")
+		if blob == nil || blob.Kind() != protoreflect.BytesKind {
+			t.Fatalf("blob descriptor = %v, want bytes", blob)
+		}
+		payload := bytes.Repeat([]byte{0x00, 0x7f, 0xff, 0x42}, size/4)
+		request := dynamicpb.NewMessage(desc.Input())
+		request.Set(blob, protoreflect.ValueOfBytes(payload))
+		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+		defer cancel()
+		response, err := h.invoke(t, ctx, corpusMethod, request)
+		if err != nil {
+			t.Fatalf("Echo 1MiB message: %v", err)
+		}
+		if got := response.Get(desc.Output().Fields().ByName("blob")).Bytes(); !bytes.Equal(got, payload) {
+			t.Fatalf("response blob length/content = %d/%v, want %d/exact", len(got), bytes.Equal(got, payload), len(payload))
+		}
+	})
 }
 
 func TestCorpusOneofPresenceRejectsUnsetAlternatives(t *testing.T) {

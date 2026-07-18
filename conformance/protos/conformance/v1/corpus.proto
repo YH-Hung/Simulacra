@@ -40,6 +40,9 @@ message Everything {
   repeated int32 packed = 15;
   Node tree = 16;
   string text = 17;
+  google.protobuf.ListValue list_value = 18;
+  Inner child = 19;
+  int32 count = 20;
 }
 
 message WideEverything {

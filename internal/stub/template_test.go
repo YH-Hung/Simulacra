@@ -81,6 +81,15 @@ func msgFor(t *testing.T, desc protoreflect.MessageDescriptor, body string) *dyn
 	return msg
 }
 
+func msgForResolver(t *testing.T, desc protoreflect.MessageDescriptor, body string, resolver *schema.Types) *dynamicpb.Message {
+	t.Helper()
+	msg := dynamicpb.NewMessage(desc)
+	if err := (protojson.UnmarshalOptions{Resolver: resolver}).Unmarshal([]byte(body), msg); err != nil {
+		t.Fatalf("protojson.Unmarshal: %v", err)
+	}
+	return msg
+}
+
 func messageJSON(t *testing.T, msg *dynamicpb.Message, resolver *schema.Types) map[string]any {
 	t.Helper()
 	data, err := (protojson.MarshalOptions{Resolver: resolver}).Marshal(msg)
@@ -310,6 +319,227 @@ func TestTemplateAcceptsScalarEncodedWellKnownTypes(t *testing.T) {
 	}
 }
 
+func TestTemplateRendersNaturalProtobufJSONSpecialForms(t *testing.T) {
+	reg, method, env := conformanceTemplateParts(t)
+	tmpl, err := newTemplate(env, reg.Types(), method.Output(), map[string]any{
+		"when":    "{{ message.when }}",
+		"span":    "{{ message.span }}",
+		"wrapped": "{{ message.text }}",
+		"attrs": map[string]any{
+			"label":  "{{ message.text }}",
+			"nested": map[string]any{"enabled": "{{ true }}"},
+			"items":  []any{"static", "{{ message.text }}"},
+		},
+		"val":        map[string]any{"label": "{{ message.text }}"},
+		"mask":       "{{ message.mask }}",
+		"list_value": []any{"{{ message.text }}", map[string]any{"enabled": "{{ true }}"}},
+	}, "corpus.yaml#special")
+	if err != nil {
+		t.Fatalf("newTemplate: %v", err)
+	}
+	request := msgFor(t, method.Input(), `{
+		"when":"2026-07-18T01:02:03Z",
+		"span":"1.500s",
+		"mask":"text,optNote",
+		"text":"dynamic"
+	}`)
+	got, err := tmpl.Render(match.Input{Message: request.ProtoReflect()})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	jsonMsg := messageJSON(t, got, reg.Types())
+	if jsonMsg["when"] != "2026-07-18T01:02:03Z" || jsonMsg["span"] != "1.500s" || jsonMsg["wrapped"] != "dynamic" || jsonMsg["mask"] != "text,optNote" {
+		t.Fatalf("scalar protobuf JSON forms = %#v", jsonMsg)
+	}
+	attrs, ok := jsonMsg["attrs"].(map[string]any)
+	if !ok || attrs["label"] != "dynamic" {
+		t.Fatalf("attrs = %#v, want dynamic natural Struct", jsonMsg["attrs"])
+	}
+	val, ok := jsonMsg["val"].(map[string]any)
+	if !ok || val["label"] != "dynamic" {
+		t.Fatalf("val = %#v, want dynamic natural Value object", jsonMsg["val"])
+	}
+	list, ok := jsonMsg["listValue"].([]any)
+	if !ok || len(list) != 2 || list[0] != "dynamic" {
+		t.Fatalf("listValue = %#v, want dynamic natural ListValue", jsonMsg["listValue"])
+	}
+}
+
+func TestTemplateRendersRegisteredAnyForms(t *testing.T) {
+	reg, method, env := conformanceTemplateParts(t)
+	request := msgForResolver(t, method.Input(), `{
+		"text":"rendered",
+		"payload":{"@type":"type.googleapis.com/conformance.v1.Inner","id":"from-any"},
+		"tree":{"label":"from-message"}
+	}`, reg.Types())
+
+	tests := []struct {
+		name   string
+		value  any
+		wantID string
+		wantTy string
+	}{
+		{
+			name: "natural envelope with templated payload",
+			value: map[string]any{
+				"@type": "type.googleapis.com/conformance.v1.Inner",
+				"id":    "{{ message.text }}",
+			},
+			wantID: "rendered",
+			wantTy: "type.googleapis.com/conformance.v1.Inner",
+		},
+		{
+			name:   "direct registered Any whole site",
+			value:  "{{ message.payload }}",
+			wantID: "from-any",
+			wantTy: "type.googleapis.com/conformance.v1.Inner",
+		},
+		{
+			name:   "registered payload whole site",
+			value:  "{{ message.tree }}",
+			wantID: "from-message",
+			wantTy: "type.googleapis.com/conformance.v1.Node",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpl, err := newTemplate(env, reg.Types(), method.Output(), map[string]any{"payload": tt.value}, "corpus.yaml#any")
+			if err != nil {
+				t.Fatalf("newTemplate: %v", err)
+			}
+			got, err := tmpl.Render(match.Input{Message: request.ProtoReflect()})
+			if err != nil {
+				t.Fatalf("Render: %v", err)
+			}
+			payload, ok := messageJSON(t, got, reg.Types())["payload"].(map[string]any)
+			if !ok || payload["@type"] != tt.wantTy {
+				t.Fatalf("payload = %#v, want type %q", payload, tt.wantTy)
+			}
+			valueField := "id"
+			if tt.wantTy == "type.googleapis.com/conformance.v1.Node" {
+				valueField = "label"
+			}
+			if gotValue := payload[valueField]; gotValue != tt.wantID {
+				t.Fatalf("payload %s = %#v, want %q", valueField, gotValue, tt.wantID)
+			}
+		})
+	}
+}
+
+func TestTemplateRendersProto2ExtensionJSONName(t *testing.T) {
+	reg := schema.NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), "../../conformance/protos"); err != nil {
+		t.Fatalf("AddProtoDir: %v", err)
+	}
+	method, err := reg.LookupMethod("conformance.v1.LegacyService/Fetch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := match.NewCompiler(reg.Files()).Env(method.Input(), match.Unary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl, err := newTemplate(env, reg.Types(), method.Output(), map[string]any{
+		"note":                     "static",
+		"[conformance.v1.ext_tag]": "{{ message.name }}",
+	}, "legacy.yaml#extension")
+	if err != nil {
+		t.Fatalf("newTemplate: %v", err)
+	}
+	request := msgFor(t, method.Input(), `{"name":"templated-extension"}`)
+	got, err := tmpl.Render(match.Input{Message: request.ProtoReflect()})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if value := messageJSON(t, got, reg.Types())["[conformance.v1.ext_tag]"]; value != "templated-extension" {
+		t.Fatalf("extension = %#v, want templated-extension", value)
+	}
+}
+
+func TestTemplateNaturalAnyRequiresRegisteredStaticType(t *testing.T) {
+	reg, method, env := conformanceTemplateParts(t)
+	_, err := newTemplate(env, reg.Types(), method.Output(), map[string]any{
+		"payload": map[string]any{
+			"@type": "type.googleapis.com/acme.Unknown",
+			"value": "{{ message.text }}",
+		},
+	}, "corpus.yaml#unknown-any")
+	if err == nil || !strings.Contains(err.Error(), "acme.Unknown") || !strings.Contains(err.Error(), "registered") {
+		t.Fatalf("newTemplate error = %v, want clear unregistered Any type error", err)
+	}
+}
+
+func TestTemplateDynamicProto2RequiredFieldLoadsAndRenders(t *testing.T) {
+	reg := schema.NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), "../../conformance/protos"); err != nil {
+		t.Fatalf("AddProtoDir: %v", err)
+	}
+	method, err := reg.LookupMethod("conformance.v1.LegacyService/Make")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := match.NewCompiler(reg.Files()).Env(method.Input(), match.Unary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl, err := newTemplate(env, reg.Types(), method.Output(), map[string]any{
+		"name": "{{ message.note }}",
+	}, "legacy.yaml#required")
+	if err != nil {
+		t.Fatalf("newTemplate: %v", err)
+	}
+	request := msgFor(t, method.Input(), `{"note":"dynamic-required"}`)
+	got, err := tmpl.Render(match.Input{Message: request.ProtoReflect()})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if name := messageJSON(t, got, reg.Types())["name"]; name != "dynamic-required" {
+		t.Fatalf("name = %#v, want dynamic-required", name)
+	}
+}
+
+func TestTemplateStaticMissingProto2RequiredFieldStillFailsAtLoad(t *testing.T) {
+	reg := schema.NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), "../../conformance/protos"); err != nil {
+		t.Fatalf("AddProtoDir: %v", err)
+	}
+	method, err := reg.LookupMethod("conformance.v1.LegacyService/Make")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = newTemplate(nil, reg.Types(), method.Output(), map[string]any{"level": 8}, "legacy.yaml#missing")
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "required") || !strings.Contains(err.Error(), "name") {
+		t.Fatalf("newTemplate error = %v, want missing required name", err)
+	}
+}
+
+func TestTemplateDynamicProto2RequiredFieldStillValidatedAtRender(t *testing.T) {
+	reg := schema.NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), "../../conformance/protos"); err != nil {
+		t.Fatalf("AddProtoDir: %v", err)
+	}
+	method, err := reg.LookupMethod("conformance.v1.LegacyService/Make")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := match.NewCompiler(reg.Files()).Env(method.Input(), match.Unary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl, err := newTemplate(env, reg.Types(), method.Output(), map[string]any{
+		"name": "{{ message.note == 'omit' ? dyn(null) : dyn(message.note) }}",
+	}, "legacy.yaml#required-runtime")
+	if err != nil {
+		t.Fatalf("newTemplate: %v", err)
+	}
+	request := msgFor(t, method.Input(), `{"note":"omit"}`)
+	_, err = tmpl.Render(match.Input{Message: request.ProtoReflect()})
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "required") || !strings.Contains(err.Error(), "name") {
+		t.Fatalf("Render error = %v, want final missing required name validation", err)
+	}
+}
+
 func TestTemplateRejectsUnknownResponseFieldAtCompileTime(t *testing.T) {
 	reg, method, env := templateParts(t)
 	_, err := newTemplate(env, reg.Types(), method.Output(), map[string]any{
@@ -395,7 +625,7 @@ func TestTemplateRenderedEnumStringMustFitSchema(t *testing.T) {
 	if err == nil {
 		t.Fatal("Render succeeded with invalid enum")
 	}
-	for _, want := range []string{"orders.yaml#2", "NOT_AN_ORDER_STATUS"} {
+	for _, want := range []string{"orders.yaml#2", "{{ metadata['status'][0] }}", "NOT_AN_ORDER_STATUS"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention %q", err, want)
 		}
