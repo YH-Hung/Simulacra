@@ -148,6 +148,127 @@ func TestTemplateRendersTimestampFromTypedExpression(t *testing.T) {
 	}
 }
 
+func TestTemplateRejectsStaticallyIncompatibleWholeSiteTypes(t *testing.T) {
+	reg, method, env := templateParts(t)
+	tests := []struct {
+		name   string
+		fields map[string]any
+		want   []string
+	}{
+		{
+			name:   "bool into string",
+			fields: map[string]any{"note": "{{ true }}"},
+			want:   []string{"bool", "string"},
+		},
+		{
+			name:   "int into timestamp",
+			fields: map[string]any{"eta": "{{ 42 }}"},
+			want:   []string{"int", "google.protobuf.Timestamp"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := newTemplate(env, reg.Types(), method.Output(), tt.fields, "orders.yaml#2")
+			if err == nil {
+				t.Fatal("newTemplate succeeded, want incompatible CEL result error")
+			}
+			for _, want := range append([]string{"orders.yaml#2"}, tt.want...) {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not mention %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+func TestTemplateRejectsStaticallyTypedCompositeCELResults(t *testing.T) {
+	reg, method, env := templateParts(t)
+	tests := []struct {
+		name string
+		expr string
+		want string
+	}{
+		{name: "list", expr: "['one', 'two']", want: "list"},
+		{name: "map", expr: "{'one': 1}", want: "map"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := newTemplate(env, reg.Types(), method.Output(), map[string]any{
+				"note": "{{ " + tt.expr + " }}",
+			}, "orders.yaml#2")
+			if err == nil {
+				t.Fatal("newTemplate succeeded, want unsupported composite CEL result error")
+			}
+			for _, want := range []string{"orders.yaml#2", "unsupported CEL result type", tt.want, "lists or maps"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not mention %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+func TestTemplateDynamicRepeatedItemDoesNotHideInvalidStaticSibling(t *testing.T) {
+	reg, method, env := templateParts(t)
+	_, err := newTemplate(env, reg.Types(), method.Input(), map[string]any{
+		"tags": []any{"{{ message.order_id }}", true},
+	}, "orders.yaml#2")
+	if err == nil {
+		t.Fatal("newTemplate succeeded, want invalid static repeated element error")
+	}
+	for _, want := range []string{"orders.yaml#2", "tags", "true"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+func TestTemplateAcceptsCompatibleTypedAndDynamicWholeSites(t *testing.T) {
+	reg, method, env := templateParts(t)
+
+	_, err := newTemplate(env, reg.Types(), method.Input(), map[string]any{
+		"order_id": "{{ message.order_id }}",
+		"big":      "{{ message.big }}",
+		"small":    "{{ message.small }}",
+		"ratio":    "{{ message.ratio }}",
+		"customer": "{{ message.customer }}",
+		"tags":     []any{"{{ message.order_id }}"},
+	}, "orders.yaml#2")
+	if err != nil {
+		t.Fatalf("newTemplate compatible typed sites: %v", err)
+	}
+	_, err = newTemplate(env, reg.Types(), method.Input(), map[string]any{
+		"small": "{{ '42' }}",
+	}, "orders.yaml#2")
+	if err != nil {
+		t.Fatalf("newTemplate numeric string site: %v", err)
+	}
+	for _, tt := range []struct {
+		name   string
+		fields map[string]any
+	}{
+		{name: "bytes rendered as string", fields: map[string]any{"note": "{{ b'abc' }}"}},
+		{name: "duration rendered as string", fields: map[string]any{"note": "{{ duration('1s') }}"}},
+		{name: "enum from numeric CEL type", fields: map[string]any{"status": "{{ message.customer.region }}"}},
+		{name: "null", fields: map[string]any{"eta": "{{ null }}"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := newTemplate(env, reg.Types(), method.Output(), tt.fields, "orders.yaml#2"); err != nil {
+				t.Fatalf("newTemplate compatible site: %v", err)
+			}
+		})
+	}
+
+	_, err = newTemplate(env, reg.Types(), method.Output(), map[string]any{
+		"note": "{{ message.payload }}",
+	}, "orders.yaml#2")
+	if err != nil {
+		t.Fatalf("newTemplate dynamic site: %v", err)
+	}
+}
+
 func TestTemplateRejectsUnknownResponseFieldAtCompileTime(t *testing.T) {
 	reg, method, env := templateParts(t)
 	_, err := newTemplate(env, reg.Types(), method.Output(), map[string]any{

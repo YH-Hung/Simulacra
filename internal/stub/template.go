@@ -53,7 +53,7 @@ func newTemplate(env *cel.Env, types *schema.Types, desc protoreflect.MessageDes
 	if _, err := BuildMessage(types, desc, templateProjection(fields).(map[string]any)); err != nil {
 		return nil, fmt.Errorf("%s: %w", source, err)
 	}
-	root, err := compileTemplateNode(env, types, fields)
+	root, err := compileTemplateMap(env, types, desc, fields)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", source, err)
 	}
@@ -193,14 +193,36 @@ func (n listNode) render(activation map[string]any) (any, error) {
 	return out, nil
 }
 
-func compileTemplateNode(env *cel.Env, types *schema.Types, value any) (templateNode, error) {
+func compileTemplateMap(env *cel.Env, types *schema.Types, desc protoreflect.MessageDescriptor, value map[string]any) (templateNode, error) {
+	entries := make([]mapEntry, 0, len(value))
+	for _, key := range sortedKeys(value) {
+		field := fieldByJSONOrProtoName(desc, key)
+		if field == nil {
+			return nil, fmt.Errorf("unknown field %q", key)
+		}
+		node, err := compileTemplateNode(env, types, value[key], field, false)
+		if err != nil {
+			return nil, fmt.Errorf("field %q: %w", key, err)
+		}
+		entries = append(entries, mapEntry{key: key, node: node})
+	}
+	return mapNode{entries: entries}, nil
+}
+
+func compileTemplateNode(env *cel.Env, types *schema.Types, value any, field protoreflect.FieldDescriptor, listElement bool) (templateNode, error) {
 	switch value := value.(type) {
 	case string:
-		return compileTemplateString(env, types, value)
+		return compileTemplateString(env, types, value, field, listElement)
 	case map[string]any:
+		if !field.IsMap() {
+			if field.Message() == nil {
+				return staticNode{value: value}, nil
+			}
+			return compileTemplateMap(env, types, field.Message(), value)
+		}
 		entries := make([]mapEntry, 0, len(value))
 		for _, key := range sortedKeys(value) {
-			node, err := compileTemplateNode(env, types, value[key])
+			node, err := compileTemplateNode(env, types, value[key], field.MapValue(), false)
 			if err != nil {
 				return nil, fmt.Errorf("field %q: %w", key, err)
 			}
@@ -210,7 +232,7 @@ func compileTemplateNode(env *cel.Env, types *schema.Types, value any) (template
 	case []any:
 		entries := make([]templateNode, len(value))
 		for i, child := range value {
-			node, err := compileTemplateNode(env, types, child)
+			node, err := compileTemplateNode(env, types, child, field, true)
 			if err != nil {
 				return nil, fmt.Errorf("element %d: %w", i, err)
 			}
@@ -222,11 +244,11 @@ func compileTemplateNode(env *cel.Env, types *schema.Types, value any) (template
 	}
 }
 
-func compileTemplateString(env *cel.Env, types *schema.Types, value string) (templateNode, error) {
+func compileTemplateString(env *cel.Env, types *schema.Types, value string, field protoreflect.FieldDescriptor, listElement bool) (templateNode, error) {
 	trimmed := strings.TrimSpace(value)
 	matches := templateSiteRE.FindAllStringSubmatchIndex(trimmed, -1)
 	if len(matches) == 1 && matches[0][0] == 0 && matches[0][1] == len(trimmed) {
-		return compileExpr(env, types, trimmed[matches[0][2]:matches[0][3]])
+		return compileExpr(env, types, trimmed[matches[0][2]:matches[0][3]], field, listElement)
 	}
 
 	matches = templateSiteRE.FindAllStringSubmatchIndex(value, -1)
@@ -239,30 +261,109 @@ func compileTemplateString(env *cel.Env, types *schema.Types, value string) (tem
 		if match[0] > last {
 			parts = append(parts, interpPart{literal: value[last:match[0]]})
 		}
-		expr, err := compileExpr(env, types, value[match[2]:match[3]])
+		expr, err := compileExpr(env, types, value[match[2]:match[3]], nil, false)
 		if err != nil {
 			return nil, err
 		}
-		parts = append(parts, interpPart{expr: expr.(*exprNode)})
+		parts = append(parts, interpPart{expr: expr})
 		last = match[1]
 	}
 	if last < len(value) {
 		parts = append(parts, interpPart{literal: value[last:]})
 	}
+	if err := validateCELResultType(cel.StringType, field, listElement); err != nil {
+		return nil, fmt.Errorf("interpolated template string: %w", err)
+	}
 	return interpNode{parts: parts}, nil
 }
 
-func compileExpr(env *cel.Env, types *schema.Types, source string) (templateNode, error) {
+func compileExpr(env *cel.Env, types *schema.Types, source string, field protoreflect.FieldDescriptor, listElement bool) (*exprNode, error) {
 	trimmed := strings.TrimSpace(source)
 	ast, issues := env.Compile(trimmed)
 	if issues.Err() != nil {
 		return nil, fmt.Errorf("template site {{ %s }}: %w", trimmed, issues.Err())
+	}
+	if err := validateCELResultType(ast.OutputType(), field, listElement); err != nil {
+		return nil, fmt.Errorf("template site {{ %s }}: %w", trimmed, err)
 	}
 	program, err := env.Program(ast)
 	if err != nil {
 		return nil, fmt.Errorf("template site {{ %s }}: %w", trimmed, err)
 	}
 	return &exprNode{program: program, source: trimmed, types: types}, nil
+}
+
+func validateCELResultType(result *cel.Type, field protoreflect.FieldDescriptor, listElement bool) error {
+	switch result.Kind() {
+	case cel.ListKind, cel.MapKind:
+		return fmt.Errorf("unsupported CEL result type %s; supported values are bool, string, numeric scalars, bytes, timestamp, duration, null, and protobuf messages (not lists or maps)", result)
+	case cel.DynKind, cel.AnyKind, types.UnknownKind, cel.TypeParamKind:
+		return nil
+	case cel.NullTypeKind:
+		return nil
+	}
+	if field == nil || celResultFitsField(result, field, listElement) {
+		return nil
+	}
+	return fmt.Errorf("CEL result type %s is incompatible with protobuf field %s (%s)", result, field.FullName(), protobufFieldType(field))
+}
+
+func celResultFitsField(result *cel.Type, field protoreflect.FieldDescriptor, listElement bool) bool {
+	if !listElement && (field.IsList() || field.IsMap()) {
+		return false
+	}
+	// Compare the JSON shape produced by celToJSON with the shapes protojson
+	// accepts. Content-dependent constraints (ranges, enum names, base64, and
+	// timestamp text) remain request-time validation concerns.
+	switch field.Kind() {
+	case protoreflect.BoolKind:
+		return result.Kind() == cel.BoolKind
+	case protoreflect.StringKind:
+		return celResultRendersString(result)
+	case protoreflect.BytesKind:
+		return result.Kind() == cel.BytesKind || result.Kind() == cel.StringKind
+	case protoreflect.Int32Kind, protoreflect.Sint32Kind, protoreflect.Sfixed32Kind,
+		protoreflect.Int64Kind, protoreflect.Sint64Kind, protoreflect.Sfixed64Kind,
+		protoreflect.Uint32Kind, protoreflect.Fixed32Kind,
+		protoreflect.Uint64Kind, protoreflect.Fixed64Kind,
+		protoreflect.FloatKind, protoreflect.DoubleKind:
+		return result.Kind() == cel.IntKind || result.Kind() == cel.UintKind || result.Kind() == cel.DoubleKind || result.Kind() == cel.StringKind
+	case protoreflect.EnumKind:
+		return result.Kind() == cel.IntKind || result.Kind() == cel.UintKind || result.Kind() == cel.DoubleKind || result.Kind() == cel.StringKind
+	case protoreflect.MessageKind, protoreflect.GroupKind:
+		fullName := field.Message().FullName()
+		switch fullName {
+		case "google.protobuf.Timestamp":
+			return result.Kind() == cel.TimestampKind || result.Kind() == cel.StringKind
+		case "google.protobuf.Duration":
+			return result.Kind() == cel.DurationKind || result.Kind() == cel.StringKind
+		case "google.protobuf.Any":
+			return result.Kind() == cel.AnyKind || result.TypeName() == string(fullName)
+		default:
+			return result.Kind() == cel.StructKind && result.TypeName() == string(fullName)
+		}
+	default:
+		return false
+	}
+}
+
+func celResultRendersString(result *cel.Type) bool {
+	switch result.Kind() {
+	case cel.StringKind, cel.BytesKind, cel.TimestampKind, cel.DurationKind:
+		return true
+	default:
+		return false
+	}
+}
+
+func protobufFieldType(field protoreflect.FieldDescriptor) string {
+	if message := field.Message(); message != nil {
+		return string(message.FullName())
+	}
+	if enum := field.Enum(); enum != nil {
+		return string(enum.FullName())
+	}
+	return field.Kind().String()
 }
 
 // celToJSON converts CEL's native scalar and protobuf values into values the
@@ -329,12 +430,12 @@ func templateProjection(value any) any {
 		}
 		return out
 	case []any:
-		if hasSites(value) {
-			return nil
-		}
-		out := make([]any, len(value))
-		for i, child := range value {
-			out[i] = templateProjection(child)
+		out := make([]any, 0, len(value))
+		for _, child := range value {
+			if text, ok := child.(string); ok && hasSites(text) {
+				continue
+			}
+			out = append(out, templateProjection(child))
 		}
 		return out
 	default:
