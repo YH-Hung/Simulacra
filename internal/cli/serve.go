@@ -55,10 +55,12 @@ func newServeCmdWithListen(serveListen func(string, string) (net.Listener, error
 				onChange := func(ctx context.Context) {
 					reconcileStubDirsContext(ctx, output, reg, store, src.stubDirs, true)
 				}
-				watcher, err = startStubWatcher(cmd.Context(), src.stubDirs, output, onChange, func(ctx context.Context) {
-					if count, replaced := reconcileStubDirsContext(ctx, output, reg, store, src.stubDirs, false); replaced {
+				watcher, err = startStubWatcher(cmd.Context(), src.stubDirs, output, onChange, func(ctx context.Context) error {
+					count, reconcileErr := reconcileStubDirsContext(ctx, output, reg, store, src.stubDirs, false)
+					if reconcileErr == nil {
 						loadedStubCount = count
 					}
+					return reconcileErr
 				}, stub.WatchWithOptions)
 				if err != nil {
 					return err
@@ -115,7 +117,7 @@ type watchDirsFunc func(context.Context, []string, stub.WatchOptions) error
 // startStubWatcher does not return success until every initial watch is
 // attached. Once attached, it reconciles the store while filesystem events
 // are already being collected, closing the load-before-watch update window.
-func startStubWatcher(parent context.Context, dirs []string, output reloadOutput, onChange, reconcile func(context.Context), watch watchDirsFunc) (watcherRun, error) {
+func startStubWatcher(parent context.Context, dirs []string, output reloadOutput, onChange func(context.Context), reconcile func(context.Context) error, watch watchDirsFunc) (watcherRun, error) {
 	startupComplete := make(chan struct{})
 	var completeStartup sync.Once
 	finishStartup := func() {
@@ -149,7 +151,15 @@ func startStubWatcher(parent context.Context, dirs []string, output reloadOutput
 		watcher.stop()
 		return watcherRun{}, parent.Err()
 	}
-	reconcile(parent)
+	if err := reconcile(parent); err != nil {
+		watcher.cancelNow()
+		finishStartup()
+		watcher.stop()
+		if parentErr := parent.Err(); parentErr != nil {
+			return watcherRun{}, parentErr
+		}
+		return watcherRun{}, fmt.Errorf("reconciling stub watcher: %w", err)
+	}
 	finishStartup()
 	if err := parent.Err(); err != nil {
 		watcher.stop()
@@ -250,29 +260,29 @@ func reloadStubDirsContext(ctx context.Context, output reloadOutput, reg *schema
 	reconcileStubDirsContext(ctx, output, reg, store, dirs, true)
 }
 
-func reconcileStubDirsContext(ctx context.Context, output reloadOutput, reg *schema.Registry, store *stub.Store, dirs []string, announce bool) (int, bool) {
+func reconcileStubDirsContext(ctx context.Context, output reloadOutput, reg *schema.Registry, store *stub.Store, dirs []string, announce bool) (int, error) {
 	if ctx.Err() != nil {
-		return 0, false
+		return 0, ctx.Err()
 	}
 	stubs, errs := stub.LoadDirs(reg, dirs)
 	if ctx.Err() != nil {
-		return 0, false
+		return 0, ctx.Err()
 	}
 	if len(errs) > 0 {
 		for _, err := range errs {
 			if ctx.Err() != nil {
-				return 0, false
+				return 0, ctx.Err()
 			}
 			output.PrintErrln("stub error:", err)
 		}
-		return 0, false
+		return 0, errors.Join(errs...)
 	}
 	if ctx.Err() != nil {
-		return 0, false
+		return 0, ctx.Err()
 	}
 	store.Replace(stubs)
 	if announce && ctx.Err() == nil {
 		output.Printf("simulacra: %d stub(s) reloaded\n", len(stubs))
 	}
-	return len(stubs), true
+	return len(stubs), nil
 }

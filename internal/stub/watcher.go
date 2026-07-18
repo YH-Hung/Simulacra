@@ -94,14 +94,17 @@ func watchWithBackend(ctx context.Context, dirs []string, opts WatchOptions, bac
 		return err
 	}
 
+	if opts.Ready != nil {
+		opts.Ready()
+	}
+	if ctx.Err() != nil {
+		return nil
+	}
 	workerCtx, cancelWorker := context.WithCancel(ctx)
 	defer cancelWorker()
 	reloads := make(chan struct{}, 1)
 	callbackErrs := make(chan error, 1)
 	go callbackWorker(workerCtx, reloads, callbackErrs, opts.OnChange)
-	if opts.Ready != nil {
-		opts.Ready()
-	}
 
 	reloadTimer := time.NewTimer(opts.Debounce)
 	stopTimer(reloadTimer)

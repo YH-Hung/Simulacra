@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -202,6 +203,39 @@ func TestWatchCancellationDoesNotWaitForBlockedCallback(t *testing.T) {
 	cancel()
 	waitForWatchReturn(t, done)
 	close(release)
+}
+
+func TestWatchDoesNotStartCallbackWorkerWhileReadyIsBlocked(t *testing.T) {
+	root := t.TempDir()
+	backend := newFakeWatchBackend()
+	readyEntered := make(chan struct{})
+	releaseReady := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- watchWithBackend(ctx, []string{root}, WatchOptions{
+			Debounce: time.Millisecond,
+			OnChange: func(context.Context) {},
+			Ready: func() {
+				close(readyEntered)
+				<-releaseReady
+			},
+		}, backend)
+	}()
+	<-readyEntered
+
+	stack := make([]byte, 1<<20)
+	n := runtime.Stack(stack, true)
+	if strings.Contains(string(stack[:n]), "created by github.com/yinghanhung/simulacra/internal/stub.watchWithBackend") {
+		cancel()
+		close(releaseReady)
+		waitForWatchReturn(t, done)
+		t.Fatal("callback worker started before watcher readiness completed")
+	}
+
+	cancel()
+	close(releaseReady)
+	waitForWatchReturn(t, done)
 }
 
 func TestWatchRecoversCallbackPanicAndReportsIt(t *testing.T) {

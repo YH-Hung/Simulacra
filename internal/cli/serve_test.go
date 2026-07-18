@@ -275,10 +275,13 @@ func TestStartStubWatcherReconcilesMutationBeforeReady(t *testing.T) {
 		<-ctx.Done()
 		return nil
 	}
-	reconcile := func(reloadCtx context.Context) {
-		reloadStubDirsContext(reloadCtx, &commandOutput{cmd: cmd}, reg, store, []string{dir})
+	reconcile := func(reloadCtx context.Context) error {
+		_, err := reconcileStubDirsContext(reloadCtx, &commandOutput{cmd: cmd}, reg, store, []string{dir}, true)
+		return err
 	}
-	watcher, err := startStubWatcher(ctx, []string{dir}, &commandOutput{cmd: cmd}, reconcile, reconcile, watch)
+	watcher, err := startStubWatcher(ctx, []string{dir}, &commandOutput{cmd: cmd}, func(reloadCtx context.Context) {
+		_ = reconcile(reloadCtx)
+	}, reconcile, watch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,10 +292,60 @@ func TestStartStubWatcherReconcilesMutationBeforeReady(t *testing.T) {
 	watcher.stop()
 }
 
+func TestStartStubWatcherReturnsStartupReconciliationError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stub.yaml")
+	if err := os.WriteFile(path, []byte(`
+- method: shop.v1.OrderService/GetOrder
+  respond: { message: {} }
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src := &sources{protoDirs: []string{"../../testdata/protos"}}
+	reg, err := src.buildRegistry(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, loadErrs := stub.LoadDirs(reg, []string{dir})
+	if len(loadErrs) != 0 {
+		t.Fatal(loadErrs)
+	}
+	store := stub.NewStore(initial)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	exited := make(chan struct{})
+	watch := func(ctx context.Context, _ []string, opts stub.WatchOptions) error {
+		if err := os.WriteFile(path, []byte("{{{ invalid yaml"), 0o644); err != nil {
+			return err
+		}
+		opts.Ready()
+		<-ctx.Done()
+		close(exited)
+		return nil
+	}
+	reconcile := func(reloadCtx context.Context) error {
+		_, err := reconcileStubDirsContext(reloadCtx, discardReloadOutput{}, reg, store, []string{dir}, false)
+		return err
+	}
+	watcher, err := startStubWatcher(ctx, []string{dir}, discardReloadOutput{}, func(context.Context) {}, reconcile, watch)
+	if watcher.cancel != nil {
+		defer watcher.stop()
+	}
+	if err == nil {
+		t.Fatal("startStubWatcher error = nil, want startup reconciliation error")
+	}
+	select {
+	case <-exited:
+	default:
+		t.Fatal("startStubWatcher returned startup reconciliation error without joining watcher")
+	}
+}
+
 func TestStartStubWatcherReturnsInitialAttachError(t *testing.T) {
 	want := errors.New("attach denied")
 	watch := func(context.Context, []string, stub.WatchOptions) error { return want }
-	_, err := startStubWatcher(context.Background(), []string{"stubs"}, discardReloadOutput{}, func(context.Context) {}, func(context.Context) {}, watch)
+	_, err := startStubWatcher(context.Background(), []string{"stubs"}, discardReloadOutput{}, func(context.Context) {}, func(context.Context) error { return nil }, watch)
 	if !errors.Is(err, want) {
 		t.Fatalf("startStubWatcher error = %v, want attach error", err)
 	}
@@ -310,7 +363,7 @@ func TestStartStubWatcherCancellationDuringStartupJoinsWatcher(t *testing.T) {
 	}
 	result := make(chan error, 1)
 	go func() {
-		_, err := startStubWatcher(ctx, []string{"stubs"}, discardReloadOutput{}, func(context.Context) {}, func(context.Context) {}, watch)
+		_, err := startStubWatcher(ctx, []string{"stubs"}, discardReloadOutput{}, func(context.Context) {}, func(context.Context) error { return nil }, watch)
 		result <- err
 	}()
 	<-entered
@@ -351,10 +404,11 @@ func TestStartStubWatcherSerializesStartupReconcileBeforeCallbacks(t *testing.T)
 	go func() {
 		watcher, err := startStubWatcher(ctx, []string{"stubs"}, discardReloadOutput{}, func(context.Context) {
 			installed.Store(2)
-		}, func(context.Context) {
+		}, func(context.Context) error {
 			close(startupEntered)
 			<-releaseStartup
 			installed.Store(1)
+			return nil
 		}, watch)
 		if err != nil {
 			errs <- err
