@@ -130,10 +130,11 @@ func (s *Server) bidi(stream grpc.ServerStream, full string, method protoreflect
 	if in.Messages == nil {
 		in.Messages = []protoreflect.Message{}
 	}
-	selected, misses := s.store.SelectOrExplain(full, in)
-	if selected == nil {
-		return s.noMatch(full, misses)
+	selection := s.store.SelectOrExplain(full, in)
+	if selection.Selected == nil {
+		return s.noMatch(full, selection.Misses, selection.RegisteredCount)
 	}
+	selected := selection.Selected
 	call.StubSource = selected.Source
 	plan := selected.Plan()
 	if len(plan.Trailer) > 0 {
@@ -192,10 +193,11 @@ func (s *Server) clientStream(stream grpc.ServerStream, full string, method prot
 		in.Messages = append(in.Messages, message.ProtoReflect())
 	}
 
-	selected, misses := s.store.SelectOrExplain(full, in)
-	if selected == nil {
-		return s.noMatch(full, misses)
+	selection := s.store.SelectOrExplain(full, in)
+	if selection.Selected == nil {
+		return s.noMatch(full, selection.Misses, selection.RegisteredCount)
 	}
+	selected := selection.Selected
 	call.StubSource = selected.Source
 	if err := applyMetadata(stream, selected.Plan()); err != nil {
 		return err
@@ -209,10 +211,11 @@ func (s *Server) unary(stream grpc.ServerStream, full string, method protoreflec
 		return err
 	}
 	in.Message = req.ProtoReflect()
-	selected, misses := s.store.SelectOrExplain(full, in)
-	if selected == nil {
-		return s.noMatch(full, misses)
+	selection := s.store.SelectOrExplain(full, in)
+	if selection.Selected == nil {
+		return s.noMatch(full, selection.Misses, selection.RegisteredCount)
 	}
+	selected := selection.Selected
 	call.StubSource = selected.Source
 	if err := applyMetadata(stream, selected.Plan()); err != nil {
 		return err
@@ -226,10 +229,11 @@ func (s *Server) serverStream(stream grpc.ServerStream, full string, method prot
 		return err
 	}
 	in.Message = req.ProtoReflect()
-	selected, misses := s.store.SelectOrExplain(full, in)
-	if selected == nil {
-		return s.noMatch(full, misses)
+	selection := s.store.SelectOrExplain(full, in)
+	if selection.Selected == nil {
+		return s.noMatch(full, selection.Misses, selection.RegisteredCount)
 	}
+	selected := selection.Selected
 	call.StubSource = selected.Source
 	plan := selected.Plan()
 	if err := applyMetadata(stream, plan); err != nil {
@@ -331,10 +335,10 @@ func runSteps(ctx context.Context, sender messageSender, steps []stub.Step, in m
 	return nil
 }
 
-func (s *Server) noMatch(full string, misses []stub.Miss) error {
+func (s *Server) noMatch(full string, misses []stub.Miss, registeredCount int) error {
 	message := fmt.Sprintf(
 		"simulacra: no stub matched %s (%d stub(s) registered for this method)",
-		full, s.store.CountFor(full),
+		full, registeredCount,
 	)
 	limit := len(misses)
 	if limit > 3 {

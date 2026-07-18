@@ -460,7 +460,7 @@ func TestUnaryPreservesReceiveStatusCode(t *testing.T) {
 	}
 }
 
-func TestNoMatchFormatsTopThreeAndEllipsis(t *testing.T) {
+func TestNoMatchFormatsSelectionSnapshotTopThreeAndEllipsis(t *testing.T) {
 	const full = "/shop.v1.OrderService/GetOrder"
 	reg := schema.NewRegistry()
 	if err := reg.AddProtoDir(context.Background(), "../../testdata/protos"); err != nil {
@@ -499,11 +499,14 @@ func TestNoMatchFormatsTopThreeAndEllipsis(t *testing.T) {
 	in := match.Input{Method: strings.TrimPrefix(full, "/"), Message: request.ProtoReflect()}
 	server := &Server{store: store}
 
-	selected, misses := store.SelectOrExplain(full, in)
-	if selected != nil {
-		t.Fatalf("SelectOrExplain selected %v, want nearest misses", selected)
+	selection := store.SelectOrExplain(full, in)
+	if selection.Selected != nil {
+		t.Fatalf("SelectOrExplain selected %v, want nearest misses", selection.Selected)
 	}
-	message := status.Convert(server.noMatch(full, misses)).Message()
+	// A reload between selection and error formatting must not change the
+	// registered count attached to this failed-selection diagnostic.
+	store.Replace(stubs[:1])
+	message := status.Convert(server.noMatch(full, selection.Misses, selection.RegisteredCount)).Message()
 	want := `simulacra: no stub matched /shop.v1.OrderService/GetOrder (4 stub(s) registered for this method); first (priority 40): message order_id: expected to equal "o-1"; actual "actual"; second (priority 30): message order_id: expected to equal "o-2"; actual "actual"; third (priority 20): message order_id: expected to equal "o-3"; actual "actual"; …`
 	if message != want {
 		t.Fatalf("no-match message:\n got: %s\nwant: %s", message, want)

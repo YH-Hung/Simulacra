@@ -221,8 +221,7 @@ func TestSelectOrExplainSnapshotsConcurrentLastBudget(t *testing.T) {
 	store := NewStore([]*Compiled{limited})
 
 	type result struct {
-		selected *Compiled
-		misses   []Miss
+		selection Selection
 	}
 	start := make(chan struct{})
 	results := make(chan result, 2)
@@ -232,8 +231,7 @@ func TestSelectOrExplainSnapshotsConcurrentLastBudget(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			selected, misses := store.SelectOrExplain(method, match.Input{})
-			results <- result{selected: selected, misses: misses}
+			results <- result{selection: store.SelectOrExplain(method, match.Input{})}
 		}()
 	}
 	close(start)
@@ -243,9 +241,9 @@ func TestSelectOrExplainSnapshotsConcurrentLastBudget(t *testing.T) {
 	selectedCount := 0
 	missCount := 0
 	for got := range results {
-		if got.selected != nil {
+		if got.selection.Selected != nil {
 			selectedCount++
-			if got.selected != limited || got.misses != nil {
+			if got.selection.Selected != limited || got.selection.Misses != nil {
 				t.Errorf("selected result = %#v, want limited stub and no misses", got)
 			}
 			continue
@@ -256,11 +254,36 @@ func TestSelectOrExplainSnapshotsConcurrentLastBudget(t *testing.T) {
 			Priority: 0,
 			Reasons:  []string{"times budget exhausted (1/1 used)"},
 		}}
-		if !reflect.DeepEqual(got.misses, want) {
-			t.Errorf("losing result misses = %#v, want %#v", got.misses, want)
+		if !reflect.DeepEqual(got.selection.Misses, want) {
+			t.Errorf("losing result misses = %#v, want %#v", got.selection.Misses, want)
 		}
 	}
 	if selectedCount != 1 || missCount != 1 {
 		t.Fatalf("selected results = %d, miss results = %d; want one of each", selectedCount, missCount)
+	}
+}
+
+func TestSelectOrExplainSnapshotsRegisteredCount(t *testing.T) {
+	reg := testRegistry(t)
+	first := compiled(t, reg, Stub{
+		Method: "shop.v1.OrderService/GetOrder",
+		Match:  &match.Block{Message: map[string]match.Rules{"order_id": {"eq": "first"}}},
+	})
+	second := compiled(t, reg, Stub{
+		Method: "shop.v1.OrderService/GetOrder",
+		Match:  &match.Block{Message: map[string]match.Rules{"order_id": {"eq": "second"}}},
+	})
+	store := NewStore([]*Compiled{first, second})
+	in := match.Input{Message: request(t, reg, `{"order_id":"actual"}`).ProtoReflect()}
+
+	result := store.SelectOrExplain(method, in)
+	if result.Selected != nil {
+		t.Fatalf("SelectOrExplain selected %v, want no match", result.Selected)
+	}
+	if result.RegisteredCount != 2 {
+		t.Fatalf("SelectOrExplain registered count = %d, want 2", result.RegisteredCount)
+	}
+	if len(result.Misses) != 2 {
+		t.Fatalf("SelectOrExplain misses = %#v, want two misses", result.Misses)
 	}
 }

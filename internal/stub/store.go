@@ -29,6 +29,14 @@ type Miss struct {
 	Reasons  []string
 }
 
+// Selection is the result of a selection attempt. On a failed selection,
+// Misses and RegisteredCount are captured from the same locked store state.
+type Selection struct {
+	Selected        *Compiled
+	Misses          []Miss
+	RegisteredCount int
+}
+
 type candidateSnapshot struct {
 	stub *Compiled
 	used int
@@ -78,7 +86,7 @@ func (s *Store) Select(method string, in match.Input) *Compiled {
 // SelectOrExplain atomically selects a live stub or snapshots the failed
 // selection for diagnostics. Matcher explanations run after releasing the
 // store lock and use the same timestamp as the selection attempt.
-func (s *Store) SelectOrExplain(method string, in match.Input) (*Compiled, []Miss) {
+func (s *Store) SelectOrExplain(method string, in match.Input) Selection {
 	in = inputWithTime(in)
 	s.mu.Lock()
 	for _, e := range s.byMethod[method] {
@@ -88,12 +96,15 @@ func (s *Store) SelectOrExplain(method string, in match.Input) (*Compiled, []Mis
 		if e.stub.Matches(in) {
 			e.used++
 			s.mu.Unlock()
-			return e.stub, nil
+			return Selection{Selected: e.stub}
 		}
 	}
 	snapshot := s.snapshotLocked(method)
 	s.mu.Unlock()
-	return nil, explainSnapshot(snapshot, in)
+	return Selection{
+		Misses:          explainSnapshot(snapshot, in),
+		RegisteredCount: len(snapshot),
+	}
 }
 
 // Explain ranks the registered stubs that miss an input by ascending number
@@ -144,8 +155,8 @@ func inputWithTime(in match.Input) match.Input {
 	return in
 }
 
-// CountFor reports how many stubs are registered for a method (regardless
-// of times budget) — used in "no stub matched" error messages.
+// CountFor reports how many stubs are registered for a method, regardless of
+// times budget.
 func (s *Store) CountFor(method string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
