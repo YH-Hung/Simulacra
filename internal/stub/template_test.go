@@ -55,6 +55,23 @@ func templateParts(t *testing.T) (*schema.Registry, protoreflect.MethodDescripto
 	return reg, method, env
 }
 
+func conformanceTemplateParts(t *testing.T) (*schema.Registry, protoreflect.MethodDescriptor, *cel.Env) {
+	t.Helper()
+	reg := schema.NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), "../../conformance/protos"); err != nil {
+		t.Fatalf("AddProtoDir: %v", err)
+	}
+	method, err := reg.LookupMethod("conformance.v1.CorpusService/Echo")
+	if err != nil {
+		t.Fatalf("LookupMethod: %v", err)
+	}
+	env, err := match.NewCompiler(reg.Files()).Env(method.Input(), match.Unary)
+	if err != nil {
+		t.Fatalf("CEL Env: %v", err)
+	}
+	return reg, method, env
+}
+
 func msgFor(t *testing.T, desc protoreflect.MessageDescriptor, body string) *dynamicpb.Message {
 	t.Helper()
 	msg := dynamicpb.NewMessage(desc)
@@ -266,6 +283,30 @@ func TestTemplateAcceptsCompatibleTypedAndDynamicWholeSites(t *testing.T) {
 	}, "orders.yaml#2")
 	if err != nil {
 		t.Fatalf("newTemplate dynamic site: %v", err)
+	}
+}
+
+func TestTemplateAcceptsScalarEncodedWellKnownTypes(t *testing.T) {
+	reg, method, env := conformanceTemplateParts(t)
+	tests := []struct {
+		name   string
+		fields map[string]any
+	}{
+		{name: "string wrapper", fields: map[string]any{"wrapped": "{{ 'wrapped value' }}"}},
+		{name: "Value bool", fields: map[string]any{"val": "{{ true }}"}},
+		{name: "Value number", fields: map[string]any{"val": "{{ 1.5 }}"}},
+		{name: "Value string", fields: map[string]any{"val": "{{ 'text' }}"}},
+		{name: "Value null", fields: map[string]any{"val": "{{ null }}"}},
+		{name: "FieldMask string", fields: map[string]any{"mask": "{{ 'foo.bar,baz' }}"}},
+		{name: "FieldMask rendered as string", fields: map[string]any{"text": "{{ message.mask }}"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := newTemplate(env, reg.Types(), method.Output(), tt.fields, "corpus.yaml#1"); err != nil {
+				t.Fatalf("newTemplate compatible WKT site: %v", err)
+			}
+		})
 	}
 }
 

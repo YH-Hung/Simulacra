@@ -316,6 +316,61 @@ func celResultFitsField(result *cel.Type, field protoreflect.FieldDescriptor, li
 	// accepts. Content-dependent constraints (ranges, enum names, base64, and
 	// timestamp text) remain request-time validation concerns.
 	switch field.Kind() {
+	case protoreflect.BoolKind, protoreflect.StringKind, protoreflect.BytesKind,
+		protoreflect.Int32Kind, protoreflect.Sint32Kind, protoreflect.Sfixed32Kind,
+		protoreflect.Int64Kind, protoreflect.Sint64Kind, protoreflect.Sfixed64Kind,
+		protoreflect.Uint32Kind, protoreflect.Fixed32Kind,
+		protoreflect.Uint64Kind, protoreflect.Fixed64Kind,
+		protoreflect.FloatKind, protoreflect.DoubleKind:
+		return celResultFitsScalarKind(result, field.Kind())
+	case protoreflect.EnumKind:
+		return result.Kind() == cel.IntKind || result.Kind() == cel.UintKind || result.Kind() == cel.DoubleKind || result.Kind() == cel.StringKind
+	case protoreflect.MessageKind, protoreflect.GroupKind:
+		fullName := field.Message().FullName()
+		if kind, ok := protobufWrapperKind(fullName); ok {
+			return celResultFitsScalarKind(result, kind)
+		}
+		switch fullName {
+		case "google.protobuf.Timestamp":
+			return result.Kind() == cel.TimestampKind || result.Kind() == cel.StringKind
+		case "google.protobuf.Duration":
+			return result.Kind() == cel.DurationKind || result.Kind() == cel.StringKind
+		case "google.protobuf.Any":
+			return result.Kind() == cel.AnyKind || result.TypeName() == string(fullName)
+		case "google.protobuf.Value":
+			return celResultFitsValue(result)
+		case "google.protobuf.FieldMask":
+			return result.Kind() == cel.StringKind || result.Kind() == cel.BytesKind ||
+				(result.Kind() == cel.StructKind && result.TypeName() == string(fullName))
+		default:
+			return result.Kind() == cel.StructKind && result.TypeName() == string(fullName)
+		}
+	default:
+		return false
+	}
+}
+
+func protobufWrapperKind(name protoreflect.FullName) (protoreflect.Kind, bool) {
+	switch name {
+	case "google.protobuf.BoolValue":
+		return protoreflect.BoolKind, true
+	case "google.protobuf.BytesValue":
+		return protoreflect.BytesKind, true
+	case "google.protobuf.DoubleValue", "google.protobuf.FloatValue":
+		return protoreflect.DoubleKind, true
+	case "google.protobuf.Int32Value", "google.protobuf.Int64Value":
+		return protoreflect.Int64Kind, true
+	case "google.protobuf.UInt32Value", "google.protobuf.UInt64Value":
+		return protoreflect.Uint64Kind, true
+	case "google.protobuf.StringValue":
+		return protoreflect.StringKind, true
+	default:
+		return 0, false
+	}
+}
+
+func celResultFitsScalarKind(result *cel.Type, kind protoreflect.Kind) bool {
+	switch kind {
 	case protoreflect.BoolKind:
 		return result.Kind() == cel.BoolKind
 	case protoreflect.StringKind:
@@ -328,20 +383,18 @@ func celResultFitsField(result *cel.Type, field protoreflect.FieldDescriptor, li
 		protoreflect.Uint64Kind, protoreflect.Fixed64Kind,
 		protoreflect.FloatKind, protoreflect.DoubleKind:
 		return result.Kind() == cel.IntKind || result.Kind() == cel.UintKind || result.Kind() == cel.DoubleKind || result.Kind() == cel.StringKind
-	case protoreflect.EnumKind:
-		return result.Kind() == cel.IntKind || result.Kind() == cel.UintKind || result.Kind() == cel.DoubleKind || result.Kind() == cel.StringKind
-	case protoreflect.MessageKind, protoreflect.GroupKind:
-		fullName := field.Message().FullName()
-		switch fullName {
-		case "google.protobuf.Timestamp":
-			return result.Kind() == cel.TimestampKind || result.Kind() == cel.StringKind
-		case "google.protobuf.Duration":
-			return result.Kind() == cel.DurationKind || result.Kind() == cel.StringKind
-		case "google.protobuf.Any":
-			return result.Kind() == cel.AnyKind || result.TypeName() == string(fullName)
-		default:
-			return result.Kind() == cel.StructKind && result.TypeName() == string(fullName)
-		}
+	default:
+		return false
+	}
+}
+
+func celResultFitsValue(result *cel.Type) bool {
+	if celResultRendersString(result) {
+		return true
+	}
+	switch result.Kind() {
+	case cel.BoolKind, cel.DoubleKind, cel.IntKind, cel.UintKind, cel.StructKind:
+		return true
 	default:
 		return false
 	}
@@ -351,6 +404,8 @@ func celResultRendersString(result *cel.Type) bool {
 	switch result.Kind() {
 	case cel.StringKind, cel.BytesKind, cel.TimestampKind, cel.DurationKind:
 		return true
+	case cel.StructKind:
+		return result.TypeName() == "google.protobuf.FieldMask"
 	default:
 		return false
 	}
