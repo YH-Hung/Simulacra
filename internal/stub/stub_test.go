@@ -42,7 +42,11 @@ func TestCompileBuildsResponse(t *testing.T) {
 	if c.Method != "/shop.v1.OrderService/GetOrder" {
 		t.Errorf("Method = %q, want normalized /shop.v1.OrderService/GetOrder", c.Method)
 	}
-	out, err := protojson.Marshal(c.Response())
+	response, err := c.Plan().Message.Render(match.Input{})
+	if err != nil {
+		t.Fatalf("rendering response: %v", err)
+	}
+	out, err := protojson.Marshal(response)
 	if err != nil {
 		t.Fatalf("marshaling response: %v", err)
 	}
@@ -69,7 +73,7 @@ func TestCompileErrors(t *testing.T) {
 		want string // substring of the error
 	}{
 		{"unknown method", Stub{Method: "shop.v1.OrderService/Nope"}, "Nope"},
-		{"streaming method", Stub{Method: "shop.v1.OrderService/WatchOrder"}, "unary"},
+		{"server-streaming without stream script", Stub{Method: "shop.v1.OrderService/WatchOrder"}, "stream"},
 		{"response field not in schema", Stub{
 			Method:  "shop.v1.OrderService/GetOrder",
 			Respond: Respond{Message: map[string]any{"no_such_field": 1}},
@@ -97,5 +101,43 @@ func TestCompileErrors(t *testing.T) {
 				t.Errorf("error %q does not mention %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestBuildMessageResolvesAnyFromRegistry(t *testing.T) {
+	reg := testRegistry(t)
+	m, err := reg.LookupMethod("shop.v1.OrderService/GetOrder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := BuildMessage(reg.Types(), m.Output(), map[string]any{
+		"extra": map[string]any{
+			"@type":  "type.googleapis.com/shop.v1.Customer",
+			"id":     "c-1",
+			"region": "EU",
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildMessage with Any: %v", err)
+	}
+	out, err := (protojson.MarshalOptions{Resolver: reg.Types()}).Marshal(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"type.googleapis.com/shop.v1.Customer", `"c-1"`} {
+		if !strings.Contains(string(out), want) {
+			t.Errorf("marshaled %s missing %s", out, want)
+		}
+	}
+}
+
+func TestBuildMessageUnknownAnyTypeFails(t *testing.T) {
+	reg := testRegistry(t)
+	m, _ := reg.LookupMethod("shop.v1.OrderService/GetOrder")
+	_, err := BuildMessage(reg.Types(), m.Output(), map[string]any{
+		"extra": map[string]any{"@type": "type.googleapis.com/no.such.Type"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "no.such.Type") {
+		t.Errorf("err = %v, want mention of no.such.Type", err)
 	}
 }

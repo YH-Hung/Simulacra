@@ -1,0 +1,24 @@
+syntax = "proto2";
+
+package conformance.v1;
+
+import "conformance/v1/legacy.proto";
+import "google/protobuf/struct.proto";
+
+message RequiredNullSemantics {
+  required google.protobuf.Value value = 1;
+  required google.protobuf.NullValue null_enum = 2;
+  optional RequiredPayload optional_payload = 3;
+  repeated int32 numbers = 4;
+  repeated RequiredPayload payloads = 5;
+  map<string, int32> number_map = 6;
+  map<string, RequiredPayload> payload_map = 7;
+  repeated google.protobuf.Value values = 8;
+  repeated google.protobuf.NullValue null_enums = 9;
+  map<string, google.protobuf.Value> value_map = 10;
+  map<string, google.protobuf.NullValue> null_enum_map = 11;
+}
+
+service NullService {
+  rpc Nulls(LegacyReply) returns (RequiredNullSemantics);
+}

@@ -10,7 +10,11 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/google/cel-go/cel"
+	"github.com/google/cel-go/common/types"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
@@ -60,18 +64,27 @@ type Input struct {
 	Metadata metadata.MD
 	Message  protoreflect.Message
 	Messages []protoreflect.Message
+	Now      time.Time
 }
 
 type Compiler struct {
 	files *protoregistry.Files
+	mu    sync.Mutex
+	envs  map[envKey]*cel.Env
+}
+
+type envKey struct {
+	msg   protoreflect.FullName
+	shape Shape
 }
 
 func NewCompiler(files *protoregistry.Files) *Compiler { return &Compiler{files: files} }
 
-// Block is the YAML shape of a stub's `match:` section (M1 structured subset).
+// Block is the YAML shape of a stub's `match:` section.
 type Block struct {
 	Metadata map[string]Rules `yaml:"metadata"`
 	Message  map[string]Rules `yaml:"message"`
+	Expr     string           `yaml:"expr"`
 }
 
 // Rules maps an operator name (eq, ne, in, matches, present, contains) to its literal.
@@ -80,6 +93,56 @@ type Rules map[string]any
 type Compiled struct {
 	metadata []mdRule
 	message  []msgRule
+	expr     *exprRule
+}
+
+type exprRule struct {
+	prg     cel.Program
+	src     string
+	adapter types.Adapter
+}
+
+func (c *Compiler) Env(input protoreflect.MessageDescriptor, shape Shape) (*cel.Env, error) {
+	if c.files == nil {
+		return nil, fmt.Errorf("CEL is unavailable: match compiler was built without descriptor files")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.envs == nil {
+		c.envs = map[envKey]*cel.Env{}
+	}
+	key := envKey{input.FullName(), shape}
+	if env, ok := c.envs[key]; ok {
+		return env, nil
+	}
+	provider, err := newCELProvider(c.files)
+	if err != nil {
+		return nil, fmt.Errorf("building CEL type provider for %s: %w", input.FullName(), err)
+	}
+	adapter := newProtoAdapter(provider, c.files)
+	obj := cel.ObjectType(string(input.FullName()))
+	opts := []cel.EnvOption{
+		cel.CustomTypeProvider(provider),
+		cel.CustomTypeAdapter(adapter),
+		cel.Variable("metadata", cel.MapType(cel.StringType, cel.ListType(cel.StringType))),
+		cel.Variable("method", cel.StringType),
+		cel.Variable("now", cel.TimestampType),
+	}
+	switch shape {
+	case Unary, ServerStream:
+		opts = append(opts, cel.Variable("message", obj))
+	case ClientStream:
+		opts = append(opts, cel.Variable("messages", cel.ListType(obj)))
+	case BidiRule:
+		opts = append(opts, cel.Variable("message", obj), cel.Variable("messages", cel.ListType(obj)))
+	case Bidi:
+	}
+	env, err := cel.NewEnv(opts...)
+	if err != nil {
+		return nil, fmt.Errorf("building CEL environment for %s: %w", input.FullName(), err)
+	}
+	c.envs[key] = env
+	return env, nil
 }
 
 type mdRule struct {
@@ -103,6 +166,7 @@ type msgRule struct {
 // literal is a stub-file literal pre-converted to the leaf field's kind.
 type literal struct {
 	kind protoreflect.Kind
+	src  string
 	str  string
 	b    bool
 	i    int64
@@ -121,8 +185,10 @@ func (c *Compiler) Compile(input protoreflect.MessageDescriptor, b *Block, shape
 	if len(b.Message) > 0 && (shape == ClientStream || shape == Bidi) {
 		return nil, fmt.Errorf("message field matchers are not valid for %s stubs (there is no single request message); use expr over `messages` instead", shape)
 	}
-	for key, rules := range b.Metadata {
-		for op, raw := range rules {
+	for _, key := range sortedKeys(b.Metadata) {
+		rules := b.Metadata[key]
+		for _, op := range sortedKeys(rules) {
+			raw := rules[op]
 			r, err := compileMDRule(strings.ToLower(key), op, raw)
 			if err != nil {
 				return nil, fmt.Errorf("metadata %q: %w", key, err)
@@ -130,12 +196,14 @@ func (c *Compiler) Compile(input protoreflect.MessageDescriptor, b *Block, shape
 			cmp.metadata = append(cmp.metadata, r)
 		}
 	}
-	for path, rules := range b.Message {
+	for _, path := range sortedKeys(b.Message) {
+		rules := b.Message[path]
 		fds, err := resolvePath(input, path)
 		if err != nil {
 			return nil, err
 		}
-		for op, raw := range rules {
+		for _, op := range sortedKeys(rules) {
+			raw := rules[op]
 			r, err := compileMsgRule(fds, op, raw)
 			if err != nil {
 				return nil, fmt.Errorf("message field %q: %w", path, err)
@@ -143,7 +211,34 @@ func (c *Compiler) Compile(input protoreflect.MessageDescriptor, b *Block, shape
 			cmp.message = append(cmp.message, r)
 		}
 	}
+	if b.Expr != "" {
+		env, err := c.Env(input, shape)
+		if err != nil {
+			return nil, err
+		}
+		ast, iss := env.Compile(b.Expr)
+		if iss.Err() != nil {
+			return nil, fmt.Errorf("expr: %w", iss.Err())
+		}
+		if !ast.OutputType().IsExactType(cel.BoolType) {
+			return nil, fmt.Errorf("expr must evaluate to a bool, got %s: %s", ast.OutputType(), b.Expr)
+		}
+		prg, err := env.Program(ast)
+		if err != nil {
+			return nil, fmt.Errorf("expr: %w", err)
+		}
+		cmp.expr = &exprRule{prg: prg, src: b.Expr, adapter: env.CELTypeAdapter()}
+	}
 	return cmp, nil
+}
+
+func sortedKeys[V any](values map[string]V) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	return keys
 }
 
 func (c *Compiled) Eval(in Input) bool {
@@ -160,7 +255,47 @@ func (c *Compiled) Eval(in Input) bool {
 			return false
 		}
 	}
+	if c.expr != nil {
+		out, _, err := c.expr.prg.Eval(activation(in, c.expr.adapter))
+		if err != nil || out != types.True {
+			return false
+		}
+	}
 	return true
+}
+
+func Activation(in Input) map[string]any {
+	return activation(in, nil)
+}
+
+func activation(in Input, adapter types.Adapter) map[string]any {
+	md := map[string][]string{}
+	for k, v := range in.Metadata {
+		md[k] = v
+	}
+	now := in.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	act := map[string]any{"metadata": md, "method": in.Method, "now": now}
+	if in.Message != nil {
+		message := any(in.Message.Interface())
+		if adapter != nil {
+			message = adapter.NativeToValue(message)
+		}
+		act["message"] = message
+	}
+	if in.Messages != nil {
+		msgs := make([]any, len(in.Messages))
+		for i, m := range in.Messages {
+			msgs[i] = m.Interface()
+			if adapter != nil {
+				msgs[i] = adapter.NativeToValue(msgs[i])
+			}
+		}
+		act["messages"] = msgs
+	}
+	return act
 }
 
 // --- metadata rules ---
@@ -246,7 +381,7 @@ func resolvePath(md protoreflect.MessageDescriptor, path string) ([]protoreflect
 		}
 		out = append(out, fd)
 		if i < len(parts)-1 {
-			if fd.Kind() != protoreflect.MessageKind || fd.IsList() || fd.IsMap() {
+			if (fd.Kind() != protoreflect.MessageKind && fd.Kind() != protoreflect.GroupKind) || fd.IsList() || fd.IsMap() {
 				return nil, fmt.Errorf("cannot descend into %q in path %q: not a singular message field", p, path)
 			}
 			cur = fd.Message()
@@ -258,6 +393,9 @@ func resolvePath(md protoreflect.MessageDescriptor, path string) ([]protoreflect
 func compileMsgRule(path []protoreflect.FieldDescriptor, op string, raw any) (msgRule, error) {
 	leaf := path[len(path)-1]
 	r := msgRule{path: path, op: op}
+	if leaf.IsMap() && slices.Contains([]string{"matches", "contains", "eq", "ne", "in"}, op) {
+		return r, fmt.Errorf("operator %q does not support map field %q (use expr for map matching)", op, leaf.Name())
+	}
 	switch op {
 	case "present":
 		want, ok := raw.(bool)
@@ -291,8 +429,8 @@ func compileMsgRule(path []protoreflect.FieldDescriptor, op string, raw any) (ms
 		r.lit = lit
 		return r, nil
 	case "eq", "ne":
-		if leaf.IsList() || leaf.IsMap() {
-			return r, fmt.Errorf("%s requires a singular field, %q is repeated/map (use contains)", op, leaf.Name())
+		if leaf.IsList() {
+			return r, fmt.Errorf("%s requires a singular field, %q is repeated (use contains)", op, leaf.Name())
 		}
 		lit, err := literalFor(leaf, raw)
 		if err != nil {
@@ -301,8 +439,8 @@ func compileMsgRule(path []protoreflect.FieldDescriptor, op string, raw any) (ms
 		r.lit = lit
 		return r, nil
 	case "in":
-		if leaf.IsList() || leaf.IsMap() {
-			return r, fmt.Errorf("in requires a singular field, %q is repeated/map", leaf.Name())
+		if leaf.IsList() {
+			return r, fmt.Errorf("in requires a singular field, %q is repeated", leaf.Name())
 		}
 		items, ok := raw.([]any)
 		if !ok {
@@ -323,7 +461,7 @@ func compileMsgRule(path []protoreflect.FieldDescriptor, op string, raw any) (ms
 
 func literalFor(fd protoreflect.FieldDescriptor, raw any) (literal, error) {
 	k := fd.Kind()
-	l := literal{kind: k}
+	l := literal{kind: k, src: fmt.Sprintf("%v", raw)}
 	switch k {
 	case protoreflect.StringKind:
 		s, ok := raw.(string)
@@ -407,7 +545,7 @@ func literalFor(fd protoreflect.FieldDescriptor, raw any) (literal, error) {
 			return l, fmt.Errorf("field %q is an enum, got %T literal", fd.Name(), raw)
 		}
 	default:
-		return l, fmt.Errorf("field %q has kind %s, which structured matchers do not support yet (bytes/message/map matching arrives with CEL in M2)", fd.Name(), k)
+		return l, fmt.Errorf("field %q has kind %s, which structured matchers do not support (use expr for bytes/message/map matching)", fd.Name(), k)
 	}
 	return l, nil
 }

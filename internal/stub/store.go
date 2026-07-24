@@ -1,8 +1,10 @@
 package stub
 
 import (
+	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/yinghanhung/simulacra/internal/match"
 )
@@ -20,17 +22,49 @@ type entry struct {
 	used int
 }
 
+// Miss describes why one registered stub did not select for a request.
+type Miss struct {
+	Source   string
+	Priority int
+	Reasons  []string
+}
+
+// Selection is the result of a selection attempt. On a failed selection,
+// Misses and RegisteredCount are captured from the same locked store state.
+type Selection struct {
+	Selected        *Compiled
+	Misses          []Miss
+	RegisteredCount int
+}
+
+type candidateSnapshot struct {
+	stub *Compiled
+	used int
+}
+
 func NewStore(stubs []*Compiled) *Store {
-	s := &Store{byMethod: make(map[string][]*entry)}
+	return &Store{byMethod: buildIndex(stubs)}
+}
+
+func buildIndex(stubs []*Compiled) map[string][]*entry {
+	byMethod := make(map[string][]*entry)
 	for _, c := range stubs {
-		s.byMethod[c.Method] = append(s.byMethod[c.Method], &entry{stub: c})
+		byMethod[c.Method] = append(byMethod[c.Method], &entry{stub: c})
 	}
-	for _, entries := range s.byMethod {
+	for _, entries := range byMethod {
 		sort.SliceStable(entries, func(i, j int) bool {
 			return entries[i].stub.Priority > entries[j].stub.Priority
 		})
 	}
-	return s
+	return byMethod
+}
+
+// Replace atomically swaps all registered stubs and resets their times budgets.
+func (s *Store) Replace(stubs []*Compiled) {
+	byMethod := buildIndex(stubs)
+	s.mu.Lock()
+	s.byMethod = byMethod
+	s.mu.Unlock()
 }
 
 // Select returns the first live matching stub for the method, or nil.
@@ -49,8 +83,80 @@ func (s *Store) Select(method string, in match.Input) *Compiled {
 	return nil
 }
 
-// CountFor reports how many stubs are registered for a method (regardless
-// of times budget) — used in "no stub matched" error messages.
+// SelectOrExplain atomically selects a live stub or snapshots the failed
+// selection for diagnostics. Matcher explanations run after releasing the
+// store lock and use the same timestamp as the selection attempt.
+func (s *Store) SelectOrExplain(method string, in match.Input) Selection {
+	in = inputWithTime(in)
+	s.mu.Lock()
+	for _, e := range s.byMethod[method] {
+		if e.stub.Times > 0 && e.used >= e.stub.Times {
+			continue
+		}
+		if e.stub.Matches(in) {
+			e.used++
+			s.mu.Unlock()
+			return Selection{Selected: e.stub}
+		}
+	}
+	snapshot := s.snapshotLocked(method)
+	s.mu.Unlock()
+	return Selection{
+		Misses:          explainSnapshot(snapshot, in),
+		RegisteredCount: len(snapshot),
+	}
+}
+
+// Explain ranks the registered stubs that miss an input by ascending number
+// of failed clauses. It is diagnostic only and never consumes a times budget.
+func (s *Store) Explain(method string, in match.Input) []Miss {
+	in = inputWithTime(in)
+	s.mu.Lock()
+	snapshot := s.snapshotLocked(method)
+	s.mu.Unlock()
+	return explainSnapshot(snapshot, in)
+}
+
+func (s *Store) snapshotLocked(method string) []candidateSnapshot {
+	entries := s.byMethod[method]
+	snapshot := make([]candidateSnapshot, len(entries))
+	for i, e := range entries {
+		snapshot[i] = candidateSnapshot{stub: e.stub, used: e.used}
+	}
+	return snapshot
+}
+
+func explainSnapshot(snapshot []candidateSnapshot, in match.Input) []Miss {
+	var misses []Miss
+	for _, candidate := range snapshot {
+		reasons := candidate.stub.Explain(in)
+		if candidate.stub.Times > 0 && candidate.used >= candidate.stub.Times {
+			reasons = append(reasons, fmt.Sprintf("times budget exhausted (%d/%d used)", candidate.used, candidate.stub.Times))
+		}
+		if len(reasons) == 0 {
+			continue
+		}
+		misses = append(misses, Miss{
+			Source:   candidate.stub.Source,
+			Priority: candidate.stub.Priority,
+			Reasons:  reasons,
+		})
+	}
+	sort.SliceStable(misses, func(i, j int) bool {
+		return len(misses[i].Reasons) < len(misses[j].Reasons)
+	})
+	return misses
+}
+
+func inputWithTime(in match.Input) match.Input {
+	if in.Now.IsZero() {
+		in.Now = time.Now()
+	}
+	return in
+}
+
+// CountFor reports how many stubs are registered for a method, regardless of
+// times budget.
 func (s *Store) CountFor(method string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -2,13 +2,22 @@ package match
 
 import (
 	"context"
+	"errors"
 	"math"
+	"strings"
 	"testing"
 
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
+	statuspb "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/reflect/protoregistry"
+	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/dynamicpb"
+	"google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/yinghanhung/simulacra/internal/schema"
 )
@@ -139,6 +148,113 @@ func TestCompileErrors(t *testing.T) {
 	}
 }
 
+func TestStructuredMatcherUnsupportedKindsDiagnostics(t *testing.T) {
+	reg := schema.NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), "../../conformance/protos"); err != nil {
+		t.Fatalf("AddProtoDir: %v", err)
+	}
+	method, err := reg.LookupMethod("conformance.v1.CorpusService/Echo")
+	if err != nil {
+		t.Fatalf("LookupMethod: %v", err)
+	}
+
+	cases := []struct {
+		name      string
+		field     string
+		op        string
+		raw       any
+		want      []string
+		forbidden string
+	}{
+		{
+			name:  "bytes eq recommends expr",
+			field: "blob",
+			op:    "eq",
+			raw:   "AAEC",
+			want:  []string{`message field "blob"`, `field "blob" has kind bytes`, "use expr for bytes/message/map matching"},
+		},
+		{
+			name:  "singular message eq recommends expr",
+			field: "tree",
+			op:    "eq",
+			raw:   map[string]any{"label": "root"},
+			want:  []string{`message field "tree"`, `field "tree" has kind message`, "use expr for bytes/message/map matching"},
+		},
+		{
+			name:      "map eq recommends expr",
+			field:     "items",
+			op:        "eq",
+			raw:       map[string]any{},
+			want:      []string{`message field "items"`, `operator "eq"`, `map field "items"`, "use expr"},
+			forbidden: "use contains",
+		},
+		{
+			name:      "map ne recommends expr",
+			field:     "items",
+			op:        "ne",
+			raw:       map[string]any{},
+			want:      []string{`message field "items"`, `operator "ne"`, `map field "items"`, "use expr"},
+			forbidden: "use contains",
+		},
+		{
+			name:      "map in recommends expr",
+			field:     "items",
+			op:        "in",
+			raw:       []any{map[string]any{}},
+			want:      []string{`message field "items"`, `operator "in"`, `map field "items"`, "use expr"},
+			forbidden: "use contains",
+		},
+		{
+			name:      "map matches recommends expr",
+			field:     "items",
+			op:        "matches",
+			raw:       ".*",
+			want:      []string{`message field "items"`, `operator "matches"`, `map field "items"`, "use expr"},
+			forbidden: "use contains",
+		},
+		{
+			name:      "map contains recommends expr",
+			field:     "items",
+			op:        "contains",
+			raw:       "key",
+			want:      []string{`message field "items"`, `operator "contains"`, `map field "items"`, "use expr"},
+			forbidden: "use contains",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := NewCompiler(nil).Compile(method.Input(), &Block{
+				Message: map[string]Rules{tc.field: {tc.op: tc.raw}},
+			}, Unary)
+			if err == nil {
+				t.Fatal("Compile error = nil, want unsupported structured matcher diagnostic")
+			}
+			got := err.Error()
+			for _, want := range tc.want {
+				if !strings.Contains(got, want) {
+					t.Errorf("Compile error = %q, want substring %q", got, want)
+				}
+			}
+			if tc.forbidden != "" && strings.Contains(got, tc.forbidden) {
+				t.Errorf("Compile error = %q, must not contain %q", got, tc.forbidden)
+			}
+		})
+	}
+}
+
+func TestStructuredMatcherRepeatedFieldDiagnosticRecommendsContains(t *testing.T) {
+	desc := requestDesc(t)
+	_, err := NewCompiler(nil).Compile(desc, &Block{
+		Message: map[string]Rules{"tags": {"eq": "prio"}},
+	}, Unary)
+	if err == nil {
+		t.Fatal("Compile error = nil, want repeated-field diagnostic")
+	}
+	if got := err.Error(); !strings.Contains(got, `eq requires a singular field, "tags" is repeated (use contains)`) {
+		t.Fatalf("Compile error = %q, want repeated-field contains guidance", got)
+	}
+}
+
 func TestShapeValidation(t *testing.T) {
 	desc := requestDesc(t)
 	withMsg := &Block{Message: map[string]Rules{"order_id": {"eq": "x"}}}
@@ -168,5 +284,403 @@ func TestEvalNilMessageFailsMessageRules(t *testing.T) {
 	}
 	if c.Eval(Input{}) {
 		t.Error("message rule matched an input with no message")
+	}
+}
+
+func testFiles(t *testing.T) *protoregistry.Files {
+	t.Helper()
+	reg := schema.NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), "../../testdata/protos"); err != nil {
+		t.Fatal(err)
+	}
+	return reg.Files()
+}
+
+func TestExprMatching(t *testing.T) {
+	desc := requestDesc(t)
+	mc := NewCompiler(testFiles(t))
+	req := `{
+		"order_id": "o-123",
+		"customer": {"id": "c-9", "region": "EU"},
+		"items": [{"sku": "A1", "qty": "3"}, {"sku": "B2", "qty": "1"}],
+		"tags": ["prio", "gift"]
+	}`
+	cases := []struct {
+		name string
+		expr string
+		md   metadata.MD
+		want bool
+	}{
+		{"compound predicate", `message.items.exists(i, i.sku == "A1") && size(message.items) <= 10`, nil, true},
+		{"compound predicate miss", `message.items.exists(i, i.sku == "ZZ")`, nil, false},
+		{"int64 arithmetic", `message.items[0].qty * 2 == 6`, nil, true},
+		{"enum comparison", `message.customer.region == shop.v1.Region.EU`, nil, true},
+		{"metadata multi-value", `'acme' in metadata['x-tenant']`, metadata.Pairs("x-tenant", "other", "x-tenant", "acme"), true},
+		{"metadata guard", `'x-tenant' in metadata && 'acme' in metadata['x-tenant']`, nil, false},
+		{"method variable", `method == "shop.v1.OrderService/GetOrder"`, nil, true},
+		{"eval error is a non-match", `metadata['absent-key'][0] == "x"`, nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := mc.Compile(desc, &Block{Expr: tc.expr}, Unary)
+			if err != nil {
+				t.Fatalf("Compile: %v", err)
+			}
+			in := Input{Method: "shop.v1.OrderService/GetOrder", Metadata: tc.md, Message: msg(t, desc, req)}
+			if got := c.Eval(in); got != tc.want {
+				t.Errorf("Eval = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestExprRegisteredDynamicAny(t *testing.T) {
+	reg := schema.NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), "../../testdata/protos"); err != nil {
+		t.Fatalf("AddProtoDir: %v", err)
+	}
+	method, err := reg.LookupMethod("shop.v1.OrderService/GetOrder")
+	if err != nil {
+		t.Fatalf("LookupMethod: %v", err)
+	}
+	request := dynamicpb.NewMessage(method.Input())
+	if err := (protojson.UnmarshalOptions{Resolver: reg.Types()}).Unmarshal([]byte(`{
+  "payload": {"@type":"type.googleapis.com/shop.v1.AnyInner", "id":"in-1"}
+}`), request); err != nil {
+		t.Fatalf("build registered Any request: %v", err)
+	}
+	compiled, err := NewCompiler(reg.Files()).Compile(method.Input(), &Block{
+		Expr: `message.payload.id == "in-1"`,
+	}, Unary)
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	if !compiled.Eval(Input{Message: request.ProtoReflect()}) {
+		t.Fatal("registered dynamic Any expression did not match")
+	}
+}
+
+func TestExprProcessGlobalAny(t *testing.T) {
+	reg, method := anyExprRegistry(t)
+	envelope, err := anypb.New(&errdetails.ErrorInfo{Reason: "global"})
+	if err != nil {
+		t.Fatalf("pack ErrorInfo: %v", err)
+	}
+	compiled := compileAnyExpr(t, reg, method.Input(), `message.payload.reason == "global"`)
+	if !compiled.Eval(Input{Message: requestWithAny(t, method.Input(), envelope)}) {
+		t.Fatal("process-global registered Any expression did not match")
+	}
+}
+
+func TestExprNestedProcessGlobalAny(t *testing.T) {
+	reg, method := anyExprRegistry(t)
+	detail, err := anypb.New(&errdetails.ErrorInfo{Reason: "nested-global"})
+	if err != nil {
+		t.Fatalf("pack ErrorInfo: %v", err)
+	}
+	envelope, err := anypb.New(&statuspb.Status{Details: []*anypb.Any{detail}})
+	if err != nil {
+		t.Fatalf("pack Status: %v", err)
+	}
+	compiled := compileAnyExpr(t, reg, method.Input(), `message.payload.details[0].reason == "nested-global"`)
+	in := Input{Message: requestWithAny(t, method.Input(), envelope)}
+	if !compiled.Eval(in) {
+		t.Fatalf("nested process-global Any expression did not match: %v", compiled.Explain(in))
+	}
+}
+
+func TestExprSchemaAnyWinsOverProcessGlobal(t *testing.T) {
+	reg, method := anyExprRegistry(t)
+	file, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
+		Name:    proto.String("schema_collision.proto"),
+		Package: proto.String("google.rpc"),
+		Syntax:  proto.String("proto3"),
+		MessageType: []*descriptorpb.DescriptorProto{{
+			Name: proto.String("ErrorInfo"),
+			Field: []*descriptorpb.FieldDescriptorProto{{
+				Name:   proto.String("schema_value"),
+				Number: proto.Int32(1),
+				Label:  descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+				Type:   descriptorpb.FieldDescriptorProto_TYPE_STRING.Enum(),
+			}},
+		}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("build collision descriptor: %v", err)
+	}
+	if err := reg.AddFile(file); err != nil {
+		t.Fatalf("register collision descriptor: %v", err)
+	}
+	desc, err := reg.LookupMessage("google.rpc.ErrorInfo")
+	if err != nil {
+		t.Fatalf("LookupMessage schema ErrorInfo: %v", err)
+	}
+	schemaMessage := dynamicpb.NewMessage(desc)
+	schemaMessage.Set(desc.Fields().ByName("schema_value"), protoreflect.ValueOfString("schema"))
+	envelope := &anypb.Any{
+		TypeUrl: "type.googleapis.com/google.rpc.ErrorInfo",
+		Value:   mustMarshal(t, schemaMessage),
+	}
+	compiled := compileAnyExpr(t, reg, method.Input(), `message.payload.schema_value == "schema"`)
+	if !compiled.Eval(Input{Message: requestWithAny(t, method.Input(), envelope)}) {
+		t.Fatal("schema-local Any did not win over process-global type with the same name")
+	}
+	global, err := protoregistry.GlobalTypes.FindMessageByName("google.rpc.ErrorInfo")
+	if err != nil {
+		t.Fatalf("find process-global ErrorInfo: %v", err)
+	}
+	if global.Descriptor().Fields().ByName("schema_value") != nil {
+		t.Fatal("schema-local collision mutated the process-global type registry")
+	}
+}
+
+func TestExprSchemaWrongKindDoesNotFallBackToProcessGlobalAny(t *testing.T) {
+	reg, method := anyExprRegistry(t)
+	file, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
+		Name:    proto.String("schema_wrong_kind.proto"),
+		Package: proto.String("google.rpc"),
+		Syntax:  proto.String("proto3"),
+		EnumType: []*descriptorpb.EnumDescriptorProto{{
+			Name: proto.String("ErrorInfo"),
+			Value: []*descriptorpb.EnumValueDescriptorProto{{
+				Name:   proto.String("ERROR_INFO_UNSPECIFIED"),
+				Number: proto.Int32(0),
+			}},
+		}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("build wrong-kind collision descriptor: %v", err)
+	}
+	if err := reg.AddFile(file); err != nil {
+		t.Fatalf("register wrong-kind collision descriptor: %v", err)
+	}
+	envelope, err := anypb.New(&errdetails.ErrorInfo{Reason: "global"})
+	if err != nil {
+		t.Fatalf("pack process-global ErrorInfo: %v", err)
+	}
+	compiled := compileAnyExpr(t, reg, method.Input(), `message.payload.reason == "global"`)
+	in := Input{Message: requestWithAny(t, method.Input(), envelope)}
+	if compiled.Eval(in) {
+		t.Fatal("schema-local enum collision silently fell back to process-global message")
+	}
+	diagnostic := strings.Join(compiled.Explain(in), "\n")
+	if !strings.Contains(diagnostic, "wrong type") || !strings.Contains(diagnostic, "want message") {
+		t.Fatalf("wrong-kind Any diagnostic = %q, want schema type error", diagnostic)
+	}
+}
+
+func TestRegistryFirstTypesFallbackOnlyOnNotFound(t *testing.T) {
+	files := new(protoregistry.Files)
+	file, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
+		Name:    proto.String("resolver_wrong_kinds.proto"),
+		Package: proto.String("google.rpc"),
+		Syntax:  proto.String("proto3"),
+		EnumType: []*descriptorpb.EnumDescriptorProto{{
+			Name: proto.String("ErrorInfo"),
+			Value: []*descriptorpb.EnumValueDescriptorProto{{
+				Name:   proto.String("ERROR_INFO_UNSPECIFIED"),
+				Number: proto.Int32(0),
+			}},
+		}},
+		MessageType: []*descriptorpb.DescriptorProto{{Name: proto.String("DebugInfo")}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("build resolver descriptors: %v", err)
+	}
+	if err := files.RegisterFile(file); err != nil {
+		t.Fatalf("register resolver descriptors: %v", err)
+	}
+	resolver := &registryFirstTypes{dynamic: dynamicpb.NewTypes(files)}
+	if _, err := resolver.FindMessageByName("google.rpc.ErrorInfo"); err == nil || errors.Is(err, protoregistry.NotFound) {
+		t.Fatalf("FindMessageByName wrong-kind error = %v, want non-NotFound error", err)
+	}
+	if _, err := resolver.FindMessageByURL("type.googleapis.com/google.rpc.ErrorInfo"); err == nil || errors.Is(err, protoregistry.NotFound) {
+		t.Fatalf("FindMessageByURL wrong-kind error = %v, want non-NotFound error", err)
+	}
+	if _, err := resolver.FindExtensionByName("google.rpc.DebugInfo"); err == nil || errors.Is(err, protoregistry.NotFound) {
+		t.Fatalf("FindExtensionByName wrong-kind error = %v, want non-NotFound error", err)
+	}
+	if _, err := resolver.FindMessageByName("google.rpc.DebugInfo"); err != nil {
+		t.Fatalf("FindMessageByName schema message: %v", err)
+	}
+	if _, err := resolver.FindMessageByName("google.rpc.Status"); err != nil {
+		t.Fatalf("FindMessageByName global fallback: %v", err)
+	}
+}
+
+func TestExprDynamicProto2Extension(t *testing.T) {
+	reg := schema.NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), "../../conformance/protos"); err != nil {
+		t.Fatalf("AddProtoDir: %v", err)
+	}
+	method, err := reg.LookupMethod("conformance.v1.LegacyService/Make")
+	if err != nil {
+		t.Fatalf("LookupMethod: %v", err)
+	}
+	extensionType, err := reg.Types().FindExtensionByName("conformance.v1.ext_tag")
+	if err != nil {
+		t.Fatalf("FindExtensionByName: %v", err)
+	}
+	extension := extensionType.TypeDescriptor()
+
+	t.Run("set", func(t *testing.T) {
+		message := dynamicpb.NewMessage(method.Input())
+		message.Set(extension, protoreflect.ValueOfString("tagged"))
+		compiled := compileAnyExpr(t, reg, method.Input(), "message.`conformance.v1.ext_tag` == 'tagged' && has(message.`conformance.v1.ext_tag`)")
+		if !compiled.Eval(Input{Message: message}) {
+			t.Fatalf("set extension expression did not match: %v", compiled.Explain(Input{Message: message}))
+		}
+	})
+
+	t.Run("unset", func(t *testing.T) {
+		message := dynamicpb.NewMessage(method.Input())
+		compiled := compileAnyExpr(t, reg, method.Input(), "message.`conformance.v1.ext_tag` == '' && !has(message.`conformance.v1.ext_tag`)")
+		if !compiled.Eval(Input{Message: message}) {
+			t.Fatalf("unset extension expression did not match: %v", compiled.Explain(Input{Message: message}))
+		}
+	})
+
+	t.Run("runtime descriptor copy", func(t *testing.T) {
+		fileProto := protodesc.ToFileDescriptorProto(method.Input().ParentFile())
+		fileCopy, err := protodesc.NewFile(fileProto, nil)
+		if err != nil {
+			t.Fatalf("clone legacy descriptor: %v", err)
+		}
+		messageDesc := fileCopy.Messages().ByName("LegacyReply")
+		runtimeExtension := dynamicpb.NewExtensionType(fileCopy.Extensions().ByName("ext_tag")).TypeDescriptor()
+		message := dynamicpb.NewMessage(messageDesc)
+		message.Set(runtimeExtension, protoreflect.ValueOfString("copied"))
+		compiled := compileAnyExpr(t, reg, method.Input(), "message.`conformance.v1.ext_tag` == 'copied' && has(message.`conformance.v1.ext_tag`)")
+		if !compiled.Eval(Input{Message: message}) {
+			t.Fatalf("copied-descriptor extension expression did not match: %v", compiled.Explain(Input{Message: message}))
+		}
+	})
+
+	t.Run("inside registered Any", func(t *testing.T) {
+		if err := reg.AddProtoDir(context.Background(), "../../testdata/protos"); err != nil {
+			t.Fatalf("AddProtoDir test schema: %v", err)
+		}
+		orderMethod, err := reg.LookupMethod("shop.v1.OrderService/GetOrder")
+		if err != nil {
+			t.Fatalf("LookupMethod OrderService/GetOrder: %v", err)
+		}
+		legacyReply := dynamicpb.NewMessage(method.Input())
+		legacyReply.Set(extension, protoreflect.ValueOfString("in-any"))
+		envelope := &anypb.Any{
+			TypeUrl: "type.googleapis.com/conformance.v1.LegacyReply",
+			Value:   mustMarshal(t, legacyReply),
+		}
+		compiled := compileAnyExpr(t, reg, orderMethod.Input(), "message.payload.`conformance.v1.ext_tag` == 'in-any' && has(message.payload.`conformance.v1.ext_tag`)")
+		in := Input{Message: requestWithAny(t, orderMethod.Input(), envelope)}
+		if !compiled.Eval(in) {
+			t.Fatalf("registered Any extension expression did not match: %v", compiled.Explain(in))
+		}
+	})
+}
+
+func TestExprUnknownAnyIsNonMatchWithDiagnostic(t *testing.T) {
+	reg, method := anyExprRegistry(t)
+	compiled := compileAnyExpr(t, reg, method.Input(), `message.payload.id == "x"`)
+	in := Input{Message: requestWithAny(t, method.Input(), &anypb.Any{
+		TypeUrl: "type.googleapis.com/acme.Unknown",
+		Value:   []byte{1, 2, 3},
+	})}
+	if compiled.Eval(in) {
+		t.Fatal("truly unknown Any unexpectedly matched")
+	}
+	diagnostic := strings.Join(compiled.Explain(in), "\n")
+	if !strings.Contains(diagnostic, "acme.Unknown") || !strings.Contains(diagnostic, "resolving") {
+		t.Fatalf("unknown Any diagnostic = %q, want type name and resolver failure", diagnostic)
+	}
+}
+
+func anyExprRegistry(t *testing.T) (*schema.Registry, protoreflect.MethodDescriptor) {
+	t.Helper()
+	reg := schema.NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), "../../testdata/protos"); err != nil {
+		t.Fatalf("AddProtoDir: %v", err)
+	}
+	method, err := reg.LookupMethod("shop.v1.OrderService/GetOrder")
+	if err != nil {
+		t.Fatalf("LookupMethod: %v", err)
+	}
+	return reg, method
+}
+
+func compileAnyExpr(t *testing.T, reg *schema.Registry, input protoreflect.MessageDescriptor, expression string) *Compiled {
+	t.Helper()
+	compiled, err := NewCompiler(reg.Files()).Compile(input, &Block{Expr: expression}, Unary)
+	if err != nil {
+		t.Fatalf("Compile(%s): %v", expression, err)
+	}
+	return compiled
+}
+
+func requestWithAny(t *testing.T, input protoreflect.MessageDescriptor, envelope *anypb.Any) protoreflect.Message {
+	t.Helper()
+	request := dynamicpb.NewMessage(input)
+	payloadField := input.Fields().ByName("payload")
+	payload := request.Mutable(payloadField).Message()
+	payload.Set(payload.Descriptor().Fields().ByName("type_url"), protoreflect.ValueOfString(envelope.TypeUrl))
+	payload.Set(payload.Descriptor().Fields().ByName("value"), protoreflect.ValueOfBytes(envelope.Value))
+	return request.ProtoReflect()
+}
+
+func mustMarshal(t *testing.T, message proto.Message) []byte {
+	t.Helper()
+	data, err := proto.Marshal(message)
+	if err != nil {
+		t.Fatalf("proto.Marshal %s: %v", message.ProtoReflect().Descriptor().FullName(), err)
+	}
+	return data
+}
+
+func TestExprMessagesForClientStream(t *testing.T) {
+	desc := requestDesc(t)
+	mc := NewCompiler(testFiles(t))
+	c, err := mc.Compile(desc, &Block{Expr: `size(messages) == 2 && messages.exists(m, m.order_id == "o-1")`}, ClientStream)
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	in := Input{Messages: []protoreflect.Message{
+		msg(t, desc, `{"order_id":"o-1"}`),
+		msg(t, desc, `{"order_id":"o-2"}`),
+	}}
+	if !c.Eval(in) {
+		t.Error("Eval = false, want true")
+	}
+	if c.Eval(Input{Messages: in.Messages[:1]}) {
+		t.Error("Eval with one message = true, want false")
+	}
+}
+
+func TestExprCompileErrors(t *testing.T) {
+	desc := requestDesc(t)
+	mc := NewCompiler(testFiles(t))
+	cases := []struct {
+		name  string
+		expr  string
+		shape Shape
+	}{
+		{"not a bool", `size(message.items)`, Unary},
+		{"unknown field", `message.no_such_field == 1`, Unary},
+		{"syntax error", `message.order_id ==`, Unary},
+		{"message var absent for client-streaming", `message.order_id == "x"`, ClientStream},
+		{"messages var absent for unary", `size(messages) > 0`, Unary},
+		{"message var absent at bidi open", `message.order_id == "x"`, Bidi},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := mc.Compile(desc, &Block{Expr: tc.expr}, tc.shape); err == nil {
+				t.Error("expected compile error, got nil")
+			}
+		})
+	}
+}
+
+func TestExprWithoutFilesFails(t *testing.T) {
+	desc := requestDesc(t)
+	if _, err := NewCompiler(nil).Compile(desc, &Block{Expr: `true`}, Unary); err == nil {
+		t.Error("expected error compiling expr without descriptor files")
 	}
 }

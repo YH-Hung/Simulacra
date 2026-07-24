@@ -1,0 +1,41 @@
+syntax = "proto2";
+
+package conformance.v1;
+
+message LegacyThing {
+  required string name = 1;
+  optional int32 level = 2 [default = 7];
+  optional group Detail = 3 {
+    required string code = 4;
+  }
+}
+
+message LegacyReply {
+  optional string note = 1;
+  extensions 100 to 199;
+}
+
+extend LegacyReply {
+  optional string ext_tag = 100;
+}
+
+message RequiredPayload {
+  required string name = 1;
+}
+
+message RequiredContainer {
+  map<int32, RequiredPayload> by_number = 1;
+  map<bool, RequiredPayload> by_flag = 2;
+  map<uint32, RequiredPayload> by_unsigned = 3;
+  extensions 100 to 199;
+}
+
+extend RequiredContainer {
+  optional RequiredPayload ext_payload = 100;
+}
+
+service LegacyService {
+  rpc Fetch(LegacyThing) returns (LegacyReply);
+  rpc Make(LegacyReply) returns (LegacyThing);
+  rpc Container(LegacyReply) returns (RequiredContainer);
+}

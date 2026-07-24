@@ -44,6 +44,7 @@ func LoadDirs(reg *schema.Registry, dirs []string) ([]*Compiled, []error) {
 	sort.Strings(paths)
 
 	var out []*Compiled
+	compiler := NewCompiler(reg)
 	for _, path := range paths {
 		stubs, err := parseFile(path)
 		if err != nil {
@@ -52,7 +53,7 @@ func LoadDirs(reg *schema.Registry, dirs []string) ([]*Compiled, []error) {
 		}
 		for i, s := range stubs {
 			source := fmt.Sprintf("%s#%d", path, i)
-			c, err := Compile(reg, s, source)
+			c, err := compiler.Compile(s, source)
 			if err != nil {
 				errs = append(errs, err)
 				continue

@@ -4,8 +4,13 @@
 package dataplane
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
 	"net"
 	"strings"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -16,8 +21,10 @@ import (
 	v1reflectionpb "google.golang.org/grpc/reflection/grpc_reflection_v1"
 	v1alphareflectionpb "google.golang.org/grpc/reflection/grpc_reflection_v1alpha"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/dynamicpb"
 
+	"github.com/yinghanhung/simulacra/internal/journal"
 	"github.com/yinghanhung/simulacra/internal/match"
 	"github.com/yinghanhung/simulacra/internal/schema"
 	"github.com/yinghanhung/simulacra/internal/stub"
@@ -26,14 +33,15 @@ import (
 type Server struct {
 	reg   *schema.Registry
 	store *stub.Store
+	calls *journal.Journal
 	grpc  *grpc.Server
 }
 
-func New(reg *schema.Registry, store *stub.Store) (*Server, error) {
-	s := &Server{reg: reg, store: store}
+func New(reg *schema.Registry, store *stub.Store, calls *journal.Journal) (*Server, error) {
+	s := &Server{reg: reg, store: store, calls: calls}
 	s.grpc = grpc.NewServer(grpc.UnknownServiceHandler(s.handleUnknown))
 
-	// Health: standard grpc.health.v1 protocol, always SERVING in M1.
+	// Health: standard grpc.health.v1 protocol, always SERVING.
 	hs := health.NewServer()
 	healthpb.RegisterHealthServer(s.grpc, hs)
 	hs.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
@@ -73,32 +81,274 @@ func (s *Server) GracefulStop() { s.grpc.GracefulStop() }
 // Stop aborts all connections immediately.
 func (s *Server) Stop() { s.grpc.Stop() }
 
-func (s *Server) handleUnknown(_ any, stream grpc.ServerStream) error {
+func (s *Server) handleUnknown(_ any, stream grpc.ServerStream) (err error) {
+	call := &journal.Call{Start: time.Now()}
+	defer func() {
+		panicked := recover()
+		call.Duration = time.Since(call.Start)
+		if panicked != nil {
+			call.Err = status.New(codes.Internal, fmt.Sprintf("simulacra: panic serving call: %v", panicked))
+		} else if err != nil {
+			call.Err = status.Convert(err)
+		}
+		if s.calls != nil {
+			s.calls.Record(call)
+		}
+		if panicked != nil {
+			panic(panicked)
+		}
+	}()
+	md, _ := metadata.FromIncomingContext(stream.Context())
+	call.Metadata = md.Copy()
+
 	full, ok := grpc.MethodFromServerStream(stream)
 	if !ok {
 		return status.Error(codes.Internal, "simulacra: no method name on stream")
 	}
+	call.Method = full
 	m, err := s.reg.LookupMethod(full)
 	if err != nil {
 		return status.Errorf(codes.Unimplemented, "simulacra: %v", err)
 	}
-	if m.IsStreamingClient() || m.IsStreamingServer() {
-		return status.Errorf(codes.Unimplemented,
-			"simulacra: %s is a streaming method; this build supports unary methods only (streaming lands in M2)", full)
+	in := match.Input{Method: strings.TrimPrefix(full, "/"), Metadata: md}
+
+	switch match.ShapeOf(m) {
+	case match.Unary:
+		return s.unary(stream, full, m, in, call)
+	case match.ServerStream:
+		return s.serverStream(stream, full, m, in, call)
+	case match.ClientStream:
+		return s.clientStream(stream, full, m, in, call)
+	case match.Bidi:
+		return s.bidi(stream, full, m, in, call)
+	default:
+		return status.Errorf(codes.Internal, "simulacra: unsupported method shape for %s", full)
+	}
+}
+
+func (s *Server) bidi(stream grpc.ServerStream, full string, method protoreflect.MethodDescriptor, in match.Input, call *journal.Call) error {
+	if in.Messages == nil {
+		in.Messages = []protoreflect.Message{}
+	}
+	selection := s.store.SelectOrExplain(full, in)
+	if selection.Selected == nil {
+		return s.noMatch(full, selection.Misses, selection.RegisteredCount)
+	}
+	selected := selection.Selected
+	call.StubSource = selected.Source
+	plan := selected.Plan()
+	if len(plan.Trailer) > 0 {
+		stream.SetTrailer(plan.Trailer)
+	}
+	if len(plan.Header) > 0 {
+		if err := stream.SendHeader(plan.Header); err != nil {
+			return err
+		}
+	}
+	if err := runSteps(stream.Context(), stream, plan.OnOpen, in, call); err != nil {
+		return err
 	}
 
-	req := dynamicpb.NewMessage(m.Input())
+	for {
+		message := dynamicpb.NewMessage(method.Input())
+		err := stream.RecvMsg(message)
+		if err == io.EOF {
+			if plan.OnClose == nil {
+				return nil
+			}
+			return plan.OnClose.Err()
+		}
+		if err != nil {
+			return receiveError(err)
+		}
+		call.Requests = append(call.Requests, message)
+		in.Message = message.ProtoReflect()
+		in.Messages = append(in.Messages, in.Message)
+		for _, rule := range plan.Rules {
+			if !rule.Matcher.Eval(in) {
+				continue
+			}
+			if err := runSteps(stream.Context(), stream, rule.Send, in, call); err != nil {
+				return err
+			}
+			break
+		}
+	}
+}
+
+func (s *Server) clientStream(stream grpc.ServerStream, full string, method protoreflect.MethodDescriptor, in match.Input, call *journal.Call) error {
+	if in.Messages == nil {
+		in.Messages = []protoreflect.Message{}
+	}
+	for {
+		message := dynamicpb.NewMessage(method.Input())
+		err := stream.RecvMsg(message)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return receiveError(err)
+		}
+		call.Requests = append(call.Requests, message)
+		in.Messages = append(in.Messages, message.ProtoReflect())
+	}
+
+	selection := s.store.SelectOrExplain(full, in)
+	if selection.Selected == nil {
+		return s.noMatch(full, selection.Misses, selection.RegisteredCount)
+	}
+	selected := selection.Selected
+	call.StubSource = selected.Source
+	if err := applyMetadata(stream, selected.Plan()); err != nil {
+		return err
+	}
+	return sendSingle(stream, selected.Plan(), in, call)
+}
+
+func (s *Server) unary(stream grpc.ServerStream, full string, method protoreflect.MethodDescriptor, in match.Input, call *journal.Call) error {
+	req, err := receiveSingleRequest(stream, method, "unary", call)
+	if err != nil {
+		return err
+	}
+	in.Message = req.ProtoReflect()
+	selection := s.store.SelectOrExplain(full, in)
+	if selection.Selected == nil {
+		return s.noMatch(full, selection.Misses, selection.RegisteredCount)
+	}
+	selected := selection.Selected
+	call.StubSource = selected.Source
+	if err := applyMetadata(stream, selected.Plan()); err != nil {
+		return err
+	}
+	return sendSingle(stream, selected.Plan(), in, call)
+}
+
+func (s *Server) serverStream(stream grpc.ServerStream, full string, method protoreflect.MethodDescriptor, in match.Input, call *journal.Call) error {
+	req, err := receiveSingleRequest(stream, method, "server-streaming", call)
+	if err != nil {
+		return err
+	}
+	in.Message = req.ProtoReflect()
+	selection := s.store.SelectOrExplain(full, in)
+	if selection.Selected == nil {
+		return s.noMatch(full, selection.Misses, selection.RegisteredCount)
+	}
+	selected := selection.Selected
+	call.StubSource = selected.Source
+	plan := selected.Plan()
+	if err := applyMetadata(stream, plan); err != nil {
+		return err
+	}
+	if plan.Delay != nil {
+		if err := plan.Delay.Wait(stream.Context()); err != nil {
+			return contextError(stream.Context(), err)
+		}
+	}
+	return runSteps(stream.Context(), stream, plan.Stream, in, call)
+}
+
+func receiveSingleRequest(stream grpc.ServerStream, method protoreflect.MethodDescriptor, shape string, call *journal.Call) (*dynamicpb.Message, error) {
+	req := dynamicpb.NewMessage(method.Input())
 	if err := stream.RecvMsg(req); err != nil {
-		return status.Errorf(codes.Internal, "simulacra: receiving request: %v", err)
+		if err == io.EOF {
+			return nil, status.Errorf(codes.Internal, "simulacra: missing request for %s RPC", shape)
+		}
+		return nil, receiveError(err)
 	}
-	md, _ := metadata.FromIncomingContext(stream.Context())
+	call.Requests = append(call.Requests, req)
+	extra := dynamicpb.NewMessage(method.Input())
+	if err := stream.RecvMsg(extra); err != io.EOF {
+		if err == nil {
+			call.Requests = append(call.Requests, extra)
+			return nil, status.Errorf(codes.Internal, "simulacra: %s request cardinality violation: received more than one request", shape)
+		}
+		return nil, receiveError(err)
+	}
+	return req, nil
+}
 
-	in := match.Input{Method: strings.TrimPrefix(full, "/"), Metadata: md, Message: req.ProtoReflect()}
-	selected := s.store.Select(full, in)
-	if selected == nil {
-		return status.Errorf(codes.NotFound,
-			"simulacra: no stub matched %s (%d stub(s) registered for this method)",
-			full, s.store.CountFor(full))
+func receiveError(err error) error {
+	return status.Errorf(status.Convert(err).Code(), "simulacra: receiving request: %v", err)
+}
+
+func contextError(ctx context.Context, err error) error {
+	if deadline, ok := ctx.Deadline(); errors.Is(err, context.Canceled) && ok && !time.Now().Before(deadline) {
+		return status.FromContextError(context.DeadlineExceeded).Err()
 	}
-	return stream.SendMsg(selected.Response())
+	return status.FromContextError(err).Err()
+}
+
+func applyMetadata(stream grpc.ServerStream, plan *stub.Plan) error {
+	if len(plan.Header) > 0 {
+		if err := stream.SetHeader(plan.Header); err != nil {
+			return status.Errorf(codes.Internal, "simulacra: setting response headers: %v", err)
+		}
+	}
+	if len(plan.Trailer) > 0 {
+		stream.SetTrailer(plan.Trailer)
+	}
+	return nil
+}
+
+func sendSingle(stream grpc.ServerStream, plan *stub.Plan, in match.Input, call *journal.Call) error {
+	if plan.Delay != nil {
+		if err := plan.Delay.Wait(stream.Context()); err != nil {
+			return contextError(stream.Context(), err)
+		}
+	}
+	if plan.Status != nil {
+		return plan.Status.Err()
+	}
+	response, err := plan.Message.Render(in)
+	if err != nil {
+		return status.Errorf(codes.Internal, "simulacra: rendering response: %v", err)
+	}
+	// Responses are rendered attempts, retained even if the transport send fails.
+	call.Responses = append(call.Responses, response)
+	return stream.SendMsg(response)
+}
+
+type messageSender interface {
+	SendMsg(any) error
+}
+
+func runSteps(ctx context.Context, sender messageSender, steps []stub.Step, in match.Input, call *journal.Call) error {
+	for _, step := range steps {
+		if step.Delay != nil {
+			if err := step.Delay.Wait(ctx); err != nil {
+				return contextError(ctx, err)
+			}
+		}
+		if step.Status != nil {
+			return step.Status.Err()
+		}
+		message, err := step.Message.Render(in)
+		if err != nil {
+			return status.Errorf(codes.Internal, "simulacra: rendering response: %v", err)
+		}
+		// Responses are rendered attempts, retained even if the transport send fails.
+		call.Responses = append(call.Responses, message)
+		if err := sender.SendMsg(message); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) noMatch(full string, misses []stub.Miss, registeredCount int) error {
+	message := fmt.Sprintf(
+		"simulacra: no stub matched %s (%d stub(s) registered for this method)",
+		full, registeredCount,
+	)
+	limit := len(misses)
+	if limit > 3 {
+		limit = 3
+	}
+	for _, miss := range misses[:limit] {
+		message += fmt.Sprintf("; %s (priority %d): %s", miss.Source, miss.Priority, strings.Join(miss.Reasons, "; "))
+	}
+	if len(misses) > limit {
+		message += "; …"
+	}
+	return status.Error(codes.NotFound, message)
 }
