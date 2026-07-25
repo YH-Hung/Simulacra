@@ -3,21 +3,14 @@ package cli
 import (
 	"bytes"
 	"context"
-	"errors"
-	"fmt"
 	"net"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/spf13/cobra"
-
-	"github.com/yinghanhung/simulacra/internal/match"
-	"github.com/yinghanhung/simulacra/internal/stub"
 )
 
 func TestServeJournalSizeFlagDefaultsTo1024(t *testing.T) {
@@ -122,101 +115,6 @@ func (w *notifyWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func TestReloadStubDirsKeepsInvalidStoreAndResetsValidBudget(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "stub.yaml")
-	write := func(body string) {
-		t.Helper()
-		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	valid := `
-- method: shop.v1.OrderService/GetOrder
-  times: 1
-  respond: { message: { note: fresh } }
-`
-	write(valid)
-	src := &sources{protoDirs: []string{"../../testdata/protos"}}
-	reg, err := src.buildRegistry(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	initial, errs := stub.LoadDirs(reg, []string{dir})
-	if len(errs) != 0 {
-		t.Fatal(errs)
-	}
-	store := stub.NewStore(initial)
-	const method = "/shop.v1.OrderService/GetOrder"
-	if got := store.Select(method, match.Input{}); got == nil {
-		t.Fatal("initial Select = nil, want limited stub")
-	}
-
-	cmd := &cobra.Command{}
-	var output bytes.Buffer
-	cmd.SetOut(&output)
-	cmd.SetErr(&output)
-	write("{{{ invalid yaml")
-	reloadStubDirs(cmd, reg, store, []string{dir})
-	if got := store.Select(method, match.Input{}); got != nil {
-		t.Fatalf("Select after invalid reload = %v, want old exhausted store", got)
-	}
-	if !strings.Contains(output.String(), "stub error:") {
-		t.Fatalf("invalid reload output = %q, want stub error", output.String())
-	}
-
-	output.Reset()
-	write(valid)
-	reloadStubDirs(cmd, reg, store, []string{dir})
-	if got := store.Select(method, match.Input{}); got == nil {
-		t.Fatal("Select after valid reload = nil, want reset times budget")
-	}
-	if !strings.Contains(output.String(), "1 stub(s) reloaded") {
-		t.Fatalf("valid reload output = %q, want count", output.String())
-	}
-}
-
-func TestReloadStubDirsContextDoesNothingAfterCancellation(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "stub.yaml")
-	if err := os.WriteFile(path, []byte(`
-- method: shop.v1.OrderService/GetOrder
-  times: 1
-  respond: { message: {} }
-`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	src := &sources{protoDirs: []string{"../../testdata/protos"}}
-	reg, err := src.buildRegistry(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	initial, errs := stub.LoadDirs(reg, []string{dir})
-	if len(errs) != 0 {
-		t.Fatal(errs)
-	}
-	store := stub.NewStore(initial)
-	const method = "/shop.v1.OrderService/GetOrder"
-	if store.Select(method, match.Input{}) == nil {
-		t.Fatal("initial limited stub did not select")
-	}
-
-	cmd := &cobra.Command{}
-	var output bytes.Buffer
-	cmd.SetOut(&output)
-	cmd.SetErr(&output)
-	printer := &commandOutput{cmd: cmd}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	reloadStubDirsContext(ctx, printer, reg, store, []string{dir})
-	if got := store.Select(method, match.Input{}); got != nil {
-		t.Fatalf("Select after canceled reload = %v, want exhausted original store", got)
-	}
-	if output.Len() != 0 {
-		t.Fatalf("canceled reload output = %q, want none", output.String())
-	}
-}
-
 func TestCommandOutputSerializesConcurrentWrites(t *testing.T) {
 	cmd := &cobra.Command{}
 	var buffer bytes.Buffer
@@ -235,257 +133,6 @@ func TestCommandOutputSerializesConcurrentWrites(t *testing.T) {
 	wg.Wait()
 }
 
-func TestStartStubWatcherReconcilesMutationBeforeReady(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "stub.yaml")
-	write := func(times int) {
-		t.Helper()
-		body := `
-- method: shop.v1.OrderService/GetOrder
-  times: ` + fmt.Sprint(times) + `
-  respond: { message: {} }
-`
-		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	write(1)
-	src := &sources{protoDirs: []string{"../../testdata/protos"}}
-	reg, err := src.buildRegistry(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	initial, loadErrs := stub.LoadDirs(reg, []string{dir})
-	if len(loadErrs) != 0 {
-		t.Fatal(loadErrs)
-	}
-	store := stub.NewStore(initial)
-	const method = "/shop.v1.OrderService/GetOrder"
-	if store.Select(method, match.Input{}) == nil {
-		t.Fatal("initial limited stub did not select")
-	}
-
-	cmd := &cobra.Command{}
-	cmd.SetOut(&bytes.Buffer{})
-	cmd.SetErr(&bytes.Buffer{})
-	ctx, cancel := context.WithCancel(context.Background())
-	watch := func(ctx context.Context, _ []string, opts stub.WatchOptions) error {
-		write(2) // mutation after the initial load but before watches report ready
-		opts.Ready()
-		<-ctx.Done()
-		return nil
-	}
-	reconcile := func(reloadCtx context.Context) error {
-		_, err := reconcileStubDirsContext(reloadCtx, &commandOutput{cmd: cmd}, reg, store, []string{dir}, true)
-		return err
-	}
-	watcher, err := startStubWatcher(ctx, []string{dir}, &commandOutput{cmd: cmd}, func(reloadCtx context.Context) {
-		_ = reconcile(reloadCtx)
-	}, reconcile, watch)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if store.Select(method, match.Input{}) == nil {
-		t.Fatal("startup reconciliation did not install mutation made before watcher readiness")
-	}
-	cancel()
-	watcher.stop()
-}
-
-func TestStartStubWatcherReturnsStartupReconciliationError(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "stub.yaml")
-	if err := os.WriteFile(path, []byte(`
-- method: shop.v1.OrderService/GetOrder
-  respond: { message: {} }
-`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	src := &sources{protoDirs: []string{"../../testdata/protos"}}
-	reg, err := src.buildRegistry(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	initial, loadErrs := stub.LoadDirs(reg, []string{dir})
-	if len(loadErrs) != 0 {
-		t.Fatal(loadErrs)
-	}
-	store := stub.NewStore(initial)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	exited := make(chan struct{})
-	watch := func(ctx context.Context, _ []string, opts stub.WatchOptions) error {
-		if err := os.WriteFile(path, []byte("{{{ invalid yaml"), 0o644); err != nil {
-			return err
-		}
-		opts.Ready()
-		<-ctx.Done()
-		close(exited)
-		return nil
-	}
-	reconcile := func(reloadCtx context.Context) error {
-		_, err := reconcileStubDirsContext(reloadCtx, discardReloadOutput{}, reg, store, []string{dir}, false)
-		return err
-	}
-	watcher, err := startStubWatcher(ctx, []string{dir}, discardReloadOutput{}, func(context.Context) {}, reconcile, watch)
-	if watcher.cancel != nil {
-		defer watcher.stop()
-	}
-	if err == nil {
-		t.Fatal("startStubWatcher error = nil, want startup reconciliation error")
-	}
-	select {
-	case <-exited:
-	default:
-		t.Fatal("startStubWatcher returned startup reconciliation error without joining watcher")
-	}
-}
-
-func TestStartStubWatcherReturnsInitialAttachError(t *testing.T) {
-	want := errors.New("attach denied")
-	watch := func(context.Context, []string, stub.WatchOptions) error { return want }
-	_, err := startStubWatcher(context.Background(), []string{"stubs"}, discardReloadOutput{}, func(context.Context) {}, func(context.Context) error { return nil }, watch)
-	if !errors.Is(err, want) {
-		t.Fatalf("startStubWatcher error = %v, want attach error", err)
-	}
-}
-
-func TestStartStubWatcherCancellationDuringStartupJoinsWatcher(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	entered := make(chan struct{})
-	exited := make(chan struct{})
-	watch := func(ctx context.Context, _ []string, _ stub.WatchOptions) error {
-		close(entered)
-		<-ctx.Done()
-		close(exited)
-		return nil
-	}
-	result := make(chan error, 1)
-	go func() {
-		_, err := startStubWatcher(ctx, []string{"stubs"}, discardReloadOutput{}, func(context.Context) {}, func(context.Context) error { return nil }, watch)
-		result <- err
-	}()
-	<-entered
-	cancel()
-	select {
-	case err := <-result:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("startStubWatcher error = %v, want context.Canceled", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("startStubWatcher did not return after startup cancellation")
-	}
-	select {
-	case <-exited:
-	default:
-		t.Fatal("startStubWatcher returned without joining watcher goroutine")
-	}
-}
-
-func TestStartStubWatcherSerializesStartupReconcileBeforeCallbacks(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	startupEntered := make(chan struct{})
-	releaseStartup := make(chan struct{})
-	triggerChange := make(chan struct{})
-	callbackDone := make(chan struct{})
-	var installed atomic.Int32
-	watch := func(ctx context.Context, _ []string, opts stub.WatchOptions) error {
-		opts.Ready()
-		<-triggerChange
-		opts.OnChange(ctx)
-		close(callbackDone)
-		<-ctx.Done()
-		return nil
-	}
-	result := make(chan watcherRun, 1)
-	errs := make(chan error, 1)
-	go func() {
-		watcher, err := startStubWatcher(ctx, []string{"stubs"}, discardReloadOutput{}, func(context.Context) {
-			installed.Store(2)
-		}, func(context.Context) error {
-			close(startupEntered)
-			<-releaseStartup
-			installed.Store(1)
-			return nil
-		}, watch)
-		if err != nil {
-			errs <- err
-			return
-		}
-		result <- watcher
-	}()
-	<-startupEntered
-	close(triggerChange)
-	select {
-	case <-callbackDone:
-		t.Fatal("watch callback overlapped startup reconciliation")
-	case <-time.After(30 * time.Millisecond):
-	}
-	close(releaseStartup)
-	var watcher watcherRun
-	select {
-	case watcher = <-result:
-	case err := <-errs:
-		t.Fatal(err)
-	case <-time.After(time.Second):
-		t.Fatal("startStubWatcher did not return")
-	}
-	select {
-	case <-callbackDone:
-	case <-time.After(time.Second):
-		t.Fatal("queued watch callback did not run after startup reconciliation")
-	}
-	if got := installed.Load(); got != 2 {
-		t.Fatalf("installed version = %d, want newer callback version 2", got)
-	}
-	watcher.stop()
-}
-
-type discardReloadOutput struct{}
-
-func (discardReloadOutput) Printf(string, ...any) {}
-func (discardReloadOutput) PrintErrln(...any)     {}
-
-func TestServeWithRuntimeStopsAndJoinsWatcherOnServeReturn(t *testing.T) {
-	started := make(chan struct{})
-	canceled := make(chan struct{})
-	release := make(chan struct{})
-	watcher := startWatcher(context.Background(), func(ctx context.Context) error {
-		close(started)
-		<-ctx.Done()
-		close(canceled)
-		<-release
-		return nil
-	}, func(error) {})
-	<-started
-
-	returned := make(chan struct{})
-	shutdownDone := make(chan struct{})
-	close(shutdownDone)
-	go func() {
-		_ = serveWithRuntime(watcher, func() {}, shutdownDone, func() error { return nil })
-		close(returned)
-	}()
-	select {
-	case <-canceled:
-	case <-time.After(time.Second):
-		t.Fatal("watcher was not canceled when Serve returned")
-	}
-	select {
-	case <-returned:
-		t.Fatal("serveWithWatcher returned before watcher goroutine exited")
-	default:
-	}
-	close(release)
-	select {
-	case <-returned:
-	case <-time.After(time.Second):
-		t.Fatal("serveWithWatcher did not join watcher goroutine")
-	}
-}
-
 func TestServeWithRuntimeCancelsAndJoinsSignalWaiter(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	waiterCanceled := make(chan struct{})
@@ -500,7 +147,7 @@ func TestServeWithRuntimeCancelsAndJoinsSignalWaiter(t *testing.T) {
 
 	returned := make(chan struct{})
 	go func() {
-		_ = serveWithRuntime(watcherRun{}, cancel, waiterDone, func() error { return nil })
+		_ = serveWithRuntime(cancel, waiterDone, func() error { return nil })
 		close(returned)
 	}()
 	select {
@@ -521,32 +168,26 @@ func TestServeWithRuntimeCancelsAndJoinsSignalWaiter(t *testing.T) {
 	}
 }
 
-func TestWatcherCanceledDuringSignalShutdown(t *testing.T) {
+func TestWaitAndShutdownRunsGracefulOnSignal(t *testing.T) {
 	canceled := make(chan struct{})
-	watcher := startWatcher(context.Background(), func(ctx context.Context) error {
-		<-ctx.Done()
-		close(canceled)
-		return nil
-	}, func(error) {})
-
+	graceful := func() { close(canceled) }
 	sig := make(chan os.Signal, 1)
 	shutdownDone := make(chan struct{})
 	go func() {
-		waitAndShutdown(sig, time.Second, watcher.cancelNow, func() {}, func(...any) {})
+		waitAndShutdown(sig, time.Second, graceful, func() {}, func(...any) {})
 		close(shutdownDone)
 	}()
 	sig <- os.Interrupt
 	select {
 	case <-canceled:
 	case <-time.After(time.Second):
-		t.Fatal("watcher was not canceled during shutdown")
+		t.Fatal("graceful shutdown was not invoked on signal")
 	}
 	select {
 	case <-shutdownDone:
 	case <-time.After(time.Second):
 		t.Fatal("signal shutdown did not finish")
 	}
-	watcher.stop()
 }
 
 func TestServeRejectsNonPositiveJournalSize(t *testing.T) {
