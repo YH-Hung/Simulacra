@@ -63,6 +63,8 @@ type Server struct {
 	waitOnce    sync.Once
 	waitErr     error
 
+	watcher watcherRun
+
 	stubCount atomic.Int64
 }
 
@@ -106,10 +108,17 @@ func Start(ctx context.Context, opts Options) (*Server, error) {
 	}
 	s.stubCount.Store(int64(len(stubs)))
 
-	// Task 2 launches the stub watcher here (before binding the listener).
+	if opts.Watch && len(opts.StubDirs) > 0 {
+		watcher, err := s.launchStubWatcher(ctx, opts.StubDirs, reporter)
+		if err != nil {
+			return nil, err
+		}
+		s.watcher = watcher
+	}
 
 	lis, err := listen("tcp", opts.DataAddr)
 	if err != nil {
+		s.watcher.stop()
 		return nil, fmt.Errorf("listening on %s: %w", opts.DataAddr, err)
 	}
 	s.lis = lis
@@ -143,17 +152,26 @@ func (s *Server) StubCount() int { return int(s.stubCount.Load()) }
 // Wait blocks until the data-plane server stops, returning Serve's error
 // (nil after a clean GracefulStop or Stop). Safe to call from one goroutine.
 func (s *Server) Wait() error {
-	s.waitOnce.Do(func() { s.waitErr = <-s.serveResult })
+	s.waitOnce.Do(func() {
+		s.waitErr = <-s.serveResult
+		s.watcher.stop()
+	})
 	return s.waitErr
 }
 
 // GracefulStop stops the data plane, waiting for in-flight RPCs (including open
 // streams); it can block indefinitely. Callers that need a bound fall back to
 // Stop.
-func (s *Server) GracefulStop() { s.data.GracefulStop() }
+func (s *Server) GracefulStop() {
+	s.watcher.cancelNow()
+	s.data.GracefulStop()
+}
 
 // Stop aborts the data plane immediately.
-func (s *Server) Stop() { s.data.Stop() }
+func (s *Server) Stop() {
+	s.watcher.cancelNow()
+	s.data.Stop()
+}
 
 // Shutdown gracefully stops the server, forcing a hard stop if ctx is done
 // before the graceful stop completes, and returns once fully stopped.
@@ -170,6 +188,21 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		<-done
 	}
 	return s.Wait()
+}
+
+func (s *Server) launchStubWatcher(ctx context.Context, dirs []string, reporter Reporter) (watcherRun, error) {
+	onChange := func(ctx context.Context) {
+		if count, err := reconcileStubDirs(ctx, reporter, s.reg, s.store, dirs, true); err == nil {
+			s.stubCount.Store(int64(count))
+		}
+	}
+	return startStubWatcher(ctx, dirs, reporter, onChange, func(ctx context.Context) error {
+		count, err := reconcileStubDirs(ctx, reporter, s.reg, s.store, dirs, false)
+		if err == nil {
+			s.stubCount.Store(int64(count))
+		}
+		return err
+	}, stub.WatchWithOptions)
 }
 
 func buildRegistry(ctx context.Context, protoDirs, descriptorSets []string) (*schema.Registry, error) {

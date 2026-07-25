@@ -161,6 +161,54 @@ func TestStartRejectsNonPositiveJournalSize(t *testing.T) {
 	}
 }
 
+// TestStartWithWatchHotReloadsOnChange proves the Watch branch end to end:
+// watcher launch → filesystem event → debounce → reconcile → store swap →
+// StubCount update. Asserting only the initial count would pass even if the
+// Watch branch were never wired, so the assertion is on a change made *after*
+// the server is running.
+func TestStartWithWatchHotReloadsOnChange(t *testing.T) {
+	dir := t.TempDir()
+	const stubBody = `
+- method: shop.v1.OrderService/GetOrder
+  respond: { message: {} }
+`
+	if err := os.WriteFile(filepath.Join(dir, "stub.yaml"), []byte(stubBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := Start(context.Background(), Options{
+		ProtoDirs:   []string{"../testdata/protos"},
+		StubDirs:    []string{dir},
+		DataAddr:    "127.0.0.1:0",
+		JournalSize: 1024,
+		Watch:       true,
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+	if got := srv.StubCount(); got != 1 {
+		t.Fatalf("StubCount after start = %d, want 1", got)
+	}
+
+	// A second stub file must be picked up by the running watcher.
+	if err := os.WriteFile(filepath.Join(dir, "extra.yaml"), []byte(stubBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if got := srv.StubCount(); got == 2 {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatalf("StubCount = %d after 10s, want 2 — hot reload did not run", got)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestShutdownWithCanceledContextReturnsPromptly(t *testing.T) {
 	srv, err := Start(context.Background(), Options{
 		ProtoDirs:   []string{"../testdata/protos"},
