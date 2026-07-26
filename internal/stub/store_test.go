@@ -112,6 +112,32 @@ func TestReplaceAtomicallyResetsTimesBudget(t *testing.T) {
 	}
 }
 
+func TestLenCountsEveryMethodAndFollowsReplace(t *testing.T) {
+	reg := testRegistry(t)
+	order := compiled(t, reg, Stub{Method: "shop.v1.OrderService/GetOrder", Times: 1})
+	list := compiled(t, reg, Stub{Method: "shop.v1.OrderService/UploadOrders"})
+	store := NewStore([]*Compiled{order, list})
+
+	if got := store.Len(); got != 2 {
+		t.Fatalf("Len = %d, want 2 across both methods", got)
+	}
+	// A spent times budget still counts as registered.
+	if store.Select(method, match.Input{}) == nil {
+		t.Fatal("Select = nil, want the limited stub")
+	}
+	if got := store.Len(); got != 2 {
+		t.Fatalf("Len after consuming a budget = %d, want 2", got)
+	}
+
+	store.Replace([]*Compiled{list})
+	if got := store.Len(); got != 1 {
+		t.Fatalf("Len after Replace = %d, want 1", got)
+	}
+	if got := NewStore(nil).Len(); got != 0 {
+		t.Fatalf("Len of empty store = %d, want 0", got)
+	}
+}
+
 func TestExplainRanksNearestMiss(t *testing.T) {
 	reg := testRegistry(t)
 	twoWrong := compiled(t, reg, Stub{

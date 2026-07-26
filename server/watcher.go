@@ -12,8 +12,65 @@ import (
 )
 
 type watcherRun struct {
-	cancel context.CancelFunc
-	done   <-chan struct{}
+	cancel  context.CancelFunc
+	done    <-chan struct{}
+	reloads *reloadTracker
+}
+
+// reloadTracker counts in-flight OnChange calls. stub.WatchWithOptions runs
+// OnChange on a worker goroutine it does not join — cancellation stops event
+// collection immediately, by design, even mid-callback — so joining the watch
+// goroutine alone would let a reload keep swapping the store and writing to the
+// Reporter after Shutdown returned.
+type reloadTracker struct {
+	mu     sync.Mutex
+	idle   sync.Cond
+	active int
+	closed bool
+}
+
+func newReloadTracker() *reloadTracker {
+	t := &reloadTracker{}
+	t.idle.L = &t.mu
+	return t
+}
+
+// track wraps onChange so the call is visible to closeAndJoin for its whole
+// duration, and so a call that enters after the tracker closed is dropped
+// rather than run. The worker tests its context and calls OnChange as two
+// separate steps, so cancellation alone cannot stop a call already between
+// them; the closed flag can, because entry and closing take the same lock.
+func (t *reloadTracker) track(onChange func(context.Context)) func(context.Context) {
+	return func(ctx context.Context) {
+		t.mu.Lock()
+		if t.closed {
+			t.mu.Unlock()
+			return
+		}
+		t.active++
+		t.mu.Unlock()
+		defer func() {
+			t.mu.Lock()
+			t.active--
+			if t.active == 0 {
+				t.idle.Broadcast()
+			}
+			t.mu.Unlock()
+		}()
+		onChange(ctx)
+	}
+}
+
+// closeAndJoin refuses further calls and blocks until the ones already running
+// have returned. Closing before waiting is what makes the join final: any call
+// that has not taken the lock yet will find the tracker closed and do nothing.
+func (t *reloadTracker) closeAndJoin() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.closed = true
+	for t.active > 0 {
+		t.idle.Wait()
+	}
 }
 
 type watchDirsFunc func(context.Context, []string, stub.WatchOptions) error
@@ -27,10 +84,11 @@ func startStubWatcher(parent context.Context, dirs []string, reporter Reporter, 
 	finishStartup := func() {
 		completeStartup.Do(func() { close(startupComplete) })
 	}
+	reloads := newReloadTracker()
 	watcher, started := startReadyWatcher(parent, func(ctx context.Context, ready func()) error {
 		return watch(ctx, dirs, stub.WatchOptions{
 			Debounce: 200 * time.Millisecond,
-			OnChange: onChange,
+			OnChange: reloads.track(onChange),
 			OnError: func(err error) {
 				reporter.PrintErrln("watch error:", err)
 			},
@@ -42,6 +100,7 @@ func startStubWatcher(parent context.Context, dirs []string, reporter Reporter, 
 	}, func(err error) {
 		reporter.PrintErrln("watch error:", err)
 	})
+	watcher.reloads = reloads
 
 	select {
 	case err := <-started:
@@ -72,8 +131,13 @@ func startStubWatcher(parent context.Context, dirs []string, reporter Reporter, 
 	return watcher, nil
 }
 
+// startReadyWatcher detaches the watcher's lifetime from parent: parent scopes
+// startup (the caller aborts by stopping the returned watcher), but once the
+// watcher is running only the server's own cancel stops it. Deriving the run
+// context from parent instead would let a caller's startup timeout silently
+// disarm hot reload under a still-serving data plane.
 func startReadyWatcher(parent context.Context, run func(context.Context, func()) error, report func(error)) (watcherRun, <-chan error) {
-	ctx, cancel := context.WithCancel(parent)
+	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
 	done := make(chan struct{})
 	started := make(chan error, 1)
 	var startup sync.Once
@@ -104,10 +168,18 @@ func (w watcherRun) cancelNow() {
 	}
 }
 
+// stop cancels the watcher, joins its goroutine, then closes out any reload the
+// watcher had already started: in-flight calls are waited for, and a call still
+// on its way in is dropped. It blocks for as long as an in-flight reload takes,
+// which includes the Reporter calls it makes (see the Reporter contract). Once
+// stop returns, no reload will touch the store or the Reporter again.
 func (w watcherRun) stop() {
 	w.cancelNow()
 	if w.done != nil {
 		<-w.done
+	}
+	if w.reloads != nil {
+		w.reloads.closeAndJoin()
 	}
 }
 

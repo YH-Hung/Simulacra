@@ -155,6 +155,19 @@ func inputWithTime(in match.Input) match.Input {
 	return in
 }
 
+// Len reports how many stubs are registered across all methods, regardless of
+// times budget. It reads the same synchronized state Select does, so it never
+// disagrees with the generation of stubs currently serving.
+func (s *Store) Len() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	total := 0
+	for _, entries := range s.byMethod {
+		total += len(entries)
+	}
+	return total
+}
+
 // CountFor reports how many stubs are registered for a method, regardless of
 // times budget.
 func (s *Store) CountFor(method string) int {

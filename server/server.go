@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"net"
 	"sync"
-	"sync/atomic"
 
 	"google.golang.org/grpc"
 
@@ -28,6 +27,10 @@ import (
 // Reporter receives asynchronous progress messages — currently stub hot-reload
 // results and watch errors. The CLI supplies an implementation backed by the
 // command's output streams; embedders that want silence leave it nil.
+//
+// Calls run on the watcher's own goroutines, which Wait and Shutdown join, so
+// an implementation that blocks indefinitely blocks shutdown by that much.
+// Implementations must return; buffer or drop instead of waiting on a consumer.
 type Reporter interface {
 	Printf(format string, args ...any)
 	PrintErrln(args ...any)
@@ -64,13 +67,17 @@ type Server struct {
 	waitErr     error
 
 	watcher watcherRun
-
-	stubCount atomic.Int64
 }
 
 // Start builds and starts a server, returning once the data listener is bound.
 // The returned Server serves in the background until GracefulStop, Stop, or
 // Shutdown is called.
+//
+// ctx scopes startup only: it aborts schema loading and the watcher's initial
+// attach, and canceling it after Start returns has no effect. The Server owns
+// everything it launched — including the Watch: true stub watcher — so a caller
+// can pass a startup timeout without silently disarming hot reload underneath a
+// data plane that is still serving.
 func Start(ctx context.Context, opts Options) (*Server, error) {
 	if opts.JournalSize <= 0 {
 		return nil, fmt.Errorf("journal size must be greater than zero (got %d)", opts.JournalSize)
@@ -106,7 +113,6 @@ func Start(ctx context.Context, opts Options) (*Server, error) {
 		data:        data,
 		serveResult: make(chan error, 1),
 	}
-	s.stubCount.Store(int64(len(stubs)))
 
 	if opts.Watch && len(opts.StubDirs) > 0 {
 		watcher, err := s.launchStubWatcher(ctx, opts.StubDirs, reporter)
@@ -146,11 +152,17 @@ func (s *Server) DataAddr() net.Addr { return s.lis.Addr() }
 // ServiceCount is the number of registered services (mocked services + health).
 func (s *Server) ServiceCount() int { return len(s.reg.Services()) }
 
-// StubCount is the number of currently loaded stubs.
-func (s *Server) StubCount() int { return int(s.stubCount.Load()) }
+// StubCount is the number of currently loaded stubs. It is read from the store
+// itself, so it changes exactly when a hot reload swaps the stubs in — never
+// later than the stubs those calls are already being answered with.
+func (s *Server) StubCount() int { return s.store.Len() }
 
 // Wait blocks until the data-plane server stops, returning Serve's error
 // (nil after a clean GracefulStop or Stop). Safe to call from one goroutine.
+//
+// Before returning it also joins the stub watcher and any reload already in
+// flight, so once Wait returns nothing the server started is still touching the
+// store or the Reporter. A Reporter that blocks delays that join (see Reporter).
 func (s *Server) Wait() error {
 	s.waitOnce.Do(func() {
 		s.waitErr = <-s.serveResult
@@ -175,6 +187,9 @@ func (s *Server) Stop() {
 
 // Shutdown gracefully stops the server, forcing a hard stop if ctx is done
 // before the graceful stop completes, and returns once fully stopped.
+//
+// ctx bounds the graceful phase, not the final join: Shutdown ends with Wait,
+// which waits out an in-flight stub reload and its Reporter calls.
 func (s *Server) Shutdown(ctx context.Context) error {
 	done := make(chan struct{})
 	go func() {
@@ -191,18 +206,14 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 
 func (s *Server) launchStubWatcher(ctx context.Context, dirs []string, reporter Reporter) (watcherRun, error) {
-	onChange := func(ctx context.Context) {
-		if count, err := reconcileStubDirs(ctx, reporter, s.reg, s.store, dirs, true); err == nil {
-			s.stubCount.Store(int64(count))
-		}
-	}
-	return startStubWatcher(ctx, dirs, reporter, onChange, func(ctx context.Context) error {
-		count, err := reconcileStubDirs(ctx, reporter, s.reg, s.store, dirs, false)
-		if err == nil {
-			s.stubCount.Store(int64(count))
-		}
+	reconcile := func(ctx context.Context, announce bool) error {
+		_, err := reconcileStubDirs(ctx, reporter, s.reg, s.store, dirs, announce)
 		return err
-	}, stub.WatchWithOptions)
+	}
+	return startStubWatcher(ctx, dirs, reporter,
+		func(ctx context.Context) { _ = reconcile(ctx, true) },
+		func(ctx context.Context) error { return reconcile(ctx, false) },
+		stub.WatchWithOptions)
 }
 
 func buildRegistry(ctx context.Context, protoDirs, descriptorSets []string) (*schema.Registry, error) {

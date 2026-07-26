@@ -335,6 +335,97 @@ func TestStartStubWatcherSerializesStartupReconcileBeforeCallbacks(t *testing.T)
 	watcher.stop()
 }
 
+// TestStartStubWatcherStopJoinsInFlightReload covers the gap between the
+// watcher's event loop and its reload work: stub.WatchWithOptions runs OnChange
+// on a separate worker and deliberately returns without joining it, so stopping
+// the event loop is not enough. A reload that is mid-flight when the server
+// shuts down must still be complete by the time stop returns, or it can mutate
+// the store (and write to the Reporter) after Shutdown.
+func TestStartStubWatcherStopJoinsInFlightReload(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var finished atomic.Bool
+	workerDone := make(chan struct{})
+	// watch mirrors WatchWithOptions: the callback runs on its own goroutine
+	// and cancellation returns without waiting for it.
+	watch := func(ctx context.Context, _ []string, opts stub.WatchOptions) error {
+		opts.Ready()
+		go func() {
+			defer close(workerDone)
+			opts.OnChange(ctx)
+		}()
+		<-ctx.Done()
+		return nil
+	}
+	watcher, err := startStubWatcher(context.Background(), []string{"stubs"}, discardReporter{},
+		func(context.Context) {
+			close(entered)
+			<-release
+			finished.Store(true)
+		},
+		func(context.Context) error { return nil }, watch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		watcher.stop()
+	}()
+	select {
+	case <-stopped:
+		t.Fatal("watcherRun.stop returned while a reload was still in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("watcherRun.stop did not return after the reload finished")
+	}
+	if !finished.Load() {
+		t.Fatal("watcherRun.stop returned before the reload completed")
+	}
+	<-workerDone
+}
+
+// TestStartStubWatcherStopRefusesReloadThatEntersAfterJoin closes the window on
+// the other side of the join. internal/stub's worker tests ctx.Err() and only
+// then calls OnChange; a worker preempted between those two steps can enter the
+// callback after the watch goroutine has exited and stop has already observed an
+// idle tracker. The callback must be refused outright, so the guarantee holds
+// however the reconciler behaves.
+func TestStartStubWatcherStopRefusesReloadThatEntersAfterJoin(t *testing.T) {
+	stopReturned := make(chan struct{})
+	workerDone := make(chan struct{})
+	var ran atomic.Bool
+	watch := func(ctx context.Context, _ []string, opts stub.WatchOptions) error {
+		opts.Ready()
+		go func() {
+			defer close(workerDone)
+			<-stopReturned // a worker preempted past its cancellation check
+			opts.OnChange(ctx)
+		}()
+		<-ctx.Done()
+		return nil
+	}
+	watcher, err := startStubWatcher(context.Background(), []string{"stubs"}, discardReporter{},
+		func(context.Context) { ran.Store(true) },
+		func(context.Context) error { return nil }, watch)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	watcher.stop()
+	close(stopReturned)
+	<-workerDone
+	if ran.Load() {
+		t.Fatal("a reload entered and ran after watcherRun.stop returned")
+	}
+}
+
 func TestWatcherRunStopJoinsGoroutine(t *testing.T) {
 	started := make(chan struct{})
 	canceled := make(chan struct{})

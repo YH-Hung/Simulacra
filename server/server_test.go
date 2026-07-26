@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -208,6 +209,109 @@ func TestStartWithWatchHotReloadsOnChange(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// TestStartContextCancellationKeepsHotReloadRunning pins the lifetime rule for
+// the ctx passed to Start: it scopes startup only. An embedder that starts the
+// server under a startup timeout (the SDK's in-process mode does) must not end
+// up with a running data plane whose Watch: true watcher has silently died.
+func TestStartContextCancellationKeepsHotReloadRunning(t *testing.T) {
+	dir := t.TempDir()
+	const stubBody = `
+- method: shop.v1.OrderService/GetOrder
+  respond: { message: {} }
+`
+	if err := os.WriteFile(filepath.Join(dir, "stub.yaml"), []byte(stubBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	startCtx, cancelStart := context.WithCancel(context.Background())
+	srv, err := Start(startCtx, Options{
+		ProtoDirs:   []string{"../testdata/protos"},
+		StubDirs:    []string{dir},
+		DataAddr:    "127.0.0.1:0",
+		JournalSize: 1024,
+		Watch:       true,
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+	cancelStart() // startup is over; this must not disarm the watcher
+
+	if err := os.WriteFile(filepath.Join(dir, "extra.yaml"), []byte(stubBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if got := srv.StubCount(); got == 2 {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatalf("StubCount = %d after 10s, want 2 — canceling the Start context stopped hot reload", got)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestStubCountTracksStoreWhileReporterBlocks keeps StubCount consistent with
+// the stubs that are actually serving. The reload swaps the store and then
+// announces it; a Reporter that is slow to return must not leave StubCount
+// reporting the previous generation.
+func TestStubCountTracksStoreWhileReporterBlocks(t *testing.T) {
+	dir := t.TempDir()
+	const stubBody = `
+- method: shop.v1.OrderService/GetOrder
+  respond: { message: {} }
+`
+	if err := os.WriteFile(filepath.Join(dir, "stub.yaml"), []byte(stubBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reporter := &blockingReporter{released: make(chan struct{})}
+	srv, err := Start(context.Background(), Options{
+		ProtoDirs:   []string{"../testdata/protos"},
+		StubDirs:    []string{dir},
+		DataAddr:    "127.0.0.1:0",
+		JournalSize: 1024,
+		Watch:       true,
+		Reporter:    reporter,
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+	// Release the reload announcement only once the assertion is done, so
+	// Shutdown (which joins in-flight reloads) is never the thing under test.
+	defer reporter.release()
+
+	if err := os.WriteFile(filepath.Join(dir, "extra.yaml"), []byte(stubBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if got := srv.StubCount(); got == 2 {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatalf("StubCount = %d after 10s, want 2 — count trails the store while the reporter blocks", got)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// blockingReporter holds every Printf until release is called.
+type blockingReporter struct {
+	released  chan struct{}
+	closeOnce sync.Once
+}
+
+func (r *blockingReporter) Printf(string, ...any) { <-r.released }
+func (r *blockingReporter) PrintErrln(...any)     {}
+func (r *blockingReporter) release()              { r.closeOnce.Do(func() { close(r.released) }) }
 
 func TestShutdownWithCanceledContextReturnsPromptly(t *testing.T) {
 	srv, err := Start(context.Background(), Options{
