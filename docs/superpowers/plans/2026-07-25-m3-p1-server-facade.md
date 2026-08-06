@@ -10,6 +10,26 @@
 
 **Reference:** M3 design `docs/superpowers/specs/2026-07-25-m3-test-story-design.md` §4 (facade), §13 phase 1. This is the first of the per-phase M3 plans; each phase lands green on `main` independently.
 
+## Status — verified 2026-08-06
+
+**Phase 1 is complete.** The public `server` facade owns data-plane startup,
+stub watching, and shutdown; `simulacra serve` uses that facade. The current
+HEAD is `2c1a25d` (`fix(server): own the stub watcher lifecycle across
+shutdown`), and the worktree was clean when this status was recorded.
+
+Verification completed against that revision:
+
+- `go test ./...`
+- `go test -race ./...`
+- `go vet ./...`
+- `go test ./internal/cli/ -run 'TestServe' -v`
+- Built `cmd/simulacra`; `serve --proto ./testdata/protos --listen
+  127.0.0.1:16565` printed its data-plane banner and exited cleanly after
+  `SIGINT`.
+
+The next M3 work remains defined by the design document; it is not part of
+this completed Phase 1 plan.
+
 ## Global Constraints
 
 - Module path `github.com/yinghanhung/simulacra`; Go 1.25. The new package is **public**: import path `github.com/yinghanhung/simulacra/server` (not under `internal/`).
@@ -73,7 +93,7 @@ Create the facade that does everything `serve --watch=false` does today: build r
   - `func (s *Server) Shutdown(ctx context.Context) error`
   - unexported helpers `buildRegistry(ctx, protoDirs, descriptorSets)` and `loadStubs(reg, dirs, reporter)` (reused by Task 2's watcher), and `normalizeServeErr(err)` (maps `grpc.ErrServerStopped` → nil)
 
-- [ ] **Step 1: Write the failing lifecycle test**
+- [x] **Step 1: Write the failing lifecycle test**
 
 Create `server/server_test.go`:
 
@@ -265,12 +285,12 @@ func TestShutdownWithCanceledContextReturnsPromptly(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `go test ./server/ -v`
 Expected: FAIL — `server/server.go` does not exist, so the package won't compile (`undefined: Start`, `undefined: Options`).
 
-- [ ] **Step 3: Write `server/server.go`**
+- [x] **Step 3: Write `server/server.go`**
 
 ```go
 // Package server is the public wiring facade for a Simulacra instance. It
@@ -482,12 +502,12 @@ func (discardReporter) Printf(string, ...any) {}
 func (discardReporter) PrintErrln(...any)     {}
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `go test ./server/ -v`
 Expected: PASS — all four tests green.
 
-- [ ] **Step 5: Vet and commit**
+- [x] **Step 5: Vet and commit**
 
 ```bash
 go vet ./server/
@@ -525,7 +545,7 @@ This is the cutover. It (a) relocates the hot-reload watcher plumbing from `inte
 | `TestServeWithRuntimeStopsAndJoinsWatcherOnServeReturn` | **replace** with `server`'s `TestWatcherRunStopJoinsGoroutine` |
 | `discardReloadOutput` helper | delete (replaced by `server`'s `discardReporter`) |
 
-- [ ] **Step 1: Write the failing watcher-move tests in `server/watcher_test.go`**
+- [x] **Step 1: Write the failing watcher-move tests in `server/watcher_test.go`**
 
 Create `server/watcher_test.go` with the helper, the two reconcile tests (rewritten to call `reconcileStubDirs`), and the join test:
 
@@ -691,12 +711,12 @@ func TestWatcherRunStopJoinsGoroutine(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `go test ./server/ -run 'Reconcile|WatcherRun' -v`
 Expected: FAIL — `undefined: reconcileStubDirs`, `undefined: startReadyWatcher` (watcher.go not created yet).
 
-- [ ] **Step 3: Create `server/watcher.go` (move the watcher plumbing)**
+- [x] **Step 3: Create `server/watcher.go` (move the watcher plumbing)**
 
 ```go
 package server
@@ -843,12 +863,12 @@ func reconcileStubDirs(ctx context.Context, reporter Reporter, reg *schema.Regis
 }
 ```
 
-- [ ] **Step 4: Run the moved tests to verify they pass**
+- [x] **Step 4: Run the moved tests to verify they pass**
 
 Run: `go test ./server/ -run 'Reconcile|WatcherRun' -v`
 Expected: PASS.
 
-- [ ] **Step 5: Move the five `startStubWatcher` concurrency tests into `server/watcher_test.go`**
+- [x] **Step 5: Move the five `startStubWatcher` concurrency tests into `server/watcher_test.go`**
 
 Copy `TestStartStubWatcherReconcilesMutationBeforeReady`, `TestStartStubWatcherReturnsStartupReconciliationError`, `TestStartStubWatcherReturnsInitialAttachError`, `TestStartStubWatcherCancellationDuringStartupJoinsWatcher`, and `TestStartStubWatcherSerializesStartupReconcileBeforeCallbacks` from `internal/cli/serve_test.go` into `server/watcher_test.go`, applying these **exact substitutions** (they change only fixtures/wiring, never the concurrency logic under test):
 
@@ -926,12 +946,12 @@ func TestStartStubWatcherReconcilesMutationBeforeReady(t *testing.T) {
 
 Apply the same recipe to the other four. (`TestStartStubWatcherReturnsInitialAttachError` and `TestStartStubWatcherCancellationDuringStartupJoinsWatcher` use `discardReloadOutput{}` → `discardReporter{}` only; they need no registry.) Add a `discardReporter` note: it already exists in `server.go` from Task 1 — reuse it, do not redeclare.
 
-- [ ] **Step 6: Run the moved suite**
+- [x] **Step 6: Run the moved suite**
 
 Run: `go test ./server/ -v`
 Expected: PASS — all facade + watcher tests green.
 
-- [ ] **Step 7: Wire the watcher into `Start` and the lifecycle methods (`server/server.go`)**
+- [x] **Step 7: Wire the watcher into `Start` and the lifecycle methods (`server/server.go`)**
 
 In `server/server.go`, add the watcher field to `Server`:
 
@@ -1008,7 +1028,7 @@ func (s *Server) launchStubWatcher(ctx context.Context, dirs []string, reporter 
 }
 ```
 
-- [ ] **Step 8: Add a facade watcher test and run the `server` suite**
+- [x] **Step 8: Add a facade watcher test and run the `server` suite**
 
 Append to `server/server_test.go`:
 
@@ -1067,7 +1087,7 @@ func TestStartWithWatchHotReloadsOnChange(t *testing.T) {
 Run: `go test ./server/ -v`
 Expected: PASS.
 
-- [ ] **Step 9: Rewrite `internal/cli/serve.go` onto the facade**
+- [x] **Step 9: Rewrite `internal/cli/serve.go` onto the facade**
 
 Replace the entire `RunE` body (lines 34–101 today) with:
 
@@ -1148,7 +1168,7 @@ import (
 
 (Removed: `errors`, `internal/dataplane`, `internal/journal`, `internal/schema`, `internal/stub`.)
 
-- [ ] **Step 10: Adjust the two CLI test survivors and delete the moved ones (`internal/cli/serve_test.go`)**
+- [x] **Step 10: Adjust the two CLI test survivors and delete the moved ones (`internal/cli/serve_test.go`)**
 
 Delete from `serve_test.go`: `TestReloadStubDirsKeepsInvalidStoreAndResetsValidBudget`, `TestReloadStubDirsContextDoesNothingAfterCancellation`, all five `TestStartStubWatcher*`, `TestServeWithRuntimeStopsAndJoinsWatcherOnServeReturn`, and the `discardReloadOutput` type.
 
@@ -1189,7 +1209,7 @@ func TestWaitAndShutdownRunsGracefulOnSignal(t *testing.T) {
 
 Then fix the `serve_test.go` import block. After the deletions, remove `errors`, `fmt`, `path/filepath`, `sync/atomic`, `github.com/yinghanhung/simulacra/internal/match`, and `github.com/yinghanhung/simulacra/internal/stub`; **keep** `bytes`, `context`, `net`, `os`, `strings`, `sync`, `time`, `testing`, and `github.com/spf13/cobra` (`cobra` is still used by `TestCommandOutputSerializesConcurrentWrites`). Let the compiler in the next step confirm.
 
-- [ ] **Step 11: Build, vet, and run the full CLI + server suites**
+- [x] **Step 11: Build, vet, and run the full CLI + server suites**
 
 Run:
 ```bash
@@ -1198,7 +1218,7 @@ go test ./internal/cli/ ./server/ -v
 ```
 Expected: PASS. Fix any "imported and not used" / "declared and not used" errors surfaced by Step 10's pruning until green.
 
-- [ ] **Step 12: Commit**
+- [x] **Step 12: Commit**
 
 ```bash
 git add server/ internal/cli/serve.go internal/cli/serve_test.go
@@ -1213,19 +1233,19 @@ Prove the refactor preserved behavior end-to-end and under the race detector acr
 
 **Files:** none modified unless a failure is found.
 
-- [ ] **Step 1: Full suite under the race detector**
+- [x] **Step 1: Full suite under the race detector**
 
 Run: `go test -race ./...`
 Expected: PASS (`ok` for every package, including `conformance` and the new `server`).
 
 Note what actually gates behavior here. `conformance` still builds its own server directly via `dataplane.New` (`conformance/harness_test.go`), so it does **not** exercise the facade — it proves the data plane is unchanged, not that the facade wires it correctly. The facade's behavioral gate is `TestStartServesStubbedUnaryCall` (Task 1): a real gRPC call through a `server.Start` server, asserting both the stubbed response and the journal entry, so a mis-wired registry, store, or journal fails the phase. Migrating the conformance harness onto the facade is deliberately left to a later phase, where the admin-driven conformance leg (design §10) reworks that harness anyway.
 
-- [ ] **Step 2: Vet the whole module**
+- [x] **Step 2: Vet the whole module**
 
 Run: `go vet ./...`
 Expected: no output.
 
-- [ ] **Step 3: Smoke-test the built binary**
+- [x] **Step 3: Smoke-test the built binary**
 
 Proves the wired-up `cmd/simulacra` binary starts, prints the banner, and shuts down cleanly on SIGINT. (Health-over-the-port is already proven by `TestStartServesHealthAndReportsCounts`, so this uses no external probe tool.)
 
@@ -1240,12 +1260,12 @@ grep -q "data plane listening on 127.0.0.1:6565" /tmp/sim-p1.log && echo "SMOKE 
 ```
 Expected: the log shows `simulacra: data plane listening on 127.0.0.1:6565` followed by `N service(s) registered, 0 stub(s) loaded — reflection and health enabled`, the process exits on SIGINT, and the final line prints `SMOKE OK`. (If `127.0.0.1:6565` is busy, pick another port and adjust the `grep`.)
 
-- [ ] **Step 4: Confirm no behavior drift in the CLI surface**
+- [x] **Step 4: Confirm no behavior drift in the CLI surface**
 
 Run: `go test ./internal/cli/ -run 'TestServe' -v`
 Expected: PASS — flag defaults (`--journal-size=1024`, `--watch=true`), non-positive journal-size rejection, and context-cancellation-returns-within-bound all still hold.
 
-- [ ] **Step 5: Final commit only if Steps 1–4 required a fix**
+- [x] **Step 5: Final commit only if Steps 1–4 required a fix**
 
 If any step forced a change, stage **only the files that fix changed** — never `git add -A`. The working tree also carries unrelated in-flight work (the M3 design spec and these plan documents), and a blanket stage would sweep it into this commit:
 
