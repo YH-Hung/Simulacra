@@ -15,3 +15,30 @@ jobs:
       - run: go build ./...
       - run: go vet ./...
       - run: go test -race ./...
+
+  api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # buf breaking needs the baseline's history
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - run: make tools
+      - run: make lint-api
+      - name: buf breaking
+        # The check needs a baseline that already contains api/. On the commit
+        # that first introduces it, buf fails with "had no .proto files", so the
+        # guard skips exactly that one run and is a no-op forever after.
+        run: |
+          if git cat-file -e origin/main:api 2>/dev/null; then
+            make breaking-api
+          else
+            echo "baseline origin/main has no api/ yet; skipping the first breaking check"
+          fi
+      - run: make generate
+      - name: verify gen/ is in sync with api/
+        # Staged before diffing so added and deleted files fail the check too,
+        # not just modified ones.
+        run: git add -A gen && git diff --cached --exit-code -- gen
