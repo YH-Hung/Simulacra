@@ -1,5 +1,6 @@
 /simulacra
 /dist/
+/bin/
 .DS_Store
 *.test
 /.worktrees/
