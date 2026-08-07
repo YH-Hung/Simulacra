@@ -38,7 +38,7 @@ arrive in Phase 4.
 
 ```
 simulacra/
-├── buf.yaml                     # NEW  v2 workspace: modules[api], lint DEFAULT, breaking WIRE_JSON
+├── buf.yaml                     # NEW  v2 workspace: modules[api], lint STANDARD, breaking WIRE_JSON
 ├── buf.gen.yaml                 # NEW  local plugins → gen/
 ├── Makefile                     # NEW  tools / generate / lint-api / breaking-api
 ├── bin/                         # NEW  gitignored; pinned tool binaries land here
@@ -410,9 +410,16 @@ A new `api` job in `.github/workflows/ci.yml`, alongside the unchanged `test` jo
           go-version: "1.25"
       - run: make tools
       - run: make lint-api
-      - run: make breaking-api
+      - name: buf breaking
+        run: |
+          if git cat-file -e origin/main:api 2>/dev/null; then
+            make breaking-api
+          else
+            echo "baseline origin/main has no api/ yet; skipping the first breaking check"
+          fi
       - run: make generate
-      - run: git add -A gen && git diff --cached --exit-code -- gen
+      - name: verify gen/ is in sync with api/
+        run: git add -A gen && git diff --cached --exit-code -- gen
 ```
 
 The sync check stages before diffing so that **added and deleted** generated files fail it, not
@@ -421,12 +428,18 @@ just modified ones — a plain `git diff` would silently pass a newly generated 
 The existing `test` job needs no change; `go build ./...` and `go test -race ./...` now also cover
 `gen/` and `internal/admin`.
 
-**Bootstrap contingency for `buf breaking`.** On the commit that first introduces `api/`, the
-`main` baseline has no protos and no `buf.yaml`. `buf breaking --against '.git#branch=main'` may
-either report nothing (correct) or fail to build the baseline workspace. This is verified
-empirically during implementation. If it fails, `api/` and `gen/` land first and the
-`breaking-api` CI step is added in the immediately following commit — the check is meaningless
-until there is a baseline anyway. Every later run has one.
+**Bootstrap of `buf breaking` — resolved by testing, not left to chance.** Two facts were verified
+against buf v1.72.0 while writing the implementation plan:
+
+- Against a baseline with no `api/` directory, `buf breaking` fails hard with
+  `Failure: Module "path: "."" had no .proto files`. It does not silently pass, so the commit that
+  first introduces `api/` would red the build.
+- `--against '.git#branch=main'` does not resolve on pull-request checkouts, which have no local
+  `main` branch. `--against '.git#ref=origin/main'` resolves on both push and PR events.
+
+Hence the guard above and `ref=origin/main` in the Makefile. The guard skips exactly one run — the
+one that introduces `api/` — and is a permanent no-op afterwards. This replaces the two-commit
+fallback an earlier draft of this section proposed.
 
 ---
 
@@ -462,7 +475,7 @@ The test asserts, against a literal expectation table:
 
 | Risk | Mitigation |
 |---|---|
-| `buf breaking` has no baseline on the bootstrap commit | Verified empirically; documented two-commit fallback (§6) |
+| `buf breaking` has no baseline on the bootstrap commit | Confirmed to fail hard; handled by the CI existence guard (§6) |
 | Generator version drift produces spurious sync-check diffs | Every binary is pinned in `tools/go.mod`; nobody uses a system buf |
 | `connectrpc.com/connect` enters the core module a phase early | Deliberate: it is dependency-free beyond protobuf, and it makes `buf.gen.yaml`, `gen/`'s layout, and the sync check final rather than re-cut in Phase 4 |
 | Contract test ossifies the API, making legitimate additions annoying | It asserts an expectation table, not a golden file: adding an RPC is a one-line test edit, which is the right amount of friction for a public contract |
