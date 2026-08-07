@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package simulacra.admin.v1;
+
+import "simulacra/admin/v1/journal.proto";
+
+option go_package = "github.com/yinghanhung/simulacra/gen/simulacra/admin/v1;adminv1";
+
+// VerifyService asserts what the data plane was asked to do.
+service VerifyService {
+  rpc VerifyCalls(VerifyCallsRequest) returns (VerifyCallsResponse);
+}
+
+// Times mirrors internal/journal.Times. Deliberately not a oneof: at_least and
+// at_most combine into a range. never excludes every numeric assertion.
+message Times {
+  optional int32 exactly = 1;
+  optional int32 at_least = 2;
+  optional int32 at_most = 3;
+  bool never = 4;
+}
+
+message VerifyCallsRequest {
+  string method = 1;
+  // Stub-grammar match block; empty matches any call to method.
+  string matcher_document = 2;
+  Times times = 3;
+}
+
+message VerifyCallsResponse {
+  bool passed = 1;
+  int32 matched = 2;
+  // Human-readable verdict.
+  string explanation = 3;
+  // Populated on failure.
+  repeated CallExplanation actual = 4;
+}
+
+message CallExplanation {
+  Call call = 1;
+  // Why this call did not match, from the shared diagnostic engine.
+  string nearest_miss = 2;
+}

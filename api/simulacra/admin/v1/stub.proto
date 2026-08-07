@@ -1,0 +1,93 @@
+syntax = "proto3";
+
+package simulacra.admin.v1;
+
+option go_package = "github.com/yinghanhung/simulacra/gen/simulacra/admin/v1;adminv1";
+
+// StubService creates, lists, and removes stubs. Stub bodies travel as
+// documents in the same grammar stub files use; the server parses them with
+// the same strict loader, so files and the API can never drift.
+service StubService {
+  rpc CreateStub(CreateStubRequest) returns (CreateStubResponse);
+  rpc ListStubs(ListStubsRequest) returns (ListStubsResponse);
+  rpc DeleteStub(DeleteStubRequest) returns (DeleteStubResponse);
+  rpc ReplaceAllStubs(ReplaceAllStubsRequest) returns (ReplaceAllStubsResponse);
+  rpc ExportStubs(ExportStubsRequest) returns (ExportStubsResponse);
+}
+
+// StubOrigin records who owns a stub. File-origin stubs belong to the
+// hot-reload watcher; API-origin stubs belong to the client that created them.
+enum StubOrigin {
+  STUB_ORIGIN_UNSPECIFIED = 0;
+  STUB_ORIGIN_FILE = 1;
+  STUB_ORIGIN_API = 2;
+}
+
+// StubShape is the RPC shape the stub answers.
+enum StubShape {
+  STUB_SHAPE_UNSPECIFIED = 0;
+  STUB_SHAPE_UNARY = 1;
+  STUB_SHAPE_SERVER_STREAM = 2;
+  STUB_SHAPE_CLIENT_STREAM = 3;
+  STUB_SHAPE_BIDI_STREAM = 4;
+}
+
+// Stub is the read-only envelope around a stub document.
+message Stub {
+  string id = 1;
+  // Normalized "/pkg.Service/Method".
+  string method = 2;
+  StubShape shape = 3;
+  int32 priority = 4;
+  // 0 means unlimited, mirroring the file grammar.
+  int32 times = 5;
+  StubOrigin origin = 6;
+  // "<path>#<index>" for file stubs, "api" for API stubs.
+  string source = 7;
+  int64 hits = 8;
+  // Normalized YAML mapping for this one stub.
+  string document = 9;
+}
+
+message CreateStubRequest {
+  // Exactly one stub as a YAML or JSON mapping. A sequence is INVALID_ARGUMENT.
+  string document = 1;
+}
+
+message CreateStubResponse {
+  Stub stub = 1;
+}
+
+message ListStubsRequest {
+  // Optional method filter.
+  string method = 1;
+  // Optional origin filter; STUB_ORIGIN_UNSPECIFIED means all origins.
+  StubOrigin origin = 2;
+}
+
+message ListStubsResponse {
+  repeated Stub stubs = 1;
+}
+
+message DeleteStubRequest {
+  string id = 1;
+}
+
+message DeleteStubResponse {}
+
+message ReplaceAllStubsRequest {
+  // Each document is one stub mapping, as in CreateStub.
+  repeated string documents = 1;
+}
+
+message ReplaceAllStubsResponse {
+  repeated Stub stubs = 1;
+}
+
+message ExportStubsRequest {}
+
+message ExportStubsResponse {
+  // One file-grammar YAML sequence holding every API-origin stub.
+  string document = 1;
+  int32 stub_count = 2;
+}

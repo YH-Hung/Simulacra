@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package simulacra.admin.v1;
+
+option go_package = "github.com/yinghanhung/simulacra/gen/simulacra/admin/v1;adminv1";
+
+// SchemaService manages the descriptors the data plane serves.
+service SchemaService {
+  rpc RegisterSchemas(RegisterSchemasRequest) returns (RegisterSchemasResponse);
+  rpc ListServices(ListServicesRequest) returns (ListServicesResponse);
+}
+
+message RegisterSchemasRequest {
+  // Serialized google.protobuf.FileDescriptorSet, applied all-or-nothing.
+  bytes descriptor_set = 1;
+}
+
+message RegisterSchemasResponse {
+  // Paths newly added; empty when every file was already registered.
+  repeated string registered_files = 1;
+  // Services in the registry after the swap.
+  int32 service_count = 2;
+}
+
+message ListServicesRequest {}
+
+message ListServicesResponse {
+  repeated ServiceInfo services = 1;
+}
+
+message ServiceInfo {
+  // Fully qualified, e.g. shop.v1.OrderService.
+  string name = 1;
+  // Descriptor path the service came from.
+  string file = 2;
+  repeated MethodInfo methods = 3;
+}
+
+message MethodInfo {
+  // Bare method name, e.g. GetOrder.
+  string name = 1;
+  string input_type = 2;
+  string output_type = 3;
+  bool client_streaming = 4;
+  bool server_streaming = 5;
+}

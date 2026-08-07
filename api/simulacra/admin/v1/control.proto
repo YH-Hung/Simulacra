@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package simulacra.admin.v1;
+
+option go_package = "github.com/yinghanhung/simulacra/gen/simulacra/admin/v1;adminv1";
+
+// ControlService reports on and resets the server as a whole.
+service ControlService {
+  rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
+  rpc Reset(ResetRequest) returns (ResetResponse);
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+}
+
+message GetServerInfoRequest {}
+
+message GetServerInfoResponse {
+  string version = 1;
+  string data_addr = 2;
+  string admin_addr = 3;
+  int32 service_count = 4;
+  int32 stub_count = 5;
+  int32 journal_count = 6;
+  int32 journal_capacity = 7;
+}
+
+message ResetRequest {
+  // Presence-tracked: an omitted field means true (reset it), explicit false
+  // skips. A plain proto3 bool could not tell those apart.
+  optional bool stubs = 1;
+  optional bool journal = 2;
+}
+
+message ResetResponse {}
+
+message ShutdownRequest {}
+
+message ShutdownResponse {}
