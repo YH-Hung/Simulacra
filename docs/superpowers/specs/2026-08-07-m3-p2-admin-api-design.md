@@ -38,7 +38,7 @@ arrive in Phase 4.
 
 ```
 simulacra/
-├── buf.yaml                     # NEW  v2 workspace: modules[api], lint STANDARD, breaking WIRE_JSON
+├── buf.yaml                     # NEW  v2 workspace: modules[api], lint STANDARD, breaking FILE
 ├── buf.gen.yaml                 # NEW  local plugins → gen/
 ├── Makefile                     # NEW  tools / generate / lint-api / breaking-api
 ├── bin/                         # NEW  gitignored; pinned tool binaries land here
@@ -78,22 +78,40 @@ is to pin executables via Go 1.24 `tool` directives:
 
 ```make
 GOBIN := $(CURDIR)/bin
-export PATH := $(GOBIN):$(PATH)
+# Invoke the pinned buf by absolute path, with ./bin prepended to PATH so buf
+# can find its protoc-gen-* plugins. Setting PATH inline rather than with a
+# global `export` is required for GNU Make 3.81 (stock macOS), which does not
+# propagate exported variables to recipe lines with no shell metacharacters.
+BUF := PATH="$(GOBIN):$$PATH" $(GOBIN)/buf
+
+.DEFAULT_GOAL := lint-api
 
 .PHONY: tools generate lint-api breaking-api
 
-tools:         ## install pinned codegen binaries into ./bin
+# $(GOBIN)/buf is a file target, not phony, so make skips the install recipe
+# once the pinned binaries are newer than tools/go.mod and tools/go.sum —
+# routine invocations of generate/lint-api/breaking-api don't reinstall the
+# toolchain every time.
+$(GOBIN)/buf: tools/go.mod tools/go.sum
 	GOBIN=$(GOBIN) go -C tools install tool
 
-generate: tools
-	buf generate
+tools: $(GOBIN)/buf         ## phony convenience alias for a fresh clone
 
-lint-api: tools
-	buf lint
+generate: $(GOBIN)/buf
+	$(BUF) generate
 
-breaking-api: tools
-	buf breaking --against '.git#branch=main'
+lint-api: $(GOBIN)/buf
+	$(BUF) lint
+
+breaking-api: $(GOBIN)/buf
+	$(BUF) breaking --against '.git#ref=origin/main'
 ```
+
+This is the final state, reached in two corrections after the first implementation: `export PATH`
+does not reach recipe lines with no shell metacharacters under GNU Make 3.81, so plain `buf`
+invocations failed to find the plugins and were replaced with the `BUF :=` inline-PATH form; and the
+phony `tools` target was later converted to the `$(GOBIN)/buf` file-target form above so that
+`lint-api`/`generate`/`breaking-api` skip reinstalling the toolchain when nothing pinning it changed.
 
 Three properties this buys:
 
@@ -115,6 +133,7 @@ buf bundles. There is no BSR dependency, so generation works offline.
 
 ```yaml
 version: v2
+clean: true
 plugins:
   - local: protoc-gen-go
     out: gen
@@ -123,6 +142,12 @@ plugins:
     out: gen
     opt: paths=source_relative
 ```
+
+`clean: true` makes `buf generate` remove files it no longer writes, not just add or update them.
+Without it, deleting or renaming a proto leaves the corresponding `.pb.go` / `.connect.go` orphaned
+in `gen/` — the "gen/ is in sync" CI check (§6) does not catch this, because a plain `git add -A gen`
++ `git diff --cached` sees no change to a file nothing touched. A rename is worse: the stale and new
+files would both register the same proto path and panic at package init.
 
 No managed mode. Each `.proto` declares its own
 `option go_package = "github.com/yinghanhung/simulacra/gen/simulacra/admin/v1;adminv1";`. The
@@ -150,7 +175,9 @@ which is why empty request/response messages appear rather than `google.protobuf
 ```proto
 service SchemaService {
   rpc RegisterSchemas(RegisterSchemasRequest) returns (RegisterSchemasResponse);
-  rpc ListServices(ListServicesRequest) returns (ListServicesResponse);
+  rpc ListServices(ListServicesRequest) returns (ListServicesResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
 }
 
 message RegisterSchemasRequest {
@@ -184,10 +211,14 @@ message MethodInfo {
 ```proto
 service StubService {
   rpc CreateStub(CreateStubRequest) returns (CreateStubResponse);
-  rpc ListStubs(ListStubsRequest) returns (ListStubsResponse);
+  rpc ListStubs(ListStubsRequest) returns (ListStubsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
   rpc DeleteStub(DeleteStubRequest) returns (DeleteStubResponse);
   rpc ReplaceAllStubs(ReplaceAllStubsRequest) returns (ReplaceAllStubsResponse);
-  rpc ExportStubs(ExportStubsRequest) returns (ExportStubsResponse);
+  rpc ExportStubs(ExportStubsRequest) returns (ExportStubsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
 }
 
 enum StubOrigin {
@@ -224,7 +255,7 @@ message CreateStubRequest {
 message CreateStubResponse { Stub stub = 1; }
 
 message ListStubsRequest {
-  string method = 1;         // optional filter
+  string method = 1;         // optional filter, normalized "/pkg.Service/Method" as in Stub.method
   StubOrigin origin = 2;     // optional filter; UNSPECIFIED means all origins
 }
 message ListStubsResponse { repeated Stub stubs = 1; }
@@ -254,8 +285,12 @@ import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 
 service JournalService {
-  rpc ListCalls(ListCallsRequest) returns (ListCallsResponse);
-  rpc WatchCalls(WatchCallsRequest) returns (stream WatchCallsResponse);
+  rpc ListCalls(ListCallsRequest) returns (ListCallsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  rpc WatchCalls(WatchCallsRequest) returns (stream WatchCallsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
   rpc ResetJournal(ResetJournalRequest) returns (ResetJournalResponse);
 }
 
@@ -282,7 +317,11 @@ message CallStatus {
 message Call {
   uint64 seq = 1;
   string method = 2;
-  repeated MetadataEntry metadata = 3;
+  // request_metadata is deliberately qualified, not "metadata": it holds
+  // request metadata only, and response headers/trailers (stub.Respond.Metadata,
+  // stub.Respond.Trailers) are a plausible future addition that would leave an
+  // unqualified name ambiguous.
+  repeated MetadataEntry request_metadata = 3;
   repeated DecodedMessage requests = 4;
   repeated DecodedMessage responses = 5;
   CallStatus status = 6;
@@ -292,21 +331,24 @@ message Call {
 }
 
 message ListCallsRequest {
-  string method = 1;         // optional filter
+  string method = 1;         // optional filter, normalized "/pkg.Service/Method" as in Stub.method
   int32 limit = 2;           // 0 means no limit
 }
 message ListCallsResponse { repeated Call calls = 1; }  // newest first
 
-message WatchCallsRequest { string method = 1; }
+message WatchCallsRequest { string method = 1; }  // optional filter, same form as ListCallsRequest.method
 message WatchCallsResponse { Call call = 1; }
 
 message ResetJournalRequest {}
 message ResetJournalResponse {}
 ```
 
-`metadata` is a `repeated MetadataEntry` rather than a `map<string, string>` because gRPC metadata
-is multi-valued (`metadata.MD` is `map[string][]string`) and proto3 maps cannot hold repeated
-values.
+`request_metadata` is a `repeated MetadataEntry` rather than a `map<string, string>` because gRPC
+metadata is multi-valued (`metadata.MD` is `map[string][]string`) and proto3 maps cannot hold
+repeated values. It is named `request_metadata`, not `metadata`, because response headers and
+trailers (`stub.Respond.Metadata`, `stub.Respond.Trailers`) are a plausible future addition to
+`Call`, and an unqualified name would then be permanently ambiguous; renaming after `api/` reaches
+`main` would be a JSON-name break, so the qualified name was adopted before that cost applied.
 
 ### 4.4 `verify.proto`
 
@@ -314,7 +356,9 @@ values.
 import "simulacra/admin/v1/journal.proto";
 
 service VerifyService {
-  rpc VerifyCalls(VerifyCallsRequest) returns (VerifyCallsResponse);
+  rpc VerifyCalls(VerifyCallsRequest) returns (VerifyCallsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
 }
 
 // Times mirrors internal/journal.Times. Deliberately NOT a oneof: at_least and
@@ -328,7 +372,7 @@ message Times {
 }
 
 message VerifyCallsRequest {
-  string method = 1;
+  string method = 1;             // normalized "/pkg.Service/Method" as in Stub.method
   string matcher_document = 2;   // stub-grammar match block; empty matches any call to method
   Times times = 3;
 }
@@ -349,7 +393,9 @@ message CallExplanation {
 
 ```proto
 service ControlService {
-  rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
+  rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
   rpc Reset(ResetRequest) returns (ResetResponse);
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
 }
@@ -367,6 +413,11 @@ message GetServerInfoResponse {
 
 message ResetRequest {
   // Presence-tracked: an omitted field means true (reset it); explicit false skips.
+  //
+  // Forward-compatibility trap: this "omitted means true" convention applies
+  // only to stubs and journal. Any reset target added later must default to
+  // NOT resetting when omitted, or every existing client already sending a
+  // bare ResetRequest{} would silently start resetting it too.
   optional bool stubs = 1;
   optional bool journal = 2;
 }
@@ -412,15 +463,26 @@ A new `api` job in `.github/workflows/ci.yml`, alongside the unchanged `test` jo
       - run: make lint-api
       - name: buf breaking
         run: |
+          git rev-parse --verify -q origin/main >/dev/null || { echo "origin/main did not resolve"; exit 1; }
           if git cat-file -e origin/main:api 2>/dev/null; then
             make breaking-api
           else
             echo "baseline origin/main has no api/ yet; skipping the first breaking check"
           fi
       - run: make generate
+      - run: go build ./...
       - name: verify gen/ is in sync with api/
         run: git add -A gen && git diff --cached --exit-code -- gen
 ```
+
+Two corrections after initial implementation: the existence guard originally checked only
+`git cat-file -e origin/main:api`, which exits nonzero both when `origin/main` has no `api/` tree and
+when `origin/main` fails to resolve at all — an unresolvable ref would have silently disabled the
+breaking check forever instead of just for the bootstrap commit, so `git rev-parse --verify` now
+fails the job loudly in that case. And `go build ./...` runs after `make generate`, so a freshly
+regenerated `gen/` is asserted to compile in CI, not just the committed bytes the `test` job already
+covers — this also turns the rename/duplicate-registration failure mode into a loud build error
+rather than a silent pass.
 
 The sync check stages before diffing so that **added and deleted** generated files fail it, not
 just modified ones — a plain `git diff` would silently pass a newly generated file.
@@ -465,7 +527,9 @@ The test asserts, against a literal expectation table:
 
 1. Each of the five service descriptors is reachable from the generated file descriptors.
 2. Each service has exactly the expected set of RPC names, with the expected streaming flags
-   (`WatchCalls` server-streaming, everything else unary).
+   (`WatchCalls` server-streaming, everything else unary) and the expected fully-qualified
+   request/response message names — the last of these added in the final review pass so a type
+   swap on an unchanged RPC name fails the test directly, not just a name-and-streaming-flags check.
 3. The connect constructors exist, via compile-time references such as
    `var _ = adminv1connect.NewStubServiceClient`.
 4. `Times`' presence semantics survive codegen: setting only `at_least` leaves `exactly` and
