@@ -431,9 +431,12 @@ The existing `test` job needs no change; `go build ./...` and `go test -race ./.
 **Bootstrap of `buf breaking` — resolved by testing, not left to chance.** Two facts were verified
 against buf v1.72.0 while writing the implementation plan:
 
-- Against a baseline with no `api/` directory, `buf breaking` fails hard with
-  `Failure: Module "path: "."" had no .proto files`. It does not silently pass, so the commit that
-  first introduces `api/` would red the build.
+- Against a baseline with no `buf.yaml` — true of `origin/main` before this phase — buf cannot
+  scope a module boundary and free-scans the whole repository instead of just `api/`. It does not
+  silently pass, but the exact symptom depends on what other protos the repository contains: here
+  it surfaces as import-resolution errors from the pre-existing `conformance/protos/**` fixtures,
+  not a clean "missing api/" message. Either way the failure is hard, so the commit that first
+  introduces `api/` would red the build without a guard.
 - `--against '.git#branch=main'` does not resolve on pull-request checkouts, which have no local
   `main` branch. `--against '.git#ref=origin/main'` resolves on both push and PR events.
 
