@@ -3,6 +3,7 @@ module github.com/yinghanhung/simulacra
 go 1.25.0
 
 require (
+	connectrpc.com/connect v1.20.0
 	github.com/bufbuild/protocompile v0.14.1
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/google/cel-go v0.29.2
