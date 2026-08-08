@@ -76,6 +76,7 @@ func NewStubServiceClient(httpClient connect.HTTPClient, baseURL string, opts ..
 			httpClient,
 			baseURL+StubServiceListStubsProcedure,
 			connect.WithSchema(stubServiceMethods.ByName("ListStubs")),
+			connect.WithIdempotency(connect.IdempotencyNoSideEffects),
 			connect.WithClientOptions(opts...),
 		),
 		deleteStub: connect.NewClient[v1.DeleteStubRequest, v1.DeleteStubResponse](
@@ -94,6 +95,7 @@ func NewStubServiceClient(httpClient connect.HTTPClient, baseURL string, opts ..
 			httpClient,
 			baseURL+StubServiceExportStubsProcedure,
 			connect.WithSchema(stubServiceMethods.ByName("ExportStubs")),
+			connect.WithIdempotency(connect.IdempotencyNoSideEffects),
 			connect.WithClientOptions(opts...),
 		),
 	}
@@ -159,6 +161,7 @@ func NewStubServiceHandler(svc StubServiceHandler, opts ...connect.HandlerOption
 		StubServiceListStubsProcedure,
 		svc.ListStubs,
 		connect.WithSchema(stubServiceMethods.ByName("ListStubs")),
+		connect.WithIdempotency(connect.IdempotencyNoSideEffects),
 		connect.WithHandlerOptions(opts...),
 	)
 	stubServiceDeleteStubHandler := connect.NewUnaryHandler(
@@ -177,6 +180,7 @@ func NewStubServiceHandler(svc StubServiceHandler, opts ...connect.HandlerOption
 		StubServiceExportStubsProcedure,
 		svc.ExportStubs,
 		connect.WithSchema(stubServiceMethods.ByName("ExportStubs")),
+		connect.WithIdempotency(connect.IdempotencyNoSideEffects),
 		connect.WithHandlerOptions(opts...),
 	)
 	return "/simulacra.admin.v1.StubService/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

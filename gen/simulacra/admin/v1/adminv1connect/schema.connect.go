@@ -68,6 +68,7 @@ func NewSchemaServiceClient(httpClient connect.HTTPClient, baseURL string, opts 
 			httpClient,
 			baseURL+SchemaServiceListServicesProcedure,
 			connect.WithSchema(schemaServiceMethods.ByName("ListServices")),
+			connect.WithIdempotency(connect.IdempotencyNoSideEffects),
 			connect.WithClientOptions(opts...),
 		),
 	}
@@ -112,6 +113,7 @@ func NewSchemaServiceHandler(svc SchemaServiceHandler, opts ...connect.HandlerOp
 		SchemaServiceListServicesProcedure,
 		svc.ListServices,
 		connect.WithSchema(schemaServiceMethods.ByName("ListServices")),
+		connect.WithIdempotency(connect.IdempotencyNoSideEffects),
 		connect.WithHandlerOptions(opts...),
 	)
 	return "/simulacra.admin.v1.SchemaService/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -31,34 +31,41 @@ type methodSpec struct {
 	Name            string
 	ClientStreaming bool
 	ServerStreaming bool
+	// Input and Output are the fully-qualified request/response message
+	// names, e.g. "simulacra.admin.v1.ListStubsRequest". Asserting them
+	// catches a type swap (an RPC kept its name but started taking or
+	// returning the wrong message) that name-and-streaming-flags alone would
+	// miss.
+	Input  string
+	Output string
 }
 
 // wantSurface is the admin contract as designed. Adding an RPC is a deliberate
 // one-line edit here — the right amount of friction for a public API.
 var wantSurface = map[string][]methodSpec{
 	"simulacra.admin.v1.SchemaService": {
-		{Name: "RegisterSchemas"},
-		{Name: "ListServices"},
+		{Name: "RegisterSchemas", Input: "simulacra.admin.v1.RegisterSchemasRequest", Output: "simulacra.admin.v1.RegisterSchemasResponse"},
+		{Name: "ListServices", Input: "simulacra.admin.v1.ListServicesRequest", Output: "simulacra.admin.v1.ListServicesResponse"},
 	},
 	"simulacra.admin.v1.StubService": {
-		{Name: "CreateStub"},
-		{Name: "ListStubs"},
-		{Name: "DeleteStub"},
-		{Name: "ReplaceAllStubs"},
-		{Name: "ExportStubs"},
+		{Name: "CreateStub", Input: "simulacra.admin.v1.CreateStubRequest", Output: "simulacra.admin.v1.CreateStubResponse"},
+		{Name: "ListStubs", Input: "simulacra.admin.v1.ListStubsRequest", Output: "simulacra.admin.v1.ListStubsResponse"},
+		{Name: "DeleteStub", Input: "simulacra.admin.v1.DeleteStubRequest", Output: "simulacra.admin.v1.DeleteStubResponse"},
+		{Name: "ReplaceAllStubs", Input: "simulacra.admin.v1.ReplaceAllStubsRequest", Output: "simulacra.admin.v1.ReplaceAllStubsResponse"},
+		{Name: "ExportStubs", Input: "simulacra.admin.v1.ExportStubsRequest", Output: "simulacra.admin.v1.ExportStubsResponse"},
 	},
 	"simulacra.admin.v1.JournalService": {
-		{Name: "ListCalls"},
-		{Name: "WatchCalls", ServerStreaming: true},
-		{Name: "ResetJournal"},
+		{Name: "ListCalls", Input: "simulacra.admin.v1.ListCallsRequest", Output: "simulacra.admin.v1.ListCallsResponse"},
+		{Name: "WatchCalls", ServerStreaming: true, Input: "simulacra.admin.v1.WatchCallsRequest", Output: "simulacra.admin.v1.WatchCallsResponse"},
+		{Name: "ResetJournal", Input: "simulacra.admin.v1.ResetJournalRequest", Output: "simulacra.admin.v1.ResetJournalResponse"},
 	},
 	"simulacra.admin.v1.VerifyService": {
-		{Name: "VerifyCalls"},
+		{Name: "VerifyCalls", Input: "simulacra.admin.v1.VerifyCallsRequest", Output: "simulacra.admin.v1.VerifyCallsResponse"},
 	},
 	"simulacra.admin.v1.ControlService": {
-		{Name: "GetServerInfo"},
-		{Name: "Reset"},
-		{Name: "Shutdown"},
+		{Name: "GetServerInfo", Input: "simulacra.admin.v1.GetServerInfoRequest", Output: "simulacra.admin.v1.GetServerInfoResponse"},
+		{Name: "Reset", Input: "simulacra.admin.v1.ResetRequest", Output: "simulacra.admin.v1.ResetResponse"},
+		{Name: "Shutdown", Input: "simulacra.admin.v1.ShutdownRequest", Output: "simulacra.admin.v1.ShutdownResponse"},
 	},
 }
 
@@ -84,6 +91,8 @@ func TestGeneratedSurfaceMatchesTheAdminContract(t *testing.T) {
 					Name:            string(m.Name()),
 					ClientStreaming: m.IsStreamingClient(),
 					ServerStreaming: m.IsStreamingServer(),
+					Input:           string(m.Input().FullName()),
+					Output:          string(m.Output().FullName()),
 				})
 			}
 			got[string(svc.FullName())] = specs

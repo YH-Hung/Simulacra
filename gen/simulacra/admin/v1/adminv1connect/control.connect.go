@@ -64,6 +64,7 @@ func NewControlServiceClient(httpClient connect.HTTPClient, baseURL string, opts
 			httpClient,
 			baseURL+ControlServiceGetServerInfoProcedure,
 			connect.WithSchema(controlServiceMethods.ByName("GetServerInfo")),
+			connect.WithIdempotency(connect.IdempotencyNoSideEffects),
 			connect.WithClientOptions(opts...),
 		),
 		reset: connect.NewClient[v1.ResetRequest, v1.ResetResponse](
@@ -121,6 +122,7 @@ func NewControlServiceHandler(svc ControlServiceHandler, opts ...connect.Handler
 		ControlServiceGetServerInfoProcedure,
 		svc.GetServerInfo,
 		connect.WithSchema(controlServiceMethods.ByName("GetServerInfo")),
+		connect.WithIdempotency(connect.IdempotencyNoSideEffects),
 		connect.WithHandlerOptions(opts...),
 	)
 	controlServiceResetHandler := connect.NewUnaryHandler(

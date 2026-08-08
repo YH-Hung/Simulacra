@@ -7,7 +7,9 @@ option go_package = "github.com/yinghanhung/simulacra/gen/simulacra/admin/v1;adm
 // SchemaService manages the descriptors the data plane serves.
 service SchemaService {
   rpc RegisterSchemas(RegisterSchemasRequest) returns (RegisterSchemasResponse);
-  rpc ListServices(ListServicesRequest) returns (ListServicesResponse);
+  rpc ListServices(ListServicesRequest) returns (ListServicesResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
 }
 
 message RegisterSchemasRequest {

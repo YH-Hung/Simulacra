@@ -364,10 +364,10 @@ const file_simulacra_admin_v1_schema_proto_rawDesc = "" +
 	"\voutput_type\x18\x03 \x01(\tR\n" +
 	"outputType\x12)\n" +
 	"\x10client_streaming\x18\x04 \x01(\bR\x0fclientStreaming\x12)\n" +
-	"\x10server_streaming\x18\x05 \x01(\bR\x0fserverStreaming2\xde\x01\n" +
+	"\x10server_streaming\x18\x05 \x01(\bR\x0fserverStreaming2\xe3\x01\n" +
 	"\rSchemaService\x12j\n" +
-	"\x0fRegisterSchemas\x12*.simulacra.admin.v1.RegisterSchemasRequest\x1a+.simulacra.admin.v1.RegisterSchemasResponse\x12a\n" +
-	"\fListServices\x12'.simulacra.admin.v1.ListServicesRequest\x1a(.simulacra.admin.v1.ListServicesResponseBAZ?github.com/yinghanhung/simulacra/gen/simulacra/admin/v1;adminv1b\x06proto3"
+	"\x0fRegisterSchemas\x12*.simulacra.admin.v1.RegisterSchemasRequest\x1a+.simulacra.admin.v1.RegisterSchemasResponse\x12f\n" +
+	"\fListServices\x12'.simulacra.admin.v1.ListServicesRequest\x1a(.simulacra.admin.v1.ListServicesResponse\"\x03\x90\x02\x01BAZ?github.com/yinghanhung/simulacra/gen/simulacra/admin/v1;adminv1b\x06proto3"
 
 var (
 	file_simulacra_admin_v1_schema_proto_rawDescOnce sync.Once

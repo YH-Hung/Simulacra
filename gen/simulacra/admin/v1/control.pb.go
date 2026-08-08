@@ -153,6 +153,14 @@ type ResetRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Presence-tracked: an omitted field means true (reset it), explicit false
 	// skips. A plain proto3 bool could not tell those apart.
+	//
+	// Forward-compatibility trap: this "omitted means true" convention applies
+	// only to stubs and journal. Any reset target added later must instead
+	// default to NOT resetting when omitted (i.e. use "omitted or false means
+	// skip, explicit true means reset"). If it reused the omitted-means-true
+	// convention, every existing client already sending a bare ResetRequest{}
+	// would silently start resetting the new target too, since it never knew
+	// to opt out.
 	Stubs         *bool `protobuf:"varint,1,opt,name=stubs,proto3,oneof" json:"stubs,omitempty"`
 	Journal       *bool `protobuf:"varint,2,opt,name=journal,proto3,oneof" json:"journal,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -335,9 +343,9 @@ const file_simulacra_admin_v1_control_proto_rawDesc = "" +
 	"\b_journal\"\x0f\n" +
 	"\rResetResponse\"\x11\n" +
 	"\x0fShutdownRequest\"\x12\n" +
-	"\x10ShutdownResponse2\x9b\x02\n" +
-	"\x0eControlService\x12d\n" +
-	"\rGetServerInfo\x12(.simulacra.admin.v1.GetServerInfoRequest\x1a).simulacra.admin.v1.GetServerInfoResponse\x12L\n" +
+	"\x10ShutdownResponse2\xa0\x02\n" +
+	"\x0eControlService\x12i\n" +
+	"\rGetServerInfo\x12(.simulacra.admin.v1.GetServerInfoRequest\x1a).simulacra.admin.v1.GetServerInfoResponse\"\x03\x90\x02\x01\x12L\n" +
 	"\x05Reset\x12 .simulacra.admin.v1.ResetRequest\x1a!.simulacra.admin.v1.ResetResponse\x12U\n" +
 	"\bShutdown\x12#.simulacra.admin.v1.ShutdownRequest\x1a$.simulacra.admin.v1.ShutdownResponseBAZ?github.com/yinghanhung/simulacra/gen/simulacra/admin/v1;adminv1b\x06proto3"
 

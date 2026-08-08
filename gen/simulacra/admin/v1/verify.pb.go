@@ -92,8 +92,9 @@ func (x *Times) GetNever() bool {
 }
 
 type VerifyCallsRequest struct {
-	state  protoimpl.MessageState `protogen:"open.v1"`
-	Method string                 `protobuf:"bytes,1,opt,name=method,proto3" json:"method,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Normalized "/pkg.Service/Method" as in stub.Stub.method.
+	Method string `protobuf:"bytes,1,opt,name=method,proto3" json:"method,omitempty"`
 	// Stub-grammar match block; empty matches any call to method.
 	MatcherDocument string `protobuf:"bytes,2,opt,name=matcher_document,json=matcherDocument,proto3" json:"matcher_document,omitempty"`
 	Times           *Times `protobuf:"bytes,3,opt,name=times,proto3" json:"times,omitempty"`
@@ -301,9 +302,9 @@ const file_simulacra_admin_v1_verify_proto_rawDesc = "" +
 	"\x06actual\x18\x04 \x03(\v2#.simulacra.admin.v1.CallExplanationR\x06actual\"b\n" +
 	"\x0fCallExplanation\x12,\n" +
 	"\x04call\x18\x01 \x01(\v2\x18.simulacra.admin.v1.CallR\x04call\x12!\n" +
-	"\fnearest_miss\x18\x02 \x01(\tR\vnearestMiss2o\n" +
-	"\rVerifyService\x12^\n" +
-	"\vVerifyCalls\x12&.simulacra.admin.v1.VerifyCallsRequest\x1a'.simulacra.admin.v1.VerifyCallsResponseBAZ?github.com/yinghanhung/simulacra/gen/simulacra/admin/v1;adminv1b\x06proto3"
+	"\fnearest_miss\x18\x02 \x01(\tR\vnearestMiss2t\n" +
+	"\rVerifyService\x12c\n" +
+	"\vVerifyCalls\x12&.simulacra.admin.v1.VerifyCallsRequest\x1a'.simulacra.admin.v1.VerifyCallsResponse\"\x03\x90\x02\x01BAZ?github.com/yinghanhung/simulacra/gen/simulacra/admin/v1;adminv1b\x06proto3"
 
 var (
 	file_simulacra_admin_v1_verify_proto_rawDescOnce sync.Once

@@ -332,7 +332,7 @@ func (x *CreateStubResponse) GetStub() *Stub {
 
 type ListStubsRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Optional method filter.
+	// Optional method filter, normalized "/pkg.Service/Method" as in Stub.method.
 	Method string `protobuf:"bytes,1,opt,name=method,proto3" json:"method,omitempty"`
 	// Optional origin filter; STUB_ORIGIN_UNSPECIFIED means all origins.
 	Origin        StubOrigin `protobuf:"varint,2,opt,name=origin,proto3,enum=simulacra.admin.v1.StubOrigin" json:"origin,omitempty"`
@@ -732,15 +732,15 @@ const file_simulacra_admin_v1_stub_proto_rawDesc = "" +
 	"\x10STUB_SHAPE_UNARY\x10\x01\x12\x1c\n" +
 	"\x18STUB_SHAPE_SERVER_STREAM\x10\x02\x12\x1c\n" +
 	"\x18STUB_SHAPE_CLIENT_STREAM\x10\x03\x12\x1a\n" +
-	"\x16STUB_SHAPE_BIDI_STREAM\x10\x042\xed\x03\n" +
+	"\x16STUB_SHAPE_BIDI_STREAM\x10\x042\xf7\x03\n" +
 	"\vStubService\x12[\n" +
 	"\n" +
-	"CreateStub\x12%.simulacra.admin.v1.CreateStubRequest\x1a&.simulacra.admin.v1.CreateStubResponse\x12X\n" +
-	"\tListStubs\x12$.simulacra.admin.v1.ListStubsRequest\x1a%.simulacra.admin.v1.ListStubsResponse\x12[\n" +
+	"CreateStub\x12%.simulacra.admin.v1.CreateStubRequest\x1a&.simulacra.admin.v1.CreateStubResponse\x12]\n" +
+	"\tListStubs\x12$.simulacra.admin.v1.ListStubsRequest\x1a%.simulacra.admin.v1.ListStubsResponse\"\x03\x90\x02\x01\x12[\n" +
 	"\n" +
 	"DeleteStub\x12%.simulacra.admin.v1.DeleteStubRequest\x1a&.simulacra.admin.v1.DeleteStubResponse\x12j\n" +
-	"\x0fReplaceAllStubs\x12*.simulacra.admin.v1.ReplaceAllStubsRequest\x1a+.simulacra.admin.v1.ReplaceAllStubsResponse\x12^\n" +
-	"\vExportStubs\x12&.simulacra.admin.v1.ExportStubsRequest\x1a'.simulacra.admin.v1.ExportStubsResponseBAZ?github.com/yinghanhung/simulacra/gen/simulacra/admin/v1;adminv1b\x06proto3"
+	"\x0fReplaceAllStubs\x12*.simulacra.admin.v1.ReplaceAllStubsRequest\x1a+.simulacra.admin.v1.ReplaceAllStubsResponse\x12c\n" +
+	"\vExportStubs\x12&.simulacra.admin.v1.ExportStubsRequest\x1a'.simulacra.admin.v1.ExportStubsResponse\"\x03\x90\x02\x01BAZ?github.com/yinghanhung/simulacra/gen/simulacra/admin/v1;adminv1b\x06proto3"
 
 var (
 	file_simulacra_admin_v1_stub_proto_rawDescOnce sync.Once

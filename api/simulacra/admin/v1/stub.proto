@@ -9,10 +9,14 @@ option go_package = "github.com/yinghanhung/simulacra/gen/simulacra/admin/v1;adm
 // the same strict loader, so files and the API can never drift.
 service StubService {
   rpc CreateStub(CreateStubRequest) returns (CreateStubResponse);
-  rpc ListStubs(ListStubsRequest) returns (ListStubsResponse);
+  rpc ListStubs(ListStubsRequest) returns (ListStubsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
   rpc DeleteStub(DeleteStubRequest) returns (DeleteStubResponse);
   rpc ReplaceAllStubs(ReplaceAllStubsRequest) returns (ReplaceAllStubsResponse);
-  rpc ExportStubs(ExportStubsRequest) returns (ExportStubsResponse);
+  rpc ExportStubs(ExportStubsRequest) returns (ExportStubsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
 }
 
 // StubOrigin records who owns a stub. File-origin stubs belong to the
@@ -59,7 +63,7 @@ message CreateStubResponse {
 }
 
 message ListStubsRequest {
-  // Optional method filter.
+  // Optional method filter, normalized "/pkg.Service/Method" as in Stub.method.
   string method = 1;
   // Optional origin filter; STUB_ORIGIN_UNSPECIFIED means all origins.
   StubOrigin origin = 2;

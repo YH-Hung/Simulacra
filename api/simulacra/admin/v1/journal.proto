@@ -10,8 +10,12 @@ option go_package = "github.com/yinghanhung/simulacra/gen/simulacra/admin/v1;adm
 
 // JournalService reads the recent-call journal.
 service JournalService {
-  rpc ListCalls(ListCallsRequest) returns (ListCallsResponse);
-  rpc WatchCalls(WatchCallsRequest) returns (stream WatchCallsResponse);
+  rpc ListCalls(ListCallsRequest) returns (ListCallsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  rpc WatchCalls(WatchCallsRequest) returns (stream WatchCallsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
   rpc ResetJournal(ResetJournalRequest) returns (ResetJournalResponse);
 }
 
@@ -45,7 +49,10 @@ message CallStatus {
 message Call {
   uint64 seq = 1;
   string method = 2;
-  repeated MetadataEntry metadata = 3;
+  // Request metadata only. Deliberately qualified: response headers and
+  // trailers (see stub.Respond.Metadata, stub.Respond.Trailers) are plausible
+  // additions later, and an unqualified "metadata" would then be ambiguous.
+  repeated MetadataEntry request_metadata = 3;
   repeated DecodedMessage requests = 4;
   repeated DecodedMessage responses = 5;
   CallStatus status = 6;
@@ -55,7 +62,8 @@ message Call {
 }
 
 message ListCallsRequest {
-  // Optional method filter.
+  // Optional method filter, normalized "/pkg.Service/Method" as in
+  // stub.Stub.method.
   string method = 1;
   // 0 means no limit.
   int32 limit = 2;
@@ -67,7 +75,8 @@ message ListCallsResponse {
 }
 
 message WatchCallsRequest {
-  // Optional method filter.
+  // Optional method filter, normalized "/pkg.Service/Method" as in
+  // stub.Stub.method.
   string method = 1;
 }
 

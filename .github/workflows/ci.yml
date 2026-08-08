@@ -31,14 +31,20 @@ jobs:
         # Guards the bootstrap commit: before api/ lands, origin/main has no
         # buf.yaml, so buf can't scope a module and fails on unrelated protos
         # instead of cleanly reporting a missing api/. The guard skips exactly
-        # that one run and is a no-op forever after.
+        # that one run and is a no-op forever after. `git cat-file -e` alone
+        # can't tell "origin/main has no api/" apart from "origin/main does
+        # not resolve at all", so resolve the ref first and fail loudly if it
+        # doesn't — otherwise an unresolvable ref would silently skip this
+        # check forever instead of just once.
         run: |
+          git rev-parse --verify -q origin/main >/dev/null || { echo "origin/main did not resolve"; exit 1; }
           if git cat-file -e origin/main:api 2>/dev/null; then
             make breaking-api
           else
             echo "baseline origin/main has no api/ yet; skipping the first breaking check"
           fi
       - run: make generate
+      - run: go build ./...
       - name: verify gen/ is in sync with api/
         # Staged before diffing so added and deleted files fail the check too,
         # not just modified ones.

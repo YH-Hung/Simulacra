@@ -6,4 +6,4 @@ lint:
     - STANDARD
 breaking:
   use:
-    - WIRE_JSON
+    - FILE

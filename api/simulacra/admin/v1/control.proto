@@ -6,7 +6,9 @@ option go_package = "github.com/yinghanhung/simulacra/gen/simulacra/admin/v1;adm
 
 // ControlService reports on and resets the server as a whole.
 service ControlService {
-  rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
+  rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
   rpc Reset(ResetRequest) returns (ResetResponse);
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
 }
@@ -26,6 +28,14 @@ message GetServerInfoResponse {
 message ResetRequest {
   // Presence-tracked: an omitted field means true (reset it), explicit false
   // skips. A plain proto3 bool could not tell those apart.
+  //
+  // Forward-compatibility trap: this "omitted means true" convention applies
+  // only to stubs and journal. Any reset target added later must instead
+  // default to NOT resetting when omitted (i.e. use "omitted or false means
+  // skip, explicit true means reset"). If it reused the omitted-means-true
+  // convention, every existing client already sending a bare ResetRequest{}
+  // would silently start resetting the new target too, since it never knew
+  // to opt out.
   optional bool stubs = 1;
   optional bool journal = 2;
 }

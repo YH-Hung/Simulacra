@@ -207,18 +207,21 @@ func (x *CallStatus) GetDetails() []*anypb.Any {
 
 // Call is one completed data-plane RPC.
 type Call struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Seq           uint64                 `protobuf:"varint,1,opt,name=seq,proto3" json:"seq,omitempty"`
-	Method        string                 `protobuf:"bytes,2,opt,name=method,proto3" json:"method,omitempty"`
-	Metadata      []*MetadataEntry       `protobuf:"bytes,3,rep,name=metadata,proto3" json:"metadata,omitempty"`
-	Requests      []*DecodedMessage      `protobuf:"bytes,4,rep,name=requests,proto3" json:"requests,omitempty"`
-	Responses     []*DecodedMessage      `protobuf:"bytes,5,rep,name=responses,proto3" json:"responses,omitempty"`
-	Status        *CallStatus            `protobuf:"bytes,6,opt,name=status,proto3" json:"status,omitempty"`
-	MatchedStubId string                 `protobuf:"bytes,7,opt,name=matched_stub_id,json=matchedStubId,proto3" json:"matched_stub_id,omitempty"`
-	Start         *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=start,proto3" json:"start,omitempty"`
-	Duration      *durationpb.Duration   `protobuf:"bytes,9,opt,name=duration,proto3" json:"duration,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Seq    uint64                 `protobuf:"varint,1,opt,name=seq,proto3" json:"seq,omitempty"`
+	Method string                 `protobuf:"bytes,2,opt,name=method,proto3" json:"method,omitempty"`
+	// Request metadata only. Deliberately qualified: response headers and
+	// trailers (see stub.Respond.Metadata, stub.Respond.Trailers) are plausible
+	// additions later, and an unqualified "metadata" would then be ambiguous.
+	RequestMetadata []*MetadataEntry       `protobuf:"bytes,3,rep,name=request_metadata,json=requestMetadata,proto3" json:"request_metadata,omitempty"`
+	Requests        []*DecodedMessage      `protobuf:"bytes,4,rep,name=requests,proto3" json:"requests,omitempty"`
+	Responses       []*DecodedMessage      `protobuf:"bytes,5,rep,name=responses,proto3" json:"responses,omitempty"`
+	Status          *CallStatus            `protobuf:"bytes,6,opt,name=status,proto3" json:"status,omitempty"`
+	MatchedStubId   string                 `protobuf:"bytes,7,opt,name=matched_stub_id,json=matchedStubId,proto3" json:"matched_stub_id,omitempty"`
+	Start           *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=start,proto3" json:"start,omitempty"`
+	Duration        *durationpb.Duration   `protobuf:"bytes,9,opt,name=duration,proto3" json:"duration,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *Call) Reset() {
@@ -265,9 +268,9 @@ func (x *Call) GetMethod() string {
 	return ""
 }
 
-func (x *Call) GetMetadata() []*MetadataEntry {
+func (x *Call) GetRequestMetadata() []*MetadataEntry {
 	if x != nil {
-		return x.Metadata
+		return x.RequestMetadata
 	}
 	return nil
 }
@@ -316,7 +319,8 @@ func (x *Call) GetDuration() *durationpb.Duration {
 
 type ListCallsRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Optional method filter.
+	// Optional method filter, normalized "/pkg.Service/Method" as in
+	// stub.Stub.method.
 	Method string `protobuf:"bytes,1,opt,name=method,proto3" json:"method,omitempty"`
 	// 0 means no limit.
 	Limit         int32 `protobuf:"varint,2,opt,name=limit,proto3" json:"limit,omitempty"`
@@ -415,7 +419,8 @@ func (x *ListCallsResponse) GetCalls() []*Call {
 
 type WatchCallsRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Optional method filter.
+	// Optional method filter, normalized "/pkg.Service/Method" as in
+	// stub.Stub.method.
 	Method        string `protobuf:"bytes,1,opt,name=method,proto3" json:"method,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -591,11 +596,11 @@ const file_simulacra_admin_v1_journal_proto_rawDesc = "" +
 	"CallStatus\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\x05R\x04code\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12.\n" +
-	"\adetails\x18\x03 \x03(\v2\x14.google.protobuf.AnyR\adetails\"\xba\x03\n" +
+	"\adetails\x18\x03 \x03(\v2\x14.google.protobuf.AnyR\adetails\"\xc9\x03\n" +
 	"\x04Call\x12\x10\n" +
 	"\x03seq\x18\x01 \x01(\x04R\x03seq\x12\x16\n" +
-	"\x06method\x18\x02 \x01(\tR\x06method\x12=\n" +
-	"\bmetadata\x18\x03 \x03(\v2!.simulacra.admin.v1.MetadataEntryR\bmetadata\x12>\n" +
+	"\x06method\x18\x02 \x01(\tR\x06method\x12L\n" +
+	"\x10request_metadata\x18\x03 \x03(\v2!.simulacra.admin.v1.MetadataEntryR\x0frequestMetadata\x12>\n" +
 	"\brequests\x18\x04 \x03(\v2\".simulacra.admin.v1.DecodedMessageR\brequests\x12@\n" +
 	"\tresponses\x18\x05 \x03(\v2\".simulacra.admin.v1.DecodedMessageR\tresponses\x126\n" +
 	"\x06status\x18\x06 \x01(\v2\x1e.simulacra.admin.v1.CallStatusR\x06status\x12&\n" +
@@ -612,11 +617,11 @@ const file_simulacra_admin_v1_journal_proto_rawDesc = "" +
 	"\x12WatchCallsResponse\x12,\n" +
 	"\x04call\x18\x01 \x01(\v2\x18.simulacra.admin.v1.CallR\x04call\"\x15\n" +
 	"\x13ResetJournalRequest\"\x16\n" +
-	"\x14ResetJournalResponse2\xac\x02\n" +
-	"\x0eJournalService\x12X\n" +
-	"\tListCalls\x12$.simulacra.admin.v1.ListCallsRequest\x1a%.simulacra.admin.v1.ListCallsResponse\x12]\n" +
+	"\x14ResetJournalResponse2\xb6\x02\n" +
+	"\x0eJournalService\x12]\n" +
+	"\tListCalls\x12$.simulacra.admin.v1.ListCallsRequest\x1a%.simulacra.admin.v1.ListCallsResponse\"\x03\x90\x02\x01\x12b\n" +
 	"\n" +
-	"WatchCalls\x12%.simulacra.admin.v1.WatchCallsRequest\x1a&.simulacra.admin.v1.WatchCallsResponse0\x01\x12a\n" +
+	"WatchCalls\x12%.simulacra.admin.v1.WatchCallsRequest\x1a&.simulacra.admin.v1.WatchCallsResponse\"\x03\x90\x02\x010\x01\x12a\n" +
 	"\fResetJournal\x12'.simulacra.admin.v1.ResetJournalRequest\x1a(.simulacra.admin.v1.ResetJournalResponseBAZ?github.com/yinghanhung/simulacra/gen/simulacra/admin/v1;adminv1b\x06proto3"
 
 var (
@@ -649,7 +654,7 @@ var file_simulacra_admin_v1_journal_proto_goTypes = []any{
 }
 var file_simulacra_admin_v1_journal_proto_depIdxs = []int32{
 	10, // 0: simulacra.admin.v1.CallStatus.details:type_name -> google.protobuf.Any
-	1,  // 1: simulacra.admin.v1.Call.metadata:type_name -> simulacra.admin.v1.MetadataEntry
+	1,  // 1: simulacra.admin.v1.Call.request_metadata:type_name -> simulacra.admin.v1.MetadataEntry
 	0,  // 2: simulacra.admin.v1.Call.requests:type_name -> simulacra.admin.v1.DecodedMessage
 	0,  // 3: simulacra.admin.v1.Call.responses:type_name -> simulacra.admin.v1.DecodedMessage
 	2,  // 4: simulacra.admin.v1.Call.status:type_name -> simulacra.admin.v1.CallStatus

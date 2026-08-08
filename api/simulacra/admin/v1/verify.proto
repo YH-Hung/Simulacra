@@ -8,7 +8,9 @@ option go_package = "github.com/yinghanhung/simulacra/gen/simulacra/admin/v1;adm
 
 // VerifyService asserts what the data plane was asked to do.
 service VerifyService {
-  rpc VerifyCalls(VerifyCallsRequest) returns (VerifyCallsResponse);
+  rpc VerifyCalls(VerifyCallsRequest) returns (VerifyCallsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
 }
 
 // Times mirrors internal/journal.Times. Deliberately not a oneof: at_least and
@@ -21,6 +23,7 @@ message Times {
 }
 
 message VerifyCallsRequest {
+  // Normalized "/pkg.Service/Method" as in stub.Stub.method.
   string method = 1;
   // Stub-grammar match block; empty matches any call to method.
   string matcher_document = 2;

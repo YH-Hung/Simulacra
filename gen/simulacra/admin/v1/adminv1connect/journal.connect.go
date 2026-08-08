@@ -66,12 +66,14 @@ func NewJournalServiceClient(httpClient connect.HTTPClient, baseURL string, opts
 			httpClient,
 			baseURL+JournalServiceListCallsProcedure,
 			connect.WithSchema(journalServiceMethods.ByName("ListCalls")),
+			connect.WithIdempotency(connect.IdempotencyNoSideEffects),
 			connect.WithClientOptions(opts...),
 		),
 		watchCalls: connect.NewClient[v1.WatchCallsRequest, v1.WatchCallsResponse](
 			httpClient,
 			baseURL+JournalServiceWatchCallsProcedure,
 			connect.WithSchema(journalServiceMethods.ByName("WatchCalls")),
+			connect.WithIdempotency(connect.IdempotencyNoSideEffects),
 			connect.WithClientOptions(opts...),
 		),
 		resetJournal: connect.NewClient[v1.ResetJournalRequest, v1.ResetJournalResponse](
@@ -123,12 +125,14 @@ func NewJournalServiceHandler(svc JournalServiceHandler, opts ...connect.Handler
 		JournalServiceListCallsProcedure,
 		svc.ListCalls,
 		connect.WithSchema(journalServiceMethods.ByName("ListCalls")),
+		connect.WithIdempotency(connect.IdempotencyNoSideEffects),
 		connect.WithHandlerOptions(opts...),
 	)
 	journalServiceWatchCallsHandler := connect.NewServerStreamHandler(
 		JournalServiceWatchCallsProcedure,
 		svc.WatchCalls,
 		connect.WithSchema(journalServiceMethods.ByName("WatchCalls")),
+		connect.WithIdempotency(connect.IdempotencyNoSideEffects),
 		connect.WithHandlerOptions(opts...),
 	)
 	journalServiceResetJournalHandler := connect.NewUnaryHandler(

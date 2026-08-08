@@ -58,6 +58,7 @@ func NewVerifyServiceClient(httpClient connect.HTTPClient, baseURL string, opts 
 			httpClient,
 			baseURL+VerifyServiceVerifyCallsProcedure,
 			connect.WithSchema(verifyServiceMethods.ByName("VerifyCalls")),
+			connect.WithIdempotency(connect.IdempotencyNoSideEffects),
 			connect.WithClientOptions(opts...),
 		),
 	}
@@ -89,6 +90,7 @@ func NewVerifyServiceHandler(svc VerifyServiceHandler, opts ...connect.HandlerOp
 		VerifyServiceVerifyCallsProcedure,
 		svc.VerifyCalls,
 		connect.WithSchema(verifyServiceMethods.ByName("VerifyCalls")),
+		connect.WithIdempotency(connect.IdempotencyNoSideEffects),
 		connect.WithHandlerOptions(opts...),
 	)
 	return "/simulacra.admin.v1.VerifyService/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
