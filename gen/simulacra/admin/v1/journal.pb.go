@@ -9,7 +9,6 @@ package adminv1
 import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
-	anypb "google.golang.org/protobuf/types/known/anypb"
 	durationpb "google.golang.org/protobuf/types/known/durationpb"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 	reflect "reflect"
@@ -92,10 +91,23 @@ func (x *DecodedMessage) GetJson() string {
 
 // MetadataEntry is one gRPC metadata key and all of its values. gRPC metadata
 // is multi-valued, which a proto3 map cannot express.
+//
+// The gRPC metadata rules split values by key, and so does this message:
+// exactly one of values / binary_values is populated for a given entry. Keys
+// ending in "-bin" carry arbitrary bytes and use binary_values; every other
+// key carries ASCII text and uses values. Binary values cannot share the
+// string field — a proto3 string must be valid UTF-8, and marshaling raw
+// metadata bytes into one fails outright rather than degrading. Keeping text
+// out of bytes matters too: it stays readable in JSON instead of base64.
 type MetadataEntry struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Key           string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
-	Values        []string               `protobuf:"bytes,2,rep,name=values,proto3" json:"values,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Key   string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	// Values for keys that do not end in "-bin".
+	Values []string `protobuf:"bytes,2,rep,name=values,proto3" json:"values,omitempty"`
+	// Values for keys ending in "-bin", as the raw bytes the application sees
+	// (grpc-go's metadata.MD holds them already base64-decoded), not the
+	// base64 form used on the wire.
+	BinaryValues  [][]byte `protobuf:"bytes,3,rep,name=binary_values,json=binaryValues,proto3" json:"binary_values,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -144,12 +156,27 @@ func (x *MetadataEntry) GetValues() []string {
 	return nil
 }
 
+func (x *MetadataEntry) GetBinaryValues() [][]byte {
+	if x != nil {
+		return x.BinaryValues
+	}
+	return nil
+}
+
 type CallStatus struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// gRPC status code; 0 is OK.
-	Code          int32        `protobuf:"varint,1,opt,name=code,proto3" json:"code,omitempty"`
-	Message       string       `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
-	Details       []*anypb.Any `protobuf:"bytes,3,rep,name=details,proto3" json:"details,omitempty"`
+	Code    int32  `protobuf:"varint,1,opt,name=code,proto3" json:"code,omitempty"`
+	Message string `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	// Deliberately DecodedMessage rather than google.protobuf.Any. Details are
+	// built from dynamically registered types (see internal/stub.compileStatus),
+	// which are absent from protoregistry.GlobalTypes. Connect's default JSON
+	// codec marshals with a zero protojson.MarshalOptions, whose nil Resolver
+	// falls back to GlobalTypes, so an Any holding a runtime-only type fails to
+	// render over JSON while working fine over binary protobuf. DecodedMessage
+	// sidesteps that: the server renders json against its own registry, and
+	// wire_bytes still lets a client decode against its own generated types.
+	Details       []*DecodedMessage `protobuf:"bytes,3,rep,name=details,proto3" json:"details,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -198,7 +225,7 @@ func (x *CallStatus) GetMessage() string {
 	return ""
 }
 
-func (x *CallStatus) GetDetails() []*anypb.Any {
+func (x *CallStatus) GetDetails() []*DecodedMessage {
 	if x != nil {
 		return x.Details
 	}
@@ -583,20 +610,21 @@ var File_simulacra_admin_v1_journal_proto protoreflect.FileDescriptor
 
 const file_simulacra_admin_v1_journal_proto_rawDesc = "" +
 	"\n" +
-	" simulacra/admin/v1/journal.proto\x12\x12simulacra.admin.v1\x1a\x19google/protobuf/any.proto\x1a\x1egoogle/protobuf/duration.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"`\n" +
+	" simulacra/admin/v1/journal.proto\x12\x12simulacra.admin.v1\x1a\x1egoogle/protobuf/duration.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"`\n" +
 	"\x0eDecodedMessage\x12\x1b\n" +
 	"\ttype_name\x18\x01 \x01(\tR\btypeName\x12\x1d\n" +
 	"\n" +
 	"wire_bytes\x18\x02 \x01(\fR\twireBytes\x12\x12\n" +
-	"\x04json\x18\x03 \x01(\tR\x04json\"9\n" +
+	"\x04json\x18\x03 \x01(\tR\x04json\"^\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x16\n" +
-	"\x06values\x18\x02 \x03(\tR\x06values\"j\n" +
+	"\x06values\x18\x02 \x03(\tR\x06values\x12#\n" +
+	"\rbinary_values\x18\x03 \x03(\fR\fbinaryValues\"x\n" +
 	"\n" +
 	"CallStatus\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\x05R\x04code\x12\x18\n" +
-	"\amessage\x18\x02 \x01(\tR\amessage\x12.\n" +
-	"\adetails\x18\x03 \x03(\v2\x14.google.protobuf.AnyR\adetails\"\xc9\x03\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\x12<\n" +
+	"\adetails\x18\x03 \x03(\v2\".simulacra.admin.v1.DecodedMessageR\adetails\"\xc9\x03\n" +
 	"\x04Call\x12\x10\n" +
 	"\x03seq\x18\x01 \x01(\x04R\x03seq\x12\x16\n" +
 	"\x06method\x18\x02 \x01(\tR\x06method\x12L\n" +
@@ -648,18 +676,17 @@ var file_simulacra_admin_v1_journal_proto_goTypes = []any{
 	(*WatchCallsResponse)(nil),    // 7: simulacra.admin.v1.WatchCallsResponse
 	(*ResetJournalRequest)(nil),   // 8: simulacra.admin.v1.ResetJournalRequest
 	(*ResetJournalResponse)(nil),  // 9: simulacra.admin.v1.ResetJournalResponse
-	(*anypb.Any)(nil),             // 10: google.protobuf.Any
-	(*timestamppb.Timestamp)(nil), // 11: google.protobuf.Timestamp
-	(*durationpb.Duration)(nil),   // 12: google.protobuf.Duration
+	(*timestamppb.Timestamp)(nil), // 10: google.protobuf.Timestamp
+	(*durationpb.Duration)(nil),   // 11: google.protobuf.Duration
 }
 var file_simulacra_admin_v1_journal_proto_depIdxs = []int32{
-	10, // 0: simulacra.admin.v1.CallStatus.details:type_name -> google.protobuf.Any
+	0,  // 0: simulacra.admin.v1.CallStatus.details:type_name -> simulacra.admin.v1.DecodedMessage
 	1,  // 1: simulacra.admin.v1.Call.request_metadata:type_name -> simulacra.admin.v1.MetadataEntry
 	0,  // 2: simulacra.admin.v1.Call.requests:type_name -> simulacra.admin.v1.DecodedMessage
 	0,  // 3: simulacra.admin.v1.Call.responses:type_name -> simulacra.admin.v1.DecodedMessage
 	2,  // 4: simulacra.admin.v1.Call.status:type_name -> simulacra.admin.v1.CallStatus
-	11, // 5: simulacra.admin.v1.Call.start:type_name -> google.protobuf.Timestamp
-	12, // 6: simulacra.admin.v1.Call.duration:type_name -> google.protobuf.Duration
+	10, // 5: simulacra.admin.v1.Call.start:type_name -> google.protobuf.Timestamp
+	11, // 6: simulacra.admin.v1.Call.duration:type_name -> google.protobuf.Duration
 	3,  // 7: simulacra.admin.v1.ListCallsResponse.calls:type_name -> simulacra.admin.v1.Call
 	3,  // 8: simulacra.admin.v1.WatchCallsResponse.call:type_name -> simulacra.admin.v1.Call
 	4,  // 9: simulacra.admin.v1.JournalService.ListCalls:input_type -> simulacra.admin.v1.ListCallsRequest

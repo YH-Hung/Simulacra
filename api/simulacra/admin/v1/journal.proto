@@ -2,7 +2,6 @@ syntax = "proto3";
 
 package simulacra.admin.v1;
 
-import "google/protobuf/any.proto";
 import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 
@@ -33,16 +32,37 @@ message DecodedMessage {
 
 // MetadataEntry is one gRPC metadata key and all of its values. gRPC metadata
 // is multi-valued, which a proto3 map cannot express.
+//
+// The gRPC metadata rules split values by key, and so does this message:
+// exactly one of values / binary_values is populated for a given entry. Keys
+// ending in "-bin" carry arbitrary bytes and use binary_values; every other
+// key carries ASCII text and uses values. Binary values cannot share the
+// string field — a proto3 string must be valid UTF-8, and marshaling raw
+// metadata bytes into one fails outright rather than degrading. Keeping text
+// out of bytes matters too: it stays readable in JSON instead of base64.
 message MetadataEntry {
   string key = 1;
+  // Values for keys that do not end in "-bin".
   repeated string values = 2;
+  // Values for keys ending in "-bin", as the raw bytes the application sees
+  // (grpc-go's metadata.MD holds them already base64-decoded), not the
+  // base64 form used on the wire.
+  repeated bytes binary_values = 3;
 }
 
 message CallStatus {
   // gRPC status code; 0 is OK.
   int32 code = 1;
   string message = 2;
-  repeated google.protobuf.Any details = 3;
+  // Deliberately DecodedMessage rather than google.protobuf.Any. Details are
+  // built from dynamically registered types (see internal/stub.compileStatus),
+  // which are absent from protoregistry.GlobalTypes. Connect's default JSON
+  // codec marshals with a zero protojson.MarshalOptions, whose nil Resolver
+  // falls back to GlobalTypes, so an Any holding a runtime-only type fails to
+  // render over JSON while working fine over binary protobuf. DecodedMessage
+  // sidesteps that: the server renders json against its own registry, and
+  // wire_bytes still lets a client decode against its own generated types.
+  repeated DecodedMessage details = 3;
 }
 
 // Call is one completed data-plane RPC.

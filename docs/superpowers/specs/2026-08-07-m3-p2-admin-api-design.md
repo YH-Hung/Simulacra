@@ -84,34 +84,49 @@ GOBIN := $(CURDIR)/bin
 # propagate exported variables to recipe lines with no shell metacharacters.
 BUF := PATH="$(GOBIN):$$PATH" $(GOBIN)/buf
 
+TOOLS := $(GOBIN)/buf $(GOBIN)/protoc-gen-go $(GOBIN)/protoc-gen-connect-go
+
+# Overridable because origin/main is the right baseline only on pull requests;
+# see §7 for what CI passes on a push.
+BREAKING_AGAINST ?= origin/main
+
 .DEFAULT_GOAL := lint-api
 
 .PHONY: tools generate lint-api breaking-api
 
-# $(GOBIN)/buf is a file target, not phony, so make skips the install recipe
-# once the pinned binaries are newer than tools/go.mod and tools/go.sum —
-# routine invocations of generate/lint-api/breaking-api don't reinstall the
-# toolchain every time.
-$(GOBIN)/buf: tools/go.mod tools/go.sum
+# These are file targets, not phony, so make skips the install recipe once the
+# pinned binaries are newer than tools/go.mod and tools/go.sum — routine
+# invocations of generate/lint-api/breaking-api don't reinstall the toolchain
+# every time. All three are listed so deleting any one of them reinstalls.
+$(TOOLS): tools/go.mod tools/go.sum
 	GOBIN=$(GOBIN) go -C tools install tool
 
-tools: $(GOBIN)/buf         ## phony convenience alias for a fresh clone
+tools: $(TOOLS)             ## phony convenience alias for a fresh clone
 
-generate: $(GOBIN)/buf
+generate: $(TOOLS)
 	$(BUF) generate
 
-lint-api: $(GOBIN)/buf
+lint-api: $(TOOLS)
 	$(BUF) lint
 
-breaking-api: $(GOBIN)/buf
-	$(BUF) breaking --against '.git#ref=origin/main'
+breaking-api: $(TOOLS)
+	$(BUF) breaking --against '.git#ref=$(BREAKING_AGAINST)'
 ```
 
-This is the final state, reached in two corrections after the first implementation: `export PATH`
+This is the final state, reached in three corrections after the first implementation: `export PATH`
 does not reach recipe lines with no shell metacharacters under GNU Make 3.81, so plain `buf`
-invocations failed to find the plugins and were replaced with the `BUF :=` inline-PATH form; and the
-phony `tools` target was later converted to the `$(GOBIN)/buf` file-target form above so that
-`lint-api`/`generate`/`breaking-api` skip reinstalling the toolchain when nothing pinning it changed.
+invocations failed to find the plugins and were replaced with the `BUF :=` inline-PATH form; the
+phony `tools` target was converted to the file-target form above so that
+`lint-api`/`generate`/`breaking-api` skip reinstalling the toolchain when nothing pinning it changed;
+and that file target was then widened from `$(GOBIN)/buf` alone to all three binaries.
+
+Keying the sentinel on buf alone was wrong even though one `go install tool` writes all three: buf's
+mtime only stands in for the others when `bin/` is complete. Delete `bin/protoc-gen-go` from an
+otherwise-current `bin/` and make sees its sentinel satisfied, skips the install, and `make generate`
+then fails inside buf on a missing plugin — reproduced before the fix. GNU Make 3.81 has no
+grouped-target (`&:`) syntax, so `$(TOOLS): …` is an ordinary multi-target rule: the recipe runs once
+per out-of-date target, but the first run installs all three, leaving the rest up to date, so it
+still runs exactly once. Verified for all-present (no-op), one-missing, and all-missing.
 
 Three properties this buys:
 
@@ -280,7 +295,6 @@ disk. That difference is the whole point of `simulacra stub export`.
 ### 4.3 `journal.proto`
 
 ```proto
-import "google/protobuf/any.proto";
 import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 
@@ -303,15 +317,18 @@ message DecodedMessage {
   string json = 3;           // protojson, rendered against the server registry
 }
 
+// Exactly one of values / binary_values is populated, chosen by the key:
+// "-bin" keys carry arbitrary bytes, every other key carries ASCII text.
 message MetadataEntry {
   string key = 1;
-  repeated string values = 2;
+  repeated string values = 2;        // keys not ending in "-bin"
+  repeated bytes binary_values = 3;  // keys ending in "-bin", raw (not base64) bytes
 }
 
 message CallStatus {
   int32 code = 1;                              // gRPC status code; 0 is OK
   string message = 2;
-  repeated google.protobuf.Any details = 3;
+  repeated DecodedMessage details = 3;         // deliberately not google.protobuf.Any
 }
 
 message Call {
@@ -349,6 +366,25 @@ repeated values. It is named `request_metadata`, not `metadata`, because respons
 trailers (`stub.Respond.Metadata`, `stub.Respond.Trailers`) are a plausible future addition to
 `Call`, and an unqualified name would then be permanently ambiguous; renaming after `api/` reaches
 `main` would be a JSON-name break, so the qualified name was adopted before that cost applied.
+
+`MetadataEntry` splits text from binary values because a proto3 `string` must be valid UTF-8 and
+`proto.Marshal` rejects one that is not — verified: marshaling `{0x00, 0xff, 0xfe, 0x80}` into a
+`repeated string` field fails with `string field contains invalid UTF-8`. gRPC `-bin` metadata is
+arbitrary bytes (grpc-go's `metadata.MD` holds it already base64-decoded), so the obvious direct
+conversion from `metadata.MD` would produce journal entries that fail to serialize at all. Making
+every value `bytes` would also work but would base64 ordinary text metadata in JSON, so the split
+follows the same `-bin` rule gRPC itself uses; the key tells a client which field to read.
+
+`CallStatus.details` is `DecodedMessage`, not `google.protobuf.Any`, for a related runtime failure.
+Status details are built from dynamically registered types (`internal/stub.compileStatus` packs
+whatever the stub's schema registry resolves), which are absent from `protoregistry.GlobalTypes`.
+Connect v1.20's default JSON codec marshals with a zero `protojson.MarshalOptions`
+(`codec.go:159`), whose nil `Resolver` falls back to `GlobalTypes` (`encode.go:148`) — so an `Any`
+holding a runtime-only type serializes fine over binary protobuf and fails over JSON, breaking
+`ListCalls`/`WatchCalls` for exactly the stubs that set details. `DecodedMessage` already solves this
+for request/response payloads: the server renders `json` against its own registry, and `wire_bytes`
+still lets a client decode against its own generated types. Reusing it avoids requiring every
+deployment to install a registry-aware JSON codec.
 
 ### 4.4 `verify.proto`
 
@@ -462,12 +498,34 @@ A new `api` job in `.github/workflows/ci.yml`, alongside the unchanged `test` jo
       - run: make tools
       - run: make lint-api
       - name: buf breaking
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          FORCED: ${{ github.event.forced }}
         run: |
-          git rev-parse --verify -q origin/main >/dev/null || { echo "origin/main did not resolve"; exit 1; }
-          if git cat-file -e origin/main:api 2>/dev/null; then
-            make breaking-api
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "push" ]; then
+            baseline="$BEFORE_SHA"
+            if [ "$baseline" = "0000000000000000000000000000000000000000" ]; then
+              echo "branch was just created; no prior API state to break"
+              exit 0
+            fi
+            if ! git cat-file -e "$baseline^{commit}" 2>/dev/null; then
+              echo "pre-push commit $baseline not in checkout (forced=$FORCED); fetching it"
+              git fetch --no-tags --quiet origin "$baseline" || true
+            fi
+            if ! git cat-file -e "$baseline^{commit}" 2>/dev/null; then
+              echo "::error::pre-push commit $baseline is unreachable (forced=$FORCED); cannot compare api/ against the state this push replaced"
+              exit 1
+            fi
           else
-            echo "baseline origin/main has no api/ yet; skipping the first breaking check"
+            baseline=origin/main
+            git rev-parse --verify -q "$baseline" >/dev/null || { echo "$baseline did not resolve"; exit 1; }
+          fi
+          if git cat-file -e "$baseline:api" 2>/dev/null; then
+            make breaking-api BREAKING_AGAINST="$baseline"
+          else
+            echo "baseline $baseline has no api/ yet; skipping the first breaking check"
           fi
       - run: make generate
       - run: go build ./...
@@ -475,14 +533,44 @@ A new `api` job in `.github/workflows/ci.yml`, alongside the unchanged `test` jo
         run: git add -A gen && git diff --cached --exit-code -- gen
 ```
 
-Two corrections after initial implementation: the existence guard originally checked only
+Three corrections after initial implementation: the existence guard originally checked only
 `git cat-file -e origin/main:api`, which exits nonzero both when `origin/main` has no `api/` tree and
 when `origin/main` fails to resolve at all — an unresolvable ref would have silently disabled the
 breaking check forever instead of just for the bootstrap commit, so `git rev-parse --verify` now
-fails the job loudly in that case. And `go build ./...` runs after `make generate`, so a freshly
+fails the job loudly in that case. `go build ./...` runs after `make generate`, so a freshly
 regenerated `gen/` is asserted to compile in CI, not just the committed bytes the `test` job already
 covers — this also turns the rename/duplicate-registration failure mode into a loud build error
-rather than a silent pass.
+rather than a silent pass. And the baseline is now chosen per event.
+
+**The baseline must differ by event.** `origin/main` is correct on a pull request and useless on a
+push. Checkout runs *after* the push, and `fetch-depth: 0` fetches all branches, so `origin/main`
+already points at the pushed tip: the comparison is HEAD-versus-HEAD and cannot fail, which quietly
+exempts every commit that lands on `main` without a pull request — the one case the push trigger
+exists to cover. `github.event.before` is the pre-push tip and is the only baseline that makes the
+check mean anything there.
+
+**A missing baseline fails the job.** A force push can orphan the pre-push tip, and `fetch-depth: 0`
+fetches branches, not unreachable objects — so the commit may be absent from the checkout. The step
+first asks the remote for it by SHA, which recovers the normal case. If it is still unreachable the
+step exits 1 rather than skipping: skipping would mean a force push carrying a breaking change
+lands with a green build, which is exactly the scenario the push trigger is meant to catch, and
+"the baseline is gone" is not evidence that nothing broke. `github.event.forced` is carried into the
+message so the log distinguishes a force push from a genuinely anomalous missing commit.
+
+Branch creation is the single remaining skip, and it is not a hole: `before` is all zeros because no
+prior state exists, so there is no published contract for the push to break.
+
+Verified by extracting this `run:` block and exercising every path. Against the real repository: a
+push whose pre-push commit contains `api/` runs the comparison and exits nonzero on a real break; a
+push predating `api/` takes the bootstrap skip; branch creation skips; an unreachable pre-push SHA
+exits 1 after the fetch attempt is refused by the remote; the pull-request path resolves
+`origin/main`. Against a purpose-built force-push fixture (a bare remote whose tip was rewritten,
+cloned over `file://` so the transfer is a real one and the orphaned commit is genuinely absent from
+the checkout): the fetch recovers the orphaned commit and the comparison then runs. `buf breaking`
+accepts a raw commit SHA in `.git#ref=`, which this depends on, and fetch-by-SHA against the real
+GitHub remote was confirmed to work for a reachable SHA. Whether GitHub serves a *force-pushed-away*
+SHA was not tested — doing so would require force-pushing the real repository — and the fail-closed
+branch exists precisely so that either answer is safe.
 
 The sync check stages before diffing so that **added and deleted** generated files fail it, not
 just modified ones — a plain `git diff` would silently pass a newly generated file.
@@ -500,11 +588,12 @@ against buf v1.72.0 while writing the implementation plan:
   not a clean "missing api/" message. Either way the failure is hard, so the commit that first
   introduces `api/` would red the build without a guard.
 - `--against '.git#branch=main'` does not resolve on pull-request checkouts, which have no local
-  `main` branch. `--against '.git#ref=origin/main'` resolves on both push and PR events.
+  `main` branch. `--against '.git#ref=…'` resolves on both push and PR events, and accepts a raw
+  commit SHA, which is what the push path passes.
 
-Hence the guard above and `ref=origin/main` in the Makefile. The guard skips exactly one run — the
-one that introduces `api/` — and is a permanent no-op afterwards. This replaces the two-commit
-fallback an earlier draft of this section proposed.
+Hence the guard above and the overridable `BREAKING_AGAINST` in the Makefile. The guard skips
+exactly one run — the one that introduces `api/` — and is a permanent no-op afterwards. This
+replaces the two-commit fallback an earlier draft of this section proposed.
 
 ---
 
@@ -515,7 +604,7 @@ Phase 2 ships no behavior, so the tests gate the *contract and the pipeline*:
 | Gate | What it catches |
 |---|---|
 | `go build ./...` | Generated code that does not compile; a missing `connectrpc.com/connect` dependency |
-| `internal/admin/contract_test.go` | A service or RPC silently dropped from the protos; a hand-edit to `gen/` that removes surface |
+| `internal/admin/contract_test.go` | A service, RPC, enum value, or idempotency level silently dropped or changed; a hand-edit to `gen/` that removes surface |
 | CI sync check | `gen/` regenerated from a different `api/`, or edited by hand |
 | `buf lint` | Convention drift in a public contract |
 | `buf breaking` | An incompatible change to a published API |
@@ -530,11 +619,29 @@ The test asserts, against a literal expectation table:
    (`WatchCalls` server-streaming, everything else unary) and the expected fully-qualified
    request/response message names — the last of these added in the final review pass so a type
    swap on an unchanged RPC name fails the test directly, not just a name-and-streaming-flags check.
-3. The connect constructors exist, via compile-time references such as
+3. Each RPC's `idempotency_level`. `RPC_SAME_IDEMPOTENCY_LEVEL` is breaking under the `FILE`
+   category, so a level dropped by accident can only be restored with a breaking exception.
+4. The connect constructors exist, via compile-time references such as
    `var _ = adminv1connect.NewStubServiceClient`.
-4. `Times`' presence semantics survive codegen: setting only `at_least` leaves `exactly` and
+5. Both enums, by value name *and* number. Renumbering is silent at compile time and wrong on the
+   wire: a client that already serialized `STUB_ORIGIN_API` as `2` keeps sending `2`.
+6. `Times`' presence semantics survive codegen: setting only `at_least` leaves `exactly` and
    `at_most` absent, and `at_least`+`at_most` together are both present. This is the field-presence
    behavior §5's oneof would have lost, so it is worth a direct assertion.
+7. `ResetRequest` distinguishes omitted from explicit `false`.
+8. The two journal shapes whose "natural" definitions fail only at runtime: `binary_values` is
+   `bytes` and round-trips invalid UTF-8, and `CallStatus.details` is `DecodedMessage` rather than
+   `google.protobuf.Any`. See §4.3 for why each matters.
+
+Every assertion above was mutation-tested: the proto was changed to the wrong form, `gen/`
+regenerated, and the corresponding test confirmed to fail.
+
+**What this does not cover.** The table asserts the service surface, enums, idempotency levels, and
+the specific field decisions listed above — not every field of every message. From the second
+landing onward that gap is closed by `buf breaking`, which checks all of it. The bootstrap commit is
+the exception: it has no baseline, so its field-level shape is reviewed rather than machine-checked.
+Expanding the table to every field would restate the whole schema in Go for one commit's worth of
+coverage, so the decisions that are expensive to reverse are asserted and the rest is not.
 
 ---
 
