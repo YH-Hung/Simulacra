@@ -1,0 +1,478 @@
+# Simulacra M3 Phase 3 — Core Extensions: Design
+
+**Goal (M3 design §13.3):** make the three core packages support everything the frozen
+`simulacra.admin.v1` contract describes — a runtime-mutable schema registry, a stub store with
+origins, IDs, and hit counts, and a journal that can be tailed — so Phase 4's handlers are pure
+proto↔core translation with no new core logic.
+
+**Reference:** `docs/superpowers/specs/2026-07-25-m3-test-story-design.md` §6 (core changes), §12
+(testing), §13 (phasing); `docs/superpowers/specs/2026-08-07-m3-p2-admin-api-design.md` §1
+(explicitly defers these items to Phase 3); `PROPOSAL.md` §5, §8.
+
+Phase 1 (`server/` facade) is complete at `65c1380`. Phase 2 (`api/`, `gen/`, buf toolchain, CI
+gates) is complete at `8e9b8a9` and **froze the admin contract** — this phase implements against
+that contract and must not require changing it.
+
+---
+
+## 1. Scope
+
+### In scope
+
+1. **`internal/schema`** — copy-on-write registry: atomic snapshot swap, writer mutex,
+   all-or-nothing registration, `RegisterSet`, and a read surface split between live and pinned
+   consumers.
+2. **`internal/stub`** — stub origins, IDs, normalized documents, hit counts; the per-stub decode
+   entry point (`ParseDocument`); export rendering; the store operations `CreateStub`,
+   `DeleteStub`, `ReplaceAllStubs`, `ListStubs`, and `ControlService.Reset` need.
+3. **`internal/journal`** — `Watch` subscriptions with slow-consumer eviction, `Call.StubID`, and
+   `Len`/`Cap` accessors.
+4. **Verify surface** — a strict match-block decode plus a `CompileMatch` entry point, so
+   `VerifyCalls.matcher_document` compiles without duplicating `Compiler.Compile`.
+5. **Wiring** — the four consumer edits in `internal/dataplane`, `internal/stub`, and `server/`
+   that the above require.
+
+### Out of scope (later phases)
+
+- Handlers, the h2c server, `/healthz`, `serve --admin` — **Phase 4**.
+- The schema-less startup relaxation (`server.Options` may omit schema sources when the admin
+  plane is enabled) — **Phase 4**: it is gated on `--admin` existing, and relaxing it earlier
+  would let a server start that can never serve anything.
+- Accessors on `server.Server` exposing the registry/store/journal — Phase 4 wires
+  `internal/admin` from inside `server.Start`, so no public accessor is needed.
+- CLI commands — Phase 5. Reflection import — Phase 6. SDKs — Phases 7/9. Dockerfile — Phase 8.
+- `VerifySequence`, server-side upstream import, admin auth, TLS — M3 non-goals (M3 design §2).
+
+### Behavior-preservation claim
+
+This phase is behavior-preserving in practice. The one semantic change — API-origin stubs beating
+file-origin stubs at equal priority — is unobservable until Phase 4 creates the first API stub.
+Every existing test must pass untouched except the four files that name the removed
+`stub.Store.Replace` or `schema.Registry.Files`:
+
+| File | Reference |
+|---|---|
+| `internal/stub/store_test.go` | `store.Replace` (3 call sites) |
+| `internal/dataplane/server_test.go:508` | `store.Replace` |
+| `internal/stub/template_test.go` | `match.NewCompiler(reg.Files())` (6 call sites) |
+| `conformance/harness_test.go:239` | `match.NewCompiler(h.reg.Files())` |
+
+The last two are a one-word rename to `Snapshot()`. `internal/match/match_test.go` is *not*
+affected: it constructs `NewCompiler(nil)` throughout and never touches a registry.
+
+---
+
+## 2. `internal/schema` — copy-on-write registry
+
+### 2.1 The problem
+
+M3 design §6 states it precisely: the raw `*protoregistry.Files` escapes the registry today.
+`Registry.Files()` is handed to grpc reflection (`internal/dataplane/server.go:58`) and to the
+match compiler's CEL environment (`internal/stub/stub.go:109`), and `Types()` binds it at
+construction via `dynamicpb.NewTypes`. `protoregistry.Files` is not safe for mutation concurrent
+with lookups, so any held reference would race with a runtime `RegisterSchemas`.
+
+`dynamicpb`'s own documentation confirms the constraint verbatim: *"The Files registry is
+retained, and changes to Files will be reflected in Types. It is not safe to concurrently change
+the Files while calling Types methods."*
+
+### 2.2 Structure
+
+```go
+type Registry struct {
+	mu   sync.Mutex               // serializes load→build→swap; readers never take it
+	snap atomic.Pointer[snapshot]
+}
+
+type snapshot struct {
+	files *protoregistry.Files    // immutable once published
+	types *dynamicpb.Types        // built from files, published atomically with it
+}
+```
+
+The atomic pointer protects *readers*. It does not stop two concurrent registrations from both
+loading S0, building S0+A and S0+B, and silently losing one on the second store — so a **writer
+mutex serializes the whole load→build→swap sequence**. Registration is rare and cheap; readers
+never touch the mutex.
+
+### 2.3 One mutation path
+
+Every mutator funnels through one unexported helper:
+
+```go
+func (r *Registry) apply(fn func(candidate *protoregistry.Files) error) error
+```
+
+It takes `mu`, builds a candidate by re-registering every file of the current snapshot into a
+fresh `Files`, runs `fn` against the candidate, and publishes
+`&snapshot{files: candidate, types: dynamicpb.NewTypes(candidate)}` only if `fn` returns nil.
+
+Three consequences, all wanted:
+
+- **All-or-nothing is free.** A failed registration discards the candidate; the served snapshot is
+  byte-for-byte untouched. This is the rollback property the contract promises for
+  `RegisterSchemas`, and it now also covers `AddProtoDir` and `AddDescriptorSetFile`, which today
+  can leave a half-loaded registry behind.
+- **One swap per operation.** `AddProtoDir` currently calls `AddFile` per compiled file; under
+  copy-on-write that would be one swap per file. Funnelling through `apply` makes each public
+  mutator exactly one swap.
+- **Descriptor identity is stable.** Pre-existing `protoreflect.FileDescriptor` values are reused
+  verbatim in each candidate — a `Files` is an index, not an owner — so descriptors that were
+  already registered keep pointer identity across a registration. Only genuinely new files are new
+  objects.
+
+### 2.4 Public surface
+
+| Method | Change |
+|---|---|
+| `NewRegistry()` | publishes an empty snapshot |
+| `AddProtoDir(ctx, root)` | one swap; now all-or-nothing |
+| `AddDescriptorSetFile(path)` | one swap; now all-or-nothing |
+| `AddFile(fd)` | one swap (still used by `dataplane.New` for the health proto) |
+| `RegisterSet(*descriptorpb.FileDescriptorSet) (added []string, err error)` | **new** — backs `SchemaService.RegisterSchemas` |
+| `Snapshot() *protoregistry.Files` | **replaces `Files()`** — returns the current immutable snapshot |
+| `FindFileByPath`, `FindDescriptorByName` | **new** — `Registry` implements `protodesc.Resolver`, delegating to the current snapshot |
+| `LookupMethod`, `LookupMessage`, `Types`, `Services` | signatures unchanged; snapshot-backed |
+
+`RegisterSet` returns the paths it newly added, which is exactly
+`RegisterSchemasResponse.registered_files`; an empty slice means every file was already present.
+
+### 2.5 Read surface: live vs. pinned
+
+M3 design §6 says "`Registry.Files()` is removed" and the registry implements the resolver
+interfaces. That is right for reflection and wrong for the match compiler, because
+`dynamicpb.NewTypes` takes the **concrete** `*protoregistry.Files`, not an interface, and
+`newCELProvider` needs `RangeFiles` — neither is expressible through `protodesc.Resolver`.
+
+**Deviation from M3 design §6, recorded deliberately:** `Files()` is replaced by
+`Snapshot() *protoregistry.Files`, documented as *immutable — never mutated after it is returned*.
+The hazard §6 identified was mutation in place; copy-on-write eliminates it, so handing out a
+snapshot is safe by construction. Consumers then split by what they actually need:
+
+| Consumer | Gets | Why |
+|---|---|---|
+| grpc reflection (`dataplane`) | `reg` itself, as `protodesc.Resolver` | **live** — a service registered at runtime is reflectable immediately, which the JVM/Go SDK boot path depends on |
+| `match.NewCompiler` (via `stub.NewCompiler`) | `reg.Snapshot()` | needs `RangeFiles` and `dynamicpb.NewTypes`; pinning is correct because compilers are constructed per load operation |
+| `schema.Types` (response templates, typed error details) | live delegation to the current snapshot | lets a stub render an `Any` whose type was registered after the stub was created |
+
+`reflection.ServerOptions.DescriptorResolver` is typed `protodesc.Resolver`, so passing `reg`
+requires no adapter.
+
+`schema.Types` changes from holding a `*dynamicpb.Types` to holding the `*Registry` and reading
+`r.snap.Load().types` per call. Its registry-first / global-fallback behavior is unchanged.
+
+### 2.6 `RegisterSet` semantics
+
+- The set must be **self-contained**: every import must be present in the set, matching
+  `AddDescriptorSetFile` today. `protodesc.NewFiles` enforces it; the existing error message
+  ("descriptor sets must be self-contained; build with `buf build -o` or `protoc
+  --include_imports`") is reused. Both SDKs walk the full dependency graph, so this is not a
+  practical limitation; supporting incremental sets that lean on already-registered imports is a
+  non-breaking addition later.
+- **Idempotent.** A path already present in the registry is compared against the incoming file; if
+  they are equivalent the file is skipped and omitted from `added`. If they differ, the whole
+  registration fails with an error naming the file — surfaced as `INVALID_ARGUMENT` in Phase 4.
+- Comparison is between `protodesc.ToFileDescriptorProto(existing)` and the incoming
+  `FileDescriptorProto`, with `SourceCodeInfo` cleared on both sides, compared by `proto.Equal`.
+
+**Named risk — the idempotency comparison is this phase's most likely surprise.** A descriptor set
+produced by `buf build` carries its own copies of the well-known types. Those will meet a registry
+that got its well-known types from protocompile's standard imports (`AddProtoDir`) or from the
+Go-generated `healthpb.File_grpc_health_v1_health_proto` (`dataplane.New`). If those copies do not
+compare equal, **every JVM SDK `RegisterSchemas` call fails** on `google/protobuf/*.proto` before
+reaching the user's own types. §7 gives this a dedicated test. If the comparison proves unequal in
+practice, the documented fallback is today's `AddFile` semantics — an already-registered path is
+skipped silently and never conflicts — which loses a genuine-conflict diagnostic but never blocks
+a legitimate register. That fallback is a one-line change to the comparison branch, and the
+decision is recorded in the plan rather than deferred to the implementer's judgement.
+
+---
+
+## 3. `internal/stub` — origins, IDs, one document grammar
+
+### 3.1 `Compiled`
+
+```go
+type Origin uint8
+const (
+	OriginFile Origin = iota   // owned by the hot-reload watcher
+	OriginAPI                  // owned by the client that created it
+)
+func (o Origin) String() string   // "file" | "api"
+```
+
+`Compiled` gains three exported fields — `ID string`, `Origin Origin`, `Document string`. It does
+**not** retain the decoded `Stub`: `Document` is rendered once at compile time and nothing
+downstream needs the struct again (export composes normalized documents, §3.5). `Source` keeps its
+current meaning:
+`"<path-as-given>#<index>"` for file stubs, `"api"` for API stubs.
+
+`Document` is the **normalized single-stub mapping** that `Stub.document` carries over the wire. It
+is produced by re-marshaling the decoded `Stub` at compile time, not by echoing the input bytes.
+Because decoding is strict (`KnownFields(true)`), re-marshaling can lose nothing but comments and
+key order — every field the grammar accepts is modeled on the struct, and every field it does not
+accept was already rejected. That property is what makes one normalized form safe for both
+origins, and it is asserted by a round-trip test (§7).
+
+### 3.2 The shared decode boundary
+
+M3 design §5 requires files and the API to share one decoder. Both routes decode the same `Stub`
+struct through yaml.v3 with `KnownFields(true)`; they differ only in the outer shape (files hold a
+sequence, possibly across `---` documents; the API carries exactly one mapping).
+
+```go
+func ParseDocument(data []byte) (Stub, error)          // exactly one stub mapping; YAML or JSON
+func ParseMatchDocument(data []byte) (*match.Block, error) // VerifyCalls.matcher_document
+```
+
+Both are implemented as **two passes over the same bytes**:
+
+1. Decode into a `yaml.Node` to classify: a sequence gets an error pointing at the file grammar
+   ("the API takes one stub mapping; files take a list"), and a second `---` document gets
+   "exactly one stub".
+2. Decode into the target struct with a fresh `yaml.Decoder` and `KnownFields(true)`.
+
+Two passes rather than classifying and then calling `node.Decode`, because `yaml.Node.Decode` has
+no `KnownFields` control — decoding from the node would silently accept unknown fields and destroy
+the strictness that is the whole point of the shared boundary. JSON needs no separate path: JSON is
+valid YAML, and both forms are tested.
+
+`parseFile` keeps its current structure; the grammar is shared by construction (same struct, same
+strictness), not by refactoring the file loader onto the single-document path.
+
+### 3.3 Compiler additions
+
+```go
+func (c *Compiler) CompileMatch(method string, b *match.Block) (*match.Compiled, error)
+```
+
+The matcher half of `Compile`, exposed: resolve the method, take `match.ShapeOf`, compile the
+block against the input descriptor. `VerifyCalls` becomes `ParseMatchDocument` → `CompileMatch` →
+`journal.Verify`, with no logic duplicated from `Compile`.
+
+`NewCompiler` now builds its match compiler from `reg.Snapshot()` (§2.5).
+
+### 3.4 `Store`
+
+```go
+type Info struct {
+	ID, Method string
+	Shape      match.Shape
+	Priority   int
+	Times      int
+	Origin     Origin
+	Source     string
+	Hits       int
+	Document   string
+}
+
+type ListFilter struct {
+	Method string   // "" means all
+	Origin *Origin  // nil means all origins
+}
+
+func (s *Store) Add(c *Compiled) (string, error)
+func (s *Store) Remove(id string) error
+func (s *Store) ReplaceOrigin(origin Origin, stubs []*Compiled) ([]string, error)
+func (s *Store) List(f ListFilter) []Info
+func (s *Store) ResetStubs()
+```
+
+`Info` is exactly the `Stub` envelope the contract froze. `Replace` is **removed**; `Len` and
+`CountFor` are unchanged.
+
+**One ID rule, applied identically by `Add` and `ReplaceOrigin`.** An empty `ID` means the store
+assigns `"api-<n>"` from a monotonic counter; a non-empty `ID` is used as given and must be unique
+across the whole store, which is why both return an error rather than only an ID. In practice
+`Add` always assigns — API stubs are compiled from documents and carry no ID — but the rule is one
+rule rather than two. File stubs arrive with
+`ID = Source` (stamped by `LoadDirs`), which is why two `--stubs` roots containing the same
+relative path yield distinct IDs — the walk path includes the root. `ReplaceOrigin` enforces
+uniqueness as a load error, catching the same root passed twice.
+
+**Ownership is enforced in the store, not in the handler.** `Remove` refuses a file-origin stub
+with a typed error carrying the owning file, which Phase 4 maps to `FAILED_PRECONDITION` ("owned
+by `<file>`; edit or remove the file"). Keeping the invariant next to the data means the CLI, the
+SDKs, and any future surface cannot each re-derive it differently.
+
+**`ResetStubs`** does both halves of `ControlService.Reset(stubs)` under a single lock: drop every
+API-origin stub and zero the `used` counters of file-origin stubs. Composing it from two exported
+calls would leave a window where the store is neither the old state nor the new one.
+`ReplaceAllStubs([])` is a *different* operation — `ReplaceOrigin(OriginAPI, nil)` — which clears
+API stubs without touching file budgets.
+
+**Selection order** sorts on `(priority desc, API-before-file, load order)`, stably. Rationale from
+M3 design §6: a test overrides a sandbox default without priority arithmetic.
+
+**Hits and budget stay one counter** (the existing per-entry `used`), as M3 design §6 specifies.
+The consequence is explicit and must be documented in the stub-model docs rather than discovered:
+`hits` resets on every hot reload and on every `Reset`, because both rebuild or rewind the entries.
+It measures consumption of the stubs currently loaded, not lifetime traffic. The CLI and the M4
+dashboard must not label it as a lifetime total.
+
+### 3.5 Export rendering
+
+```go
+func RenderSequence(docs []string) (string, error)
+```
+
+Lives in the grammar package, beside the parser it must round-trip with. It parses each normalized
+mapping into a `yaml.Node`, assembles them into one sequence node, and marshals — producing
+`ExportStubsResponse.document`, a file-grammar YAML sequence the CLI can write straight to disk.
+Assembling nodes rather than concatenating indented text is what keeps it correct for block
+scalars and nested structures. The guarantee that matters is the round trip: export →
+`parseFile` → the same stubs (§7).
+
+---
+
+## 4. `internal/journal` — watch, StubID, counts
+
+```go
+const watchBuffer = 64
+var ErrSlowConsumer = errors.New("journal: subscriber fell behind and was dropped")
+
+func (j *Journal) Watch(ctx context.Context, method string) *Subscription
+
+func (s *Subscription) Calls() <-chan *Call   // closed on drop, Close, or ctx done
+func (s *Subscription) Close()
+func (s *Subscription) Err() error            // read after Calls closes
+```
+
+**Why a `Subscription` and not the bare `Watch(ctx) (<-chan *Call, func())` of M3 design §6.** A
+bare channel cannot tell Phase 4's handler *why* the stream ended, and the two reasons need
+different gRPC outcomes: a clean unsubscribe or client cancel ends the stream with `OK`, while a
+slow-consumer eviction must be `RESOURCE_EXHAUSTED` ("client too slow — reconnect"). Inferring the
+reason from context state races and mislabels a clean `Close`. `Err()` makes the termination
+reason a value: nil for cancel/`Close`, `ErrSlowConsumer` for eviction. Phase 4 maps it in one
+place, and the core behavior is testable without a server.
+
+**Ordering.** `Record` broadcasts while holding the write lock, so every subscriber observes calls
+in `Seq` order and never observes a call the ring does not already hold.
+
+**Filtering happens before the send**, inside the journal, so a tail on one method is not evicted
+by unrelated traffic on another.
+
+**Eviction.** Sends are non-blocking. A full buffer sets `ErrSlowConsumer`, closes the channel, and
+unregisters the subscriber. A `sync.Once` per subscription makes writer-side eviction and
+consumer-side `Close` safe against double-close; one small goroutine per subscription maps
+`ctx.Done()` onto `Close`.
+
+**Aliasing.** Subscribers receive the same retained `*Call` the ring holds. `Record` already clones
+once for retention and nothing mutates a `Call` afterwards (`Reset` nils slots; it does not touch
+call objects), so per-subscriber cloning would be pure cost. The contract is documented on `Watch`:
+the delivered call is read-only.
+
+Also: `Call.StubID` alongside the existing `StubSource` (feeding `Call.matched_stub_id`), and
+`Len() int` / `Cap() int` for `GetServerInfoResponse.journal_count` / `journal_capacity`.
+
+---
+
+## 5. Wiring
+
+The only edits outside the three core packages:
+
+| File | Change |
+|---|---|
+| `internal/dataplane/server.go:58` | `DescriptorResolver: reg.Files()` → `DescriptorResolver: reg` |
+| `internal/dataplane/server.go` (4 sites) | set `call.StubID = selected.ID` beside the existing `call.StubSource = selected.Source` |
+| `internal/stub/stub.go:109` | `match.NewCompiler(reg.Files())` → `match.NewCompiler(reg.Snapshot())` |
+| `internal/stub/loader.go` | `LoadDirs` stamps `Origin = OriginFile` and `ID = Source` |
+| `server/watcher.go:209` | `store.Replace(stubs)` → `store.ReplaceOrigin(stub.OriginFile, stubs)`, reporting a uniqueness error through the existing stub-error path and leaving the store untouched |
+
+`match.NewCompiler` keeps its `*protoregistry.Files` parameter. No signature change is needed once
+the caller passes a snapshot, and inventing an interface there would buy nothing `dynamicpb` can
+use.
+
+---
+
+## 6. Error handling
+
+Core packages return typed Go errors; Phase 4 maps them to codes. The mapping the contract implies:
+
+| Core error | Phase 4 code |
+|---|---|
+| `ParseDocument` / `ParseMatchDocument` / `Compile` diagnostics | `INVALID_ARGUMENT`, message passed through verbatim with source positions |
+| `RegisterSet` conflict or non-self-contained set | `INVALID_ARGUMENT`, naming the file |
+| `Store.Remove` unknown ID | `NOT_FOUND` |
+| `Store.Remove` file-origin (typed, carries the owning file) | `FAILED_PRECONDITION` |
+| `Subscription.Err() == ErrSlowConsumer` | `RESOURCE_EXHAUSTED` |
+
+Loader and CEL diagnostics are already good; the requirement here is only that the new entry
+points do not wrap them into something less precise.
+
+---
+
+## 7. Testing
+
+M3 design §12's core row, made specific, plus the tests this design's decisions require.
+
+**`internal/schema`**
+
+- `-race` suite: reflection lookups, CEL compile + eval, and dynamic `Any`/type resolution running
+  concurrently with `RegisterSet` — all three references that escaped before §2.5.
+- All-or-nothing rollback: a conflicting set fails and the served registry is unchanged, asserted
+  by comparing the full file list and a resolved descriptor before and after.
+- Concurrent disjoint registrations both land and the final registry holds their union — a
+  functional lost-update check, which `-race` cannot make (the lost update is a benign-looking
+  atomic store, not a data race).
+- **WKT idempotency:** a descriptor set produced by `buf build`, carrying its own
+  `google/protobuf/*.proto`, registered against a registry built by `AddProtoDir` — must succeed
+  and report only the non-WKT files as added. This is the §2.6 risk, and it is exactly the JVM SDK
+  path.
+- Descriptor identity stability: a descriptor resolved before a registration is pointer-identical
+  to the same descriptor resolved after it.
+
+**`internal/stub`**
+
+- Origin, ID, and tie-break units, including duplicate relative paths across two `--stubs` roots
+  and the same root passed twice.
+- `Remove` refusing file-origin with the owning file named; `Remove` of an unknown ID.
+- `ResetStubs` clears API stubs and restores file budgets in one step.
+- `List` filters by method and by origin.
+- `ParseDocument` in YAML and in JSON; sequence rejected; multi-document rejected; unknown field
+  rejected.
+- Document round trip: `Compiled.Document` → `ParseDocument` → identical compiled fields.
+- Export round trip: `RenderSequence` output → `parseFile` → the same stubs.
+
+**`internal/journal`**
+
+- Broadcast ordering and the method filter.
+- Slow-consumer eviction sets `ErrSlowConsumer` and closes the channel.
+- `-race` test putting consumer `Close` against a writer-side eviction.
+- Context cancellation closes the stream with a nil `Err`.
+- `Len` / `Cap`.
+
+**`internal/dataplane`**
+
+- `StubID` recorded on the journal entry for each of the four shapes.
+- A service registered at runtime becomes reflectable — the live-resolver property of §2.5, which
+  no existing test covers because nothing could register at runtime before.
+
+---
+
+## 8. Risks
+
+| Risk | Mitigation |
+|---|---|
+| WKT descriptor copies compare unequal, blocking every SDK register call (§2.6) | Dedicated test on the real `buf build` path; documented one-line fallback to skip-already-registered |
+| Rebuilding a candidate `Files` per registration is O(files) | Registration is rare and startup-dominated; readers never pay it. If it ever matters, the fix is an incremental candidate, which the `apply` boundary already localizes |
+| `yaml.v3` `omitempty` on the `Stub` struct changes the normalized document in a way that breaks the round trip | The round-trip test is the gate; tags are added field by field only where the zero value is genuinely absent, and `respond` keeps no `omitempty` because `respond: {}` is meaningful |
+| Removing `Store.Replace` and `Registry.Files` breaks in-tree callers | Only three production call sites and four test files reference them (§1, §5); the compiler finds them all, and the test-side changes are a rename |
+| Journal broadcast under the write lock slows `Record` | Sends are non-blocking into buffered channels; the worst case per subscriber is a channel send and an eviction, both O(1) |
+
+---
+
+## 9. Decisions flagged for review
+
+1. **`Snapshot()` instead of removing `Files()`** (§2.5) — a deliberate deviation from M3 design
+   §6, forced by `dynamicpb.NewTypes` taking a concrete `*protoregistry.Files`. Safety comes from
+   copy-on-write immutability rather than from hiding the type.
+2. **`Subscription` value instead of `(<-chan *Call, func())`** (§4) — more surface than M3 design
+   §6 sketched, bought to make the `RESOURCE_EXHAUSTED` termination reason a value rather than an
+   inference.
+3. **`hits` collapsed onto the times budget** (§3.4) — as M3 design §6 specifies; the cost is that
+   `hits` resets on hot reload and on `Reset`, which must be documented wherever it is displayed.
+4. **Self-contained descriptor sets only** (§2.6) — incremental sets that lean on already-registered
+   imports are rejected; adding them later is non-breaking.
+5. **Ownership policy lives in `Store.Remove`** (§3.4) rather than in the Phase 4 handler, so every
+   present and future surface inherits one rule.
