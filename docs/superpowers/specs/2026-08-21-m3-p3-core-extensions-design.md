@@ -47,18 +47,20 @@ that contract and must not require changing it.
 
 This phase is behavior-preserving in practice. The one semantic change — API-origin stubs beating
 file-origin stubs at equal priority — is unobservable until Phase 4 creates the first API stub.
-Every existing test must pass untouched except the four files that name the removed
-`stub.Store.Replace` or `schema.Registry.Files`:
+Every existing test must pass with mechanical-only edits in the files that name a removed or
+reshaped constructor — `stub.Store.Replace`, `stub.NewStore(stubs)`, or `schema.Registry.Files`:
 
 | File | Reference |
 |---|---|
-| `internal/stub/store_test.go` | `store.Replace` (3 call sites) |
-| `internal/dataplane/server_test.go:508` | `store.Replace` |
+| `internal/stub/store_test.go` | `store.Replace` (2 call sites), `NewStore(stubs)` |
+| `internal/dataplane/server_test.go` | `store.Replace` (line 508), `stub.NewStore(stubs)` (4 call sites) |
 | `internal/stub/template_test.go` | `match.NewCompiler(reg.Files())` (6 call sites) |
-| `conformance/harness_test.go:239` | `match.NewCompiler(h.reg.Files())` |
+| `internal/match/match_test.go` | `reg.Files()` (lines 296, 352, 612) |
+| `conformance/harness_test.go` | `match.NewCompiler(h.reg.Files())` (line 239), `stub.NewStore(compiled)` (line 106) |
+| `server/watcher_test.go` | `stub.NewStore(initial)` (4 call sites) |
 
-The last two are a one-word rename to `Snapshot()`. `internal/match/match_test.go` is *not*
-affected: it constructs `NewCompiler(nil)` throughout and never touches a registry.
+The `Files()` sites are a one-word rename to `Snapshot()`; the `NewStore(stubs)` sites become
+`NewStore()` + `ReplaceOrigin` (§3.4), best wrapped once in a small test helper per package.
 
 ---
 
@@ -145,9 +147,15 @@ interfaces. That is right for reflection and wrong for the match compiler, becau
 `newCELProvider` needs `RangeFiles` — neither is expressible through `protodesc.Resolver`.
 
 **Deviation from M3 design §6, recorded deliberately:** `Files()` is replaced by
-`Snapshot() *protoregistry.Files`, documented as *immutable — never mutated after it is returned*.
-The hazard §6 identified was mutation in place; copy-on-write eliminates it, so handing out a
-snapshot is safe by construction. Consumers then split by what they actually need:
+`Snapshot() *protoregistry.Files`. The hazard §6 identified was mutation in place; copy-on-write
+removes the registry itself as a mutator, since every registration builds a fresh `Files` and the
+published one is never touched again. What copy-on-write cannot remove is the returned type's own
+`RegisterFile` method — a caller *could* still mutate a snapshot. This is therefore a
+**trusted-caller convention, not structural immutability**: the doc comment on `Snapshot` states
+"read-only — registering into a snapshot is a data race with every other holder", and the type
+cannot be narrowed to enforce it because the two consumers that need `Snapshot` at all need the
+concrete type (`dynamicpb.NewTypes` and `RangeFiles`). The convention is in-tree only; snapshots
+are never handed across an API boundary. Consumers split by what they actually need:
 
 | Consumer | Gets | Why |
 |---|---|---|
@@ -180,11 +188,18 @@ produced by `buf build` carries its own copies of the well-known types. Those wi
 that got its well-known types from protocompile's standard imports (`AddProtoDir`) or from the
 Go-generated `healthpb.File_grpc_health_v1_health_proto` (`dataplane.New`). If those copies do not
 compare equal, **every JVM SDK `RegisterSchemas` call fails** on `google/protobuf/*.proto` before
-reaching the user's own types. §7 gives this a dedicated test. If the comparison proves unequal in
-practice, the documented fallback is today's `AddFile` semantics — an already-registered path is
-skipped silently and never conflicts — which loses a genuine-conflict diagnostic but never blocks
-a legitimate register. That fallback is a one-line change to the comparison branch, and the
-decision is recorded in the plan rather than deferred to the implementer's judgement.
+reaching the user's own types. §7 gives this a dedicated test, and the plan must verify the
+comparison empirically (a real `buf build` set against a protocompile-built registry) before any
+task is written against it.
+
+If the copies prove representationally unequal, the fix is to **normalize the comparison** —
+inspect the actual `FileDescriptorProto` diff and clear the specific fields that differ without
+changing meaning (source info is already cleared; plausible candidates are toolchain-dependent
+defaults of the same kind). What is *not* an option is skipping a non-equivalent file: the frozen
+contract requires same-path-with-different-content to fail with `INVALID_ARGUMENT` naming the
+file, and a silent skip would also let the rest of the set register against a dependency the
+registry resolves differently than the set's author intended. Equivalence may loosen; the
+conflict error may not.
 
 ---
 
@@ -237,6 +252,15 @@ no `KnownFields` control — decoding from the node would silently accept unknow
 the strictness that is the whole point of the shared boundary. JSON needs no separate path: JSON is
 valid YAML, and both forms are tested.
 
+**Empty input diverges between the two.** The frozen contract says an empty
+`VerifyCalls.matcher_document` matches any call to the method — and Phase 4 calls
+`ParseMatchDocument` unconditionally — so `ParseMatchDocument` returns `(nil, nil)` for empty or
+whitespace-only input rather than surfacing the decoder's EOF. A nil `*match.Block` is already the
+"matches everything" value throughout the codebase (`match.Compiler.Compile` returns an
+always-true `Compiled` for a nil block, and `journal.Verify` treats a nil matcher as match-all).
+`ParseDocument` keeps the opposite rule: an empty `CreateStub.document` is `INVALID_ARGUMENT` —
+there is no empty stub. Both behaviors are tested (§7).
+
 `parseFile` keeps its current structure; the grammar is shared by construction (same struct, same
 strictness), not by refactoring the file loader onto the single-document path.
 
@@ -271,7 +295,9 @@ type ListFilter struct {
 	Origin *Origin  // nil means all origins
 }
 
-func (s *Store) Add(c *Compiled) (string, error)
+func NewStore() *Store                            // empty; population is Add / ReplaceOrigin only
+
+func (s *Store) Add(c *Compiled) string           // API-origin ingest
 func (s *Store) Remove(id string) error
 func (s *Store) ReplaceOrigin(origin Origin, stubs []*Compiled) ([]string, error)
 func (s *Store) List(f ListFilter) []Info
@@ -281,14 +307,30 @@ func (s *Store) ResetStubs()
 `Info` is exactly the `Stub` envelope the contract froze. `Replace` is **removed**; `Len` and
 `CountFor` are unchanged.
 
-**One ID rule, applied identically by `Add` and `ReplaceOrigin`.** An empty `ID` means the store
-assigns `"api-<n>"` from a monotonic counter; a non-empty `ID` is used as given and must be unique
-across the whole store, which is why both return an error rather than only an ID. In practice
-`Add` always assigns — API stubs are compiled from documents and carry no ID — but the rule is one
-rule rather than two. File stubs arrive with
-`ID = Source` (stamped by `LoadDirs`), which is why two `--stubs` roots containing the same
-relative path yield distinct IDs — the walk path includes the root. `ReplaceOrigin` enforces
-uniqueness as a load error, catching the same root passed twice.
+**`NewStore` no longer takes stubs.** Today `server.Start` passes `LoadDirs` output straight to
+`NewStore(stubs)`, whose signature cannot report an error — so the duplicate-ID check would be
+enforced on every path *except* initial startup, and passing the same `--stubs` root twice would
+boot a store holding duplicate IDs that only the first reload would reject. Making the constructor
+empty leaves exactly two ingest paths, both validated: `server.Start` becomes
+`store := stub.NewStore()` followed by `ReplaceOrigin(OriginFile, stubs)` with the error
+propagated as a startup failure, and a test drives the duplicate-root case through `server.Start`
+itself, not just the store unit.
+
+**The store stamps ownership; callers cannot get it wrong.** `Origin`'s zero value is
+`OriginFile`, and the compiler does not set it — so if ownership were a field callers must
+remember to fill, the natural Phase 4 path (`ParseDocument` → `Compile` → `Add`) would silently
+create a *file-owned* stub. Instead both ingest paths stamp it: `Add` is the API-origin ingest and
+sets `Origin = OriginAPI`, `Source = "api"`, and a store-assigned ID on the stub it stores;
+`ReplaceOrigin` stamps its `origin` argument onto every stub it installs. `Compiled.ID` and
+`Compiled.Origin` are store-managed fields, documented as such.
+
+**One ID rule, enforced where IDs enter.** In `ReplaceOrigin`, an empty `ID` gets a store-assigned
+`"api-<n>"` (the `ReplaceAllStubs` path — fresh documents carry no IDs) and a non-empty `ID` is
+used as given and must be unique across the whole store, else an error naming the duplicates with
+the store untouched. `Add` always assigns, so it cannot conflict and returns only the ID. File
+stubs arrive with `ID = Source` (stamped by `LoadDirs`), which is why two `--stubs` roots
+containing the same relative path yield distinct IDs — the walk path includes the root — and why
+the same root passed twice is caught as a duplicate.
 
 **Ownership is enforced in the store, not in the handler.** `Remove` refuses a file-origin stub
 with a typed error carrying the owning file, which Phase 4 maps to `FAILED_PRECONDITION` ("owned
@@ -304,11 +346,18 @@ API stubs without touching file budgets.
 **Selection order** sorts on `(priority desc, API-before-file, load order)`, stably. Rationale from
 M3 design §6: a test overrides a sandbox default without priority arithmetic.
 
+**`ReplaceOrigin` touches only the named origin.** Entries of every other origin keep their
+objects — and therefore their `used` counters — untouched. This is a correctness requirement, not
+an optimization: a filesystem edit triggering a file reload must not replenish the `times` budgets
+of API stubs a running test depends on, and symmetrically `ReplaceAllStubs` must not rewind file
+budgets. A cross-origin preservation test covers both directions (§7).
+
 **Hits and budget stay one counter** (the existing per-entry `used`), as M3 design §6 specifies.
 The consequence is explicit and must be documented in the stub-model docs rather than discovered:
-`hits` resets on every hot reload and on every `Reset`, because both rebuild or rewind the entries.
-It measures consumption of the stubs currently loaded, not lifetime traffic. The CLI and the M4
-dashboard must not label it as a lifetime total.
+a stub's `hits` resets when *its own origin* is replaced (a hot reload for file stubs, a
+`ReplaceAllStubs` for API stubs) and when `Reset` rewinds it. It measures consumption of the
+currently-loaded stub, not lifetime traffic. The CLI and the M4 dashboard must not label it as a
+lifetime total.
 
 ### 3.5 Export rendering
 
@@ -352,10 +401,18 @@ in `Seq` order and never observes a call the ring does not already hold.
 **Filtering happens before the send**, inside the journal, so a tail on one method is not evicted
 by unrelated traffic on another.
 
-**Eviction.** Sends are non-blocking. A full buffer sets `ErrSlowConsumer`, closes the channel, and
-unregisters the subscriber. A `sync.Once` per subscription makes writer-side eviction and
-consumer-side `Close` safe against double-close; one small goroutine per subscription maps
-`ctx.Done()` onto `Close`.
+**Eviction, and the locking discipline that makes it safe.** Sends are non-blocking; a full buffer
+sets `ErrSlowConsumer`, closes the channel, and unregisters the subscriber. The subtle hazard is
+not double-close but **send-versus-close**: a `sync.Once` around `close` cannot stop `Record` from
+sending into a channel that a concurrent consumer `Close` (or the ctx goroutine) is closing — a
+send on a closed channel panics. So every channel state transition shares `Journal.mu`: `Record`
+already broadcasts under the write lock, and `Close` takes the same lock to unregister and close.
+Since eviction happens *inside* `Record` — which already holds `mu` — the close-and-unregister step
+is a locked-state helper both paths call, one from under the lock and one after taking it, rather
+than a public method calling itself recursively. A `sync.Once` still wraps the user-facing `Close`
+for idempotence, but the mutex is what carries the guarantee. One small goroutine per subscription
+maps `ctx.Done()` onto `Close`; §7 races both pairs — `Close` against writer-side eviction, and
+ctx cancellation against a normal broadcast.
 
 **Aliasing.** Subscribers receive the same retained `*Call` the ring holds. `Record` already clones
 once for retention and nothing mutates a `Call` afterwards (`Reset` nils slots; it does not touch
@@ -376,7 +433,8 @@ The only edits outside the three core packages:
 | `internal/dataplane/server.go:58` | `DescriptorResolver: reg.Files()` → `DescriptorResolver: reg` |
 | `internal/dataplane/server.go` (4 sites) | set `call.StubID = selected.ID` beside the existing `call.StubSource = selected.Source` |
 | `internal/stub/stub.go:109` | `match.NewCompiler(reg.Files())` → `match.NewCompiler(reg.Snapshot())` |
-| `internal/stub/loader.go` | `LoadDirs` stamps `Origin = OriginFile` and `ID = Source` |
+| `internal/stub/loader.go` | `LoadDirs` stamps `ID = Source` (origin is stamped by the store on ingest, §3.4) |
+| `server/server.go:102` | `stub.NewStore(stubs)` → `stub.NewStore()` + `ReplaceOrigin(stub.OriginFile, stubs)`, the error propagated as a startup failure |
 | `server/watcher.go:209` | `store.Replace(stubs)` → `store.ReplaceOrigin(stub.OriginFile, stubs)`, reporting a uniqueness error through the existing stub-error path and leaving the store untouched |
 
 `match.NewCompiler` keeps its `*protoregistry.Files` parameter. No signature change is needed once
@@ -426,19 +484,31 @@ M3 design §12's core row, made specific, plus the tests this design's decisions
 
 - Origin, ID, and tie-break units, including duplicate relative paths across two `--stubs` roots
   and the same root passed twice.
+- Origin stamping: `Add` produces an `OriginAPI` stub with `Source = "api"` regardless of what the
+  compiler left on the fields; `ReplaceOrigin` stamps its argument onto every installed stub.
+- Cross-origin preservation: a `ReplaceOrigin(OriginFile, …)` leaves API entries and their `used`
+  counters untouched, and `ReplaceOrigin(OriginAPI, …)` leaves file budgets untouched.
 - `Remove` refusing file-origin with the owning file named; `Remove` of an unknown ID.
 - `ResetStubs` clears API stubs and restores file budgets in one step.
 - `List` filters by method and by origin.
 - `ParseDocument` in YAML and in JSON; sequence rejected; multi-document rejected; unknown field
-  rejected.
+  rejected; empty input rejected.
+- `ParseMatchDocument` on empty and whitespace-only input returns a nil block (the match-all
+  value); on a non-empty block, strictness matches `ParseDocument`.
 - Document round trip: `Compiled.Document` → `ParseDocument` → identical compiled fields.
 - Export round trip: `RenderSequence` output → `parseFile` → the same stubs.
+
+**`server`**
+
+- Startup with the same `--stubs` root passed twice fails through `server.Start` with the
+  duplicate-ID error — the path that bypassed validation when `NewStore` took stubs directly.
 
 **`internal/journal`**
 
 - Broadcast ordering and the method filter.
 - Slow-consumer eviction sets `ErrSlowConsumer` and closes the channel.
-- `-race` test putting consumer `Close` against a writer-side eviction.
+- `-race` tests for both hazard pairs: consumer `Close` against writer-side eviction, and context
+  cancellation against a concurrent broadcast (the send-versus-close race of §4).
 - Context cancellation closes the stream with a nil `Err`.
 - `Len` / `Cap`.
 
@@ -454,10 +524,10 @@ M3 design §12's core row, made specific, plus the tests this design's decisions
 
 | Risk | Mitigation |
 |---|---|
-| WKT descriptor copies compare unequal, blocking every SDK register call (§2.6) | Dedicated test on the real `buf build` path; documented one-line fallback to skip-already-registered |
+| WKT descriptor copies compare unequal, blocking every SDK register call (§2.6) | Comparison verified empirically during plan writing on the real `buf build` path; if unequal, the comparison is normalized against the inspected diff — the conflict error itself is contract-frozen and never loosened |
 | Rebuilding a candidate `Files` per registration is O(files) | Registration is rare and startup-dominated; readers never pay it. If it ever matters, the fix is an incremental candidate, which the `apply` boundary already localizes |
 | `yaml.v3` `omitempty` on the `Stub` struct changes the normalized document in a way that breaks the round trip | The round-trip test is the gate; tags are added field by field only where the zero value is genuinely absent, and `respond` keeps no `omitempty` because `respond: {}` is meaningful |
-| Removing `Store.Replace` and `Registry.Files` breaks in-tree callers | Only three production call sites and four test files reference them (§1, §5); the compiler finds them all, and the test-side changes are a rename |
+| Removing `Store.Replace`, `Registry.Files`, and the stub-taking `NewStore` breaks in-tree callers | Four production call sites and six test files reference them (§1, §5); the compiler finds them all, and the test-side changes are a rename or a two-line helper |
 | Journal broadcast under the write lock slows `Record` | Sends are non-blocking into buffered channels; the worst case per subscriber is a channel send and an eviction, both O(1) |
 
 ---
@@ -465,14 +535,17 @@ M3 design §12's core row, made specific, plus the tests this design's decisions
 ## 9. Decisions flagged for review
 
 1. **`Snapshot()` instead of removing `Files()`** (§2.5) — a deliberate deviation from M3 design
-   §6, forced by `dynamicpb.NewTypes` taking a concrete `*protoregistry.Files`. Safety comes from
-   copy-on-write immutability rather than from hiding the type.
+   §6, forced by `dynamicpb.NewTypes` taking a concrete `*protoregistry.Files`. Copy-on-write
+   removes the registry as a mutator; read-only use of the returned value is a documented in-tree
+   convention, not structural immutability.
 2. **`Subscription` value instead of `(<-chan *Call, func())`** (§4) — more surface than M3 design
    §6 sketched, bought to make the `RESOURCE_EXHAUSTED` termination reason a value rather than an
    inference.
 3. **`hits` collapsed onto the times budget** (§3.4) — as M3 design §6 specifies; the cost is that
-   `hits` resets on hot reload and on `Reset`, which must be documented wherever it is displayed.
+   a stub's `hits` resets when its own origin is replaced and on `Reset`, which must be documented
+   wherever it is displayed.
 4. **Self-contained descriptor sets only** (§2.6) — incremental sets that lean on already-registered
    imports are rejected; adding them later is non-breaking.
-5. **Ownership policy lives in `Store.Remove`** (§3.4) rather than in the Phase 4 handler, so every
-   present and future surface inherits one rule.
+5. **Ownership policy lives in the store** (§3.4) — `Add` and `ReplaceOrigin` stamp origins,
+   `Remove` enforces them, and `NewStore` takes no stubs so no ingest path can skip validation.
+   The Phase 4 handler inherits the rules rather than restating them.
