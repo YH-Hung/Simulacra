@@ -21,7 +21,9 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/dynamicpb"
 
 	"github.com/yinghanhung/simulacra/internal/journal"
@@ -1149,4 +1151,52 @@ func storeWith(t *testing.T, stubs []*stub.Compiled) *stub.Store {
 		t.Fatal(err)
 	}
 	return s
+}
+
+// A service registered at runtime must become reflectable immediately: the
+// reflection server holds the registry itself, not a startup snapshot
+// (design §2.5). Nothing could register at runtime before this phase, so no
+// earlier test covers it.
+func TestReflectionSeesRuntimeRegisteredService(t *testing.T) {
+	reg, conn, _ := startServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	set := &descriptorpb.FileDescriptorSet{File: []*descriptorpb.FileDescriptorProto{{
+		Name:        proto.String("late.proto"),
+		Package:     proto.String("late.v1"),
+		Syntax:      proto.String("proto3"),
+		MessageType: []*descriptorpb.DescriptorProto{{Name: proto.String("Ping")}},
+		Service: []*descriptorpb.ServiceDescriptorProto{{
+			Name: proto.String("LateService"),
+			Method: []*descriptorpb.MethodDescriptorProto{{
+				Name:       proto.String("Ping"),
+				InputType:  proto.String(".late.v1.Ping"),
+				OutputType: proto.String(".late.v1.Ping"),
+			}},
+		}},
+	}}}
+	if _, err := reg.RegisterSet(set); err != nil {
+		t.Fatal(err)
+	}
+
+	rc := v1reflectionpb.NewServerReflectionClient(conn)
+	strm, err := rc.ServerReflectionInfo(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := strm.Send(&v1reflectionpb.ServerReflectionRequest{
+		MessageRequest: &v1reflectionpb.ServerReflectionRequest_FileContainingSymbol{
+			FileContainingSymbol: "late.v1.LateService",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := strm.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.GetFileDescriptorResponse().GetFileDescriptorProto()) == 0 {
+		t.Fatal("runtime-registered service is not reflectable")
+	}
 }
