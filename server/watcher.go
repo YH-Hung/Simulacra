@@ -206,7 +206,13 @@ func reconcileStubDirs(ctx context.Context, reporter Reporter, reg *schema.Regis
 	if ctx.Err() != nil {
 		return 0, ctx.Err()
 	}
-	store.Replace(stubs)
+	if _, err := store.ReplaceOrigin(stub.OriginFile, stubs); err != nil {
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
+		reporter.PrintErrln("stub error:", err)
+		return 0, err
+	}
 	if announce && ctx.Err() == nil {
 		reporter.Printf("simulacra: %d stub(s) reloaded\n", len(stubs))
 	}

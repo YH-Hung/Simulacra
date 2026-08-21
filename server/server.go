@@ -99,7 +99,10 @@ func Start(ctx context.Context, opts Options) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	store := stub.NewStore(stubs)
+	store := stub.NewStore()
+	if _, err := store.ReplaceOrigin(stub.OriginFile, stubs); err != nil {
+		return nil, err
+	}
 	jrnl := journal.New(opts.JournalSize)
 	data, err := dataplane.New(reg, store, jrnl)
 	if err != nil {

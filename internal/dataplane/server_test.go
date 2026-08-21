@@ -130,7 +130,7 @@ func startServerWithStubs(t *testing.T, contents string) (*schema.Registry, *grp
 		t.Fatalf("stub load errors: %v", errs)
 	}
 	j := journal.New(100)
-	srv, err := New(reg, stub.NewStore(stubs), j)
+	srv, err := New(reg, storeWith(t, stubs), j)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -487,7 +487,7 @@ func TestNoMatchFormatsSelectionSnapshotTopThreeAndEllipsis(t *testing.T) {
 		}
 		stubs = append(stubs, compiled)
 	}
-	store := stub.NewStore(stubs)
+	store := storeWith(t, stubs)
 	methodDesc, err := reg.LookupMethod(full)
 	if err != nil {
 		t.Fatal(err)
@@ -505,7 +505,9 @@ func TestNoMatchFormatsSelectionSnapshotTopThreeAndEllipsis(t *testing.T) {
 	}
 	// A reload between selection and error formatting must not change the
 	// registered count attached to this failed-selection diagnostic.
-	store.Replace(stubs[:1])
+	if _, err := store.ReplaceOrigin(stub.OriginFile, stubs[:1]); err != nil {
+		t.Fatal(err)
+	}
 	message := status.Convert(server.noMatch(full, selection.Misses, selection.RegisteredCount)).Message()
 	want := `simulacra: no stub matched /shop.v1.OrderService/GetOrder (4 stub(s) registered for this method); first (priority 40): message order_id: expected to equal "o-1"; actual "actual"; second (priority 30): message order_id: expected to equal "o-2"; actual "actual"; third (priority 20): message order_id: expected to equal "o-3"; actual "actual"; …`
 	if message != want {
@@ -978,7 +980,7 @@ func TestBidirectionalStreamingPreservesSendHeaderError(t *testing.T) {
 		t.Fatal(err)
 	}
 	headerErr := status.Error(codes.Unavailable, "header transport failed")
-	err = (&Server{store: stub.NewStore([]*stub.Compiled{compiled})}).bidi(
+	err = (&Server{store: storeWith(t, []*stub.Compiled{compiled})}).bidi(
 		headerErrorStream{err: headerErr}, "/shop.v1.OrderService/Chat", method, match.Input{}, &journal.Call{})
 	if err != headerErr {
 		t.Fatalf("bidi error = %v, want exact SendHeader error %v", err, headerErr)
@@ -1032,7 +1034,7 @@ func TestBidirectionalStreamingPreservesReceiveStatusCode(t *testing.T) {
 	for _, code := range []codes.Code{codes.ResourceExhausted, codes.Canceled, codes.DeadlineExceeded} {
 		t.Run(code.String(), func(t *testing.T) {
 			receiveErr := status.Error(code, "transport receive failed")
-			err := (&Server{store: stub.NewStore([]*stub.Compiled{compiled})}).bidi(
+			err := (&Server{store: storeWith(t, []*stub.Compiled{compiled})}).bidi(
 				receiveErrorStream{err: receiveErr}, "/shop.v1.OrderService/Chat", method, match.Input{}, &journal.Call{})
 			st := status.Convert(err)
 			if st.Code() != code {
@@ -1136,4 +1138,15 @@ func TestRunStepsMapsTemplateFailureToInternal(t *testing.T) {
 	if st.Code() != codes.Internal || !strings.Contains(st.Message(), "rendering response") {
 		t.Fatalf("runSteps error = %v, want Internal rendering response", err)
 	}
+}
+
+// storeWith builds a store the way server.Start now does: empty, then one
+// validated file-origin ingest.
+func storeWith(t *testing.T, stubs []*stub.Compiled) *stub.Store {
+	t.Helper()
+	s := stub.NewStore()
+	if _, err := s.ReplaceOrigin(stub.OriginFile, stubs); err != nil {
+		t.Fatal(err)
+	}
+	return s
 }

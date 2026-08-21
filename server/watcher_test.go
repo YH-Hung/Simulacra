@@ -72,7 +72,7 @@ func TestReconcileStubDirsKeepsInvalidStoreAndResetsValidBudget(t *testing.T) {
 	if len(errs) != 0 {
 		t.Fatal(errs)
 	}
-	store := stub.NewStore(initial)
+	store := storeWith(t, initial)
 	const method = "/shop.v1.OrderService/GetOrder"
 	if got := store.Select(method, match.Input{}); got == nil {
 		t.Fatal("initial Select = nil, want limited stub")
@@ -117,7 +117,7 @@ func TestReconcileStubDirsDoesNothingAfterCancellation(t *testing.T) {
 	if len(errs) != 0 {
 		t.Fatal(errs)
 	}
-	store := stub.NewStore(initial)
+	store := storeWith(t, initial)
 	const method = "/shop.v1.OrderService/GetOrder"
 	if store.Select(method, match.Input{}) == nil {
 		t.Fatal("initial limited stub did not select")
@@ -157,7 +157,7 @@ func TestStartStubWatcherReconcilesMutationBeforeReady(t *testing.T) {
 	if len(loadErrs) != 0 {
 		t.Fatal(loadErrs)
 	}
-	store := stub.NewStore(initial)
+	store := storeWith(t, initial)
 	const method = "/shop.v1.OrderService/GetOrder"
 	if store.Select(method, match.Input{}) == nil {
 		t.Fatal("initial limited stub did not select")
@@ -202,7 +202,7 @@ func TestStartStubWatcherReturnsStartupReconciliationError(t *testing.T) {
 	if len(loadErrs) != 0 {
 		t.Fatal(loadErrs)
 	}
-	store := stub.NewStore(initial)
+	store := storeWith(t, initial)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -443,4 +443,15 @@ func TestWatcherRunStopJoinsGoroutine(t *testing.T) {
 	default:
 		t.Fatal("watcherRun.stop returned before the watcher goroutine exited")
 	}
+}
+
+// storeWith builds a store the way server.Start now does: empty, then one
+// validated file-origin ingest.
+func storeWith(t *testing.T, stubs []*stub.Compiled) *stub.Store {
+	t.Helper()
+	s := stub.NewStore()
+	if _, err := s.ReplaceOrigin(stub.OriginFile, stubs); err != nil {
+		t.Fatal(err)
+	}
+	return s
 }
