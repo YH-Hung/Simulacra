@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -333,5 +334,31 @@ func TestShutdownWithCanceledContextReturnsPromptly(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Shutdown did not return within 2s")
+	}
+}
+
+// Passing the same stub root twice must fail at startup with the
+// duplicate-id error — the path that bypassed validation when NewStore took
+// stubs directly (design §3.4).
+func TestStartRejectsDuplicateStubRoots(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "stub.yaml"), []byte(`
+- method: shop.v1.OrderService/GetOrder
+  respond:
+    message: {}
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Start(context.Background(), Options{
+		ProtoDirs:   []string{"../testdata/protos"},
+		StubDirs:    []string{dir, dir},
+		DataAddr:    "127.0.0.1:0",
+		JournalSize: 16,
+	})
+	if err == nil {
+		t.Fatal("Start with a duplicated stub root succeeded, want duplicate-id error")
+	}
+	if !strings.Contains(err.Error(), "duplicate stub id") {
+		t.Fatalf("err = %v, want a duplicate-stub-id failure", err)
 	}
 }

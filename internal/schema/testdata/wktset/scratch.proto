@@ -1,0 +1,22 @@
+// Test fixture: a file importing three well-known types, used to prove that
+// a buf-built image registers cleanly against a protocompile-built registry
+// (design §2.6). Regenerate the committed image with:
+//   bin/buf build internal/schema/testdata/wktset -o internal/schema/testdata/wkt_image.binpb
+syntax = "proto3";
+
+package scratch.v1;
+
+import "google/protobuf/any.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+message Thing {
+  string id = 1;
+  google.protobuf.Timestamp at = 2;
+  google.protobuf.Duration ttl = 3;
+  google.protobuf.Any payload = 4;
+}
+
+service ThingService {
+  rpc GetThing(Thing) returns (Thing);
+}

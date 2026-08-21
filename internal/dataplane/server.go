@@ -55,7 +55,7 @@ func New(reg *schema.Registry, store *stub.Store, calls *journal.Journal) (*Serv
 	// Reflection over the dynamic registry: v1 and v1alpha (grpcurl uses both).
 	opts := reflection.ServerOptions{
 		Services:           s,
-		DescriptorResolver: reg.Files(),
+		DescriptorResolver: reg,
 	}
 	v1reflectionpb.RegisterServerReflectionServer(s.grpc, reflection.NewServerV1(opts))
 	v1alphareflectionpb.RegisterServerReflectionServer(s.grpc, reflection.NewServer(opts))
@@ -136,6 +136,7 @@ func (s *Server) bidi(stream grpc.ServerStream, full string, method protoreflect
 	}
 	selected := selection.Selected
 	call.StubSource = selected.Source
+	call.StubID = selected.ID
 	plan := selected.Plan()
 	if len(plan.Trailer) > 0 {
 		stream.SetTrailer(plan.Trailer)
@@ -199,6 +200,7 @@ func (s *Server) clientStream(stream grpc.ServerStream, full string, method prot
 	}
 	selected := selection.Selected
 	call.StubSource = selected.Source
+	call.StubID = selected.ID
 	if err := applyMetadata(stream, selected.Plan()); err != nil {
 		return err
 	}
@@ -217,6 +219,7 @@ func (s *Server) unary(stream grpc.ServerStream, full string, method protoreflec
 	}
 	selected := selection.Selected
 	call.StubSource = selected.Source
+	call.StubID = selected.ID
 	if err := applyMetadata(stream, selected.Plan()); err != nil {
 		return err
 	}
@@ -235,6 +238,7 @@ func (s *Server) serverStream(stream grpc.ServerStream, full string, method prot
 	}
 	selected := selection.Selected
 	call.StubSource = selected.Source
+	call.StubID = selected.ID
 	plan := selected.Plan()
 	if err := applyMetadata(stream, plan); err != nil {
 		return err

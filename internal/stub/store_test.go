@@ -1,6 +1,7 @@
 package stub
 
 import (
+	"errors"
 	"reflect"
 	"strings"
 	"sync"
@@ -50,7 +51,7 @@ func TestSelectPriorityAndTimes(t *testing.T) {
 		Method:  "shop.v1.OrderService/GetOrder",
 		Respond: Respond{Message: map[string]any{"note": "fallback"}},
 	})
-	store := NewStore([]*Compiled{fallback, specific}) // load order: fallback first
+	store := storeWith(t, fallback, specific) // load order: fallback first
 
 	req := request(t, reg, `{"order_id":"o-123"}`)
 
@@ -77,7 +78,7 @@ func TestSelectNoMatch(t *testing.T) {
 		Method: "shop.v1.OrderService/GetOrder",
 		Match:  &match.Block{Message: map[string]match.Rules{"order_id": {"eq": "o-999"}}},
 	})
-	store := NewStore([]*Compiled{only})
+	store := storeWith(t, only)
 	req := request(t, reg, `{"order_id":"o-123"}`)
 	if got := store.Select(method, match.Input{Message: req.ProtoReflect()}); got != nil {
 		t.Fatalf("Select = %v, want nil for non-matching request", got)
@@ -94,7 +95,7 @@ func TestReplaceAtomicallyResetsTimesBudget(t *testing.T) {
 		Method: "shop.v1.OrderService/GetOrder",
 		Times:  1,
 	})
-	store := NewStore([]*Compiled{old})
+	store := storeWith(t, old)
 
 	if got := store.Select(method, match.Input{}); got != old {
 		t.Fatalf("first Select = %v, want old stub", got)
@@ -103,12 +104,14 @@ func TestReplaceAtomicallyResetsTimesBudget(t *testing.T) {
 		t.Fatalf("second Select = %v, want exhausted budget", got)
 	}
 
-	store.Replace([]*Compiled{fresh})
+	if _, err := store.ReplaceOrigin(OriginFile, []*Compiled{fresh}); err != nil {
+		t.Fatal(err)
+	}
 	if got := store.Select(method, match.Input{}); got != fresh {
-		t.Fatalf("Select after Replace = %v, want fresh stub", got)
+		t.Fatalf("Select after ReplaceOrigin = %v, want fresh stub", got)
 	}
 	if got := store.Select(method, match.Input{}); got != nil {
-		t.Fatalf("second Select after Replace = %v, want fresh budget exhausted", got)
+		t.Fatalf("second Select after ReplaceOrigin = %v, want fresh budget exhausted", got)
 	}
 }
 
@@ -116,7 +119,7 @@ func TestLenCountsEveryMethodAndFollowsReplace(t *testing.T) {
 	reg := testRegistry(t)
 	order := compiled(t, reg, Stub{Method: "shop.v1.OrderService/GetOrder", Times: 1})
 	list := compiled(t, reg, Stub{Method: "shop.v1.OrderService/UploadOrders"})
-	store := NewStore([]*Compiled{order, list})
+	store := storeWith(t, order, list)
 
 	if got := store.Len(); got != 2 {
 		t.Fatalf("Len = %d, want 2 across both methods", got)
@@ -129,11 +132,13 @@ func TestLenCountsEveryMethodAndFollowsReplace(t *testing.T) {
 		t.Fatalf("Len after consuming a budget = %d, want 2", got)
 	}
 
-	store.Replace([]*Compiled{list})
-	if got := store.Len(); got != 1 {
-		t.Fatalf("Len after Replace = %d, want 1", got)
+	if _, err := store.ReplaceOrigin(OriginFile, []*Compiled{list}); err != nil {
+		t.Fatal(err)
 	}
-	if got := NewStore(nil).Len(); got != 0 {
+	if got := store.Len(); got != 1 {
+		t.Fatalf("Len after ReplaceOrigin = %d, want 1", got)
+	}
+	if got := NewStore().Len(); got != 0 {
 		t.Fatalf("Len of empty store = %d, want 0", got)
 	}
 }
@@ -162,7 +167,7 @@ func TestExplainRanksNearestMiss(t *testing.T) {
 	})
 	spent.Source = "spent.yaml#0"
 
-	store := NewStore([]*Compiled{twoWrong, oneWrong, spent})
+	store := storeWith(t, twoWrong, oneWrong, spent)
 	in := match.Input{Message: request(t, reg, `{"order_id":"o-123"}`).ProtoReflect()}
 	if got := store.Select(method, in); got != spent {
 		t.Fatalf("Select = %v, want catch-all stub", got)
@@ -208,7 +213,7 @@ func TestExplainStableTiesAndDoesNotConsumeBudget(t *testing.T) {
 	first := makeMiss("first", "o-first", 10)
 	high := makeMiss("high", "o-high", 20)
 	second := makeMiss("second", "o-second", 10)
-	store := NewStore([]*Compiled{first, high, second})
+	store := storeWith(t, first, high, second)
 	in := match.Input{Message: request(t, reg, `{"order_id":"actual"}`).ProtoReflect()}
 
 	misses := store.Explain(method, in)
@@ -225,7 +230,7 @@ func TestExplainStableTiesAndDoesNotConsumeBudget(t *testing.T) {
 		Match:  &match.Block{Message: map[string]match.Rules{"order_id": {"eq": "actual"}}},
 		Times:  1,
 	})
-	budgetStore := NewStore([]*Compiled{limited})
+	budgetStore := storeWith(t, limited)
 	if reasons := budgetStore.Explain(method, in); reasons != nil {
 		t.Fatalf("Explain for a live match = %#v, want nil", reasons)
 	}
@@ -244,7 +249,7 @@ func TestSelectOrExplainSnapshotsConcurrentLastBudget(t *testing.T) {
 		Times:  1,
 	})
 	limited.Source = "limited"
-	store := NewStore([]*Compiled{limited})
+	store := storeWith(t, limited)
 
 	type result struct {
 		selection Selection
@@ -299,7 +304,7 @@ func TestSelectOrExplainSnapshotsRegisteredCount(t *testing.T) {
 		Method: "shop.v1.OrderService/GetOrder",
 		Match:  &match.Block{Message: map[string]match.Rules{"order_id": {"eq": "second"}}},
 	})
-	store := NewStore([]*Compiled{first, second})
+	store := storeWith(t, first, second)
 	in := match.Input{Message: request(t, reg, `{"order_id":"actual"}`).ProtoReflect()}
 
 	result := store.SelectOrExplain(method, in)
@@ -311,5 +316,204 @@ func TestSelectOrExplainSnapshotsRegisteredCount(t *testing.T) {
 	}
 	if len(result.Misses) != 2 {
 		t.Fatalf("SelectOrExplain misses = %#v, want two misses", result.Misses)
+	}
+}
+
+// storeWith builds a store the way server.Start now does: empty, then one
+// validated file-origin ingest.
+func storeWith(t *testing.T, stubs ...*Compiled) *Store {
+	t.Helper()
+	s := NewStore()
+	if _, err := s.ReplaceOrigin(OriginFile, stubs); err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// plainStub compiles a matcher-less GetOrder stub, which matches any input.
+func plainStub(t *testing.T, reg *schema.Registry) *Compiled {
+	t.Helper()
+	return compiled(t, reg, Stub{Method: "shop.v1.OrderService/GetOrder"})
+}
+
+func TestAddStampsAPIOwnership(t *testing.T) {
+	reg := testRegistry(t)
+	c := plainStub(t, reg)
+	c.Origin = OriginFile // a wrong pre-set value must be overwritten
+	c.Source = "left-over"
+	s := NewStore()
+	id := s.Add(c)
+	if id != "api-1" {
+		t.Fatalf("id = %q, want api-1", id)
+	}
+	if c.Origin != OriginAPI || c.Source != "api" || c.ID != "api-1" {
+		t.Fatalf("Add did not stamp ownership: ID=%q Origin=%v Source=%q", c.ID, c.Origin, c.Source)
+	}
+	infos := s.List(ListFilter{})
+	if len(infos) != 1 || infos[0].Origin != OriginAPI || infos[0].ID != "api-1" {
+		t.Fatalf("List = %+v", infos)
+	}
+}
+
+func TestAPIBeatsFileAtEqualPriority(t *testing.T) {
+	reg := testRegistry(t)
+	file := plainStub(t, reg)
+	api := plainStub(t, reg) // same priority
+	s := storeWith(t, file)
+	s.Add(api)
+	if got := s.Select(method, match.Input{}); got != api {
+		t.Fatalf("Select = %v, want the API stub at equal priority", got)
+	}
+}
+
+func TestHigherPriorityFileBeatsLowerPriorityAPI(t *testing.T) {
+	reg := testRegistry(t)
+	file := plainStub(t, reg)
+	file.Priority = 10
+	api := plainStub(t, reg)
+	s := storeWith(t, file)
+	s.Add(api)
+	if got := s.Select(method, match.Input{}); got != file {
+		t.Fatalf("Select = %v, want the priority-10 file stub", got)
+	}
+}
+
+func TestRemoveRefusesFileOriginAndUnknownIDs(t *testing.T) {
+	reg := testRegistry(t)
+	file := plainStub(t, reg)
+	file.ID, file.Source = "stubs/a.yaml#0", "stubs/a.yaml#0"
+	s := storeWith(t, file)
+	err := s.Remove("stubs/a.yaml#0")
+	var owned *FileOwnedError
+	if !errors.As(err, &owned) {
+		t.Fatalf("Remove(file-origin) = %v, want *FileOwnedError", err)
+	}
+	if owned.Source != "stubs/a.yaml#0" {
+		t.Fatalf("owned.Source = %q", owned.Source)
+	}
+	if err := s.Remove("nope"); !errors.Is(err, ErrStubNotFound) {
+		t.Fatalf("Remove(unknown) = %v, want ErrStubNotFound", err)
+	}
+	if s.Len() != 1 {
+		t.Fatalf("Len = %d after refused removes, want 1", s.Len())
+	}
+}
+
+func TestRemoveDeletesAPIStub(t *testing.T) {
+	reg := testRegistry(t)
+	s := NewStore()
+	id := s.Add(plainStub(t, reg))
+	if err := s.Remove(id); err != nil {
+		t.Fatal(err)
+	}
+	if s.Len() != 0 {
+		t.Fatalf("Len = %d, want 0", s.Len())
+	}
+}
+
+func TestReplaceOriginPreservesOtherOriginAndItsCounters(t *testing.T) {
+	reg := testRegistry(t)
+	limited := plainStub(t, reg)
+	limited.Times = 2
+	s := NewStore()
+	s.Add(limited) // API stub with a budget
+	if got := s.Select(method, match.Input{}); got != limited {
+		t.Fatal("setup select failed")
+	}
+	// A file hot-reload must not replenish the API stub's budget.
+	fresh := plainStub(t, reg)
+	fresh.ID, fresh.Source = "f#0", "f#0"
+	fresh.Priority = -1 // below the API stub, so selection still hits the API stub
+	if _, err := s.ReplaceOrigin(OriginFile, []*Compiled{fresh}); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.Select(method, match.Input{}); got != limited {
+		t.Fatalf("Select = %v, want the API stub's second use", got)
+	}
+	if got := s.Select(method, match.Input{}); got != fresh {
+		t.Fatalf("Select = %v, want fallthrough to file stub: API budget must be spent (2 uses), not replenished by the reload", got)
+	}
+}
+
+func TestReplaceOriginRejectsDuplicateIDsUntouched(t *testing.T) {
+	reg := testRegistry(t)
+	a := plainStub(t, reg)
+	a.ID, a.Source = "dup#0", "dup#0"
+	s := storeWith(t, a)
+	b := plainStub(t, reg)
+	b.ID, b.Source = "same#0", "same#0"
+	c := plainStub(t, reg)
+	c.ID, c.Source = "same#0", "same#0"
+	if _, err := s.ReplaceOrigin(OriginFile, []*Compiled{b, c}); err == nil {
+		t.Fatal("duplicate ids accepted, want error")
+	} else if !strings.Contains(err.Error(), "same#0") {
+		t.Fatalf("error %q does not name the duplicate id", err)
+	}
+	infos := s.List(ListFilter{})
+	if len(infos) != 1 || infos[0].ID != "dup#0" {
+		t.Fatalf("failed ReplaceOrigin changed the store: %+v", infos)
+	}
+}
+
+func TestReplaceOriginAssignsIDsToAPIDocuments(t *testing.T) {
+	reg := testRegistry(t)
+	s := NewStore()
+	ids, err := s.ReplaceOrigin(OriginAPI, []*Compiled{plainStub(t, reg), plainStub(t, reg)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 2 || ids[0] == ids[1] || ids[0] == "" {
+		t.Fatalf("ids = %v, want two distinct assigned ids", ids)
+	}
+}
+
+func TestResetStubsDropsAPIAndRestoresFileBudgets(t *testing.T) {
+	reg := testRegistry(t)
+	limited := plainStub(t, reg)
+	limited.Times = 1
+	limited.ID, limited.Source = "f#0", "f#0"
+	s := storeWith(t, limited)
+	s.Add(plainStub(t, reg))
+	if got := s.Select(method, match.Input{}); got == nil {
+		t.Fatal("setup select failed")
+	}
+	s.ResetStubs()
+	infos := s.List(ListFilter{})
+	if len(infos) != 1 || infos[0].Origin != OriginFile {
+		t.Fatalf("after ResetStubs: %+v, want only the file stub", infos)
+	}
+	if infos[0].Hits != 0 {
+		t.Fatalf("Hits = %d after ResetStubs, want 0 (budget restored)", infos[0].Hits)
+	}
+}
+
+func TestListFiltersByMethodAndOrigin(t *testing.T) {
+	reg := testRegistry(t)
+	f := plainStub(t, reg)
+	f.ID, f.Source = "f#0", "f#0"
+	s := storeWith(t, f)
+	s.Add(plainStub(t, reg))
+	api := OriginAPI
+	if got := s.List(ListFilter{Origin: &api}); len(got) != 1 || got[0].Origin != OriginAPI {
+		t.Fatalf("List(api) = %+v", got)
+	}
+	if got := s.List(ListFilter{Method: "/no.Such/Method"}); len(got) != 0 {
+		t.Fatalf("List(unknown method) = %+v", got)
+	}
+	if got := s.List(ListFilter{}); len(got) != 2 {
+		t.Fatalf("List(all) = %+v", got)
+	}
+}
+
+func TestListReportsHits(t *testing.T) {
+	reg := testRegistry(t)
+	c := plainStub(t, reg)
+	s := NewStore()
+	s.Add(c)
+	s.Select(method, match.Input{})
+	s.Select(method, match.Input{})
+	infos := s.List(ListFilter{})
+	if len(infos) != 1 || infos[0].Hits != 2 {
+		t.Fatalf("Hits = %+v, want 2", infos)
 	}
 }

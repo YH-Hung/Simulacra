@@ -46,7 +46,7 @@ func LoadDirs(reg *schema.Registry, dirs []string) ([]*Compiled, []error) {
 	var out []*Compiled
 	compiler := NewCompiler(reg)
 	for _, path := range paths {
-		stubs, err := parseFile(path)
+		stubs, docs, err := parseFile(path)
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -58,6 +58,8 @@ func LoadDirs(reg *schema.Registry, dirs []string) ([]*Compiled, []error) {
 				errs = append(errs, err)
 				continue
 			}
+			c.ID = source
+			c.Document = docs[i]
 			out = append(out, c)
 		}
 	}
@@ -66,11 +68,13 @@ func LoadDirs(reg *schema.Registry, dirs []string) ([]*Compiled, []error) {
 
 // parseFile reads one YAML file holding a list of stubs, decoding every
 // `---` document in the file. Parsing is strict: unknown keys are errors,
-// so unsupported/future syntax fails loudly instead of being ignored.
-func parseFile(path string) ([]Stub, error) {
+// so unsupported/future syntax fails loudly instead of being ignored. The
+// second return value carries each stub's normalized document (design §3.1),
+// harvested from a parallel node pass over the same bytes.
+func parseFile(path string) ([]Stub, []string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("reading %s: %w", path, err)
+		return nil, nil, fmt.Errorf("reading %s: %w", path, err)
 	}
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
@@ -79,10 +83,51 @@ func parseFile(path string) ([]Stub, error) {
 		var doc []Stub
 		if err := dec.Decode(&doc); err != nil {
 			if errors.Is(err, io.EOF) {
-				return stubs, nil
+				break
 			}
-			return nil, fmt.Errorf("parsing %s: %w", path, err)
+			return nil, nil, fmt.Errorf("parsing %s: %w", path, err)
 		}
 		stubs = append(stubs, doc...)
+	}
+	docs, err := stubDocuments(data)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parsing %s: %w", path, err)
+	}
+	if len(docs) != len(stubs) {
+		return nil, nil, fmt.Errorf("parsing %s: %d stubs but %d documents; file structure not understood", path, len(stubs), len(docs))
+	}
+	return stubs, docs, nil
+}
+
+// stubDocuments renders each sequence item of each YAML document as a
+// normalized per-stub document. The struct decoder above already rejected
+// non-sequence documents, so the sequence error here can only fire on
+// shapes it also rejected; the count check in parseFile is the belt to
+// that suspender.
+func stubDocuments(data []byte) ([]string, error) {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	var docs []string
+	for {
+		var doc yaml.Node
+		if err := dec.Decode(&doc); err != nil {
+			if errors.Is(err, io.EOF) {
+				return docs, nil
+			}
+			return nil, err
+		}
+		if len(doc.Content) == 0 {
+			continue
+		}
+		seq := doc.Content[0]
+		if seq.Kind != yaml.SequenceNode {
+			return nil, errors.New("stub files hold a list of stubs")
+		}
+		for _, item := range seq.Content {
+			rendered, err := renderNode(item)
+			if err != nil {
+				return nil, err
+			}
+			docs = append(docs, rendered)
+		}
 	}
 }

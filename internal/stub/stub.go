@@ -76,6 +76,23 @@ type Rule struct {
 	Send    []Step
 }
 
+// Origin records who owns a stub: the hot-reload watcher (file) or an admin
+// API client (api). The store stamps it on ingest (design §3.4); compilers
+// leave it zero.
+type Origin uint8
+
+const (
+	OriginFile Origin = iota
+	OriginAPI
+)
+
+func (o Origin) String() string {
+	if o == OriginAPI {
+		return "api"
+	}
+	return "file"
+}
+
 // Compiled is a stub validated against the schema. Source identifies where it
 // came from ("path/to/file.yaml#index") for error messages.
 type Compiled struct {
@@ -84,6 +101,9 @@ type Compiled struct {
 	Priority int
 	Times    int
 	Source   string
+	ID       string // store-managed: file stubs carry Source, API stubs get "api-<n>"
+	Origin   Origin // store-managed: stamped on ingest
+	Document string // normalized single-stub YAML mapping (admin Stub.document)
 	matcher  *match.Compiled
 	plan     *Plan
 }
@@ -106,7 +126,7 @@ type Compiler struct {
 }
 
 func NewCompiler(reg *schema.Registry) *Compiler {
-	return &Compiler{reg: reg, matcher: match.NewCompiler(reg.Files()), types: reg.Types()}
+	return &Compiler{reg: reg, matcher: match.NewCompiler(reg.Snapshot()), types: reg.Types()}
 }
 
 func Compile(reg *schema.Registry, s Stub, source string) (*Compiled, error) {
@@ -302,4 +322,14 @@ func buildMessage(types *schema.Types, desc protoreflect.MessageDescriptor, fiel
 		return nil, fmt.Errorf("response message does not fit %s: %w", desc.FullName(), err)
 	}
 	return msg, nil
+}
+
+// CompileMatch compiles a bare match block against a method — the matcher
+// half of Compile, for VerifyCalls. A nil block compiles to match-all.
+func (c *Compiler) CompileMatch(method string, b *match.Block) (*match.Compiled, error) {
+	m, err := c.reg.LookupMethod(method)
+	if err != nil {
+		return nil, err
+	}
+	return c.matcher.Compile(m.Input(), b, match.ShapeOf(m))
 }

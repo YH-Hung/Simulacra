@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/bufbuild/protocompile"
 	"google.golang.org/protobuf/proto"
@@ -22,15 +24,93 @@ import (
 )
 
 type Registry struct {
+	mu   sync.Mutex // serializes load→build→swap; readers never take it
+	snap atomic.Pointer[snapshot]
+}
+
+// snapshot is an immutable pairing of a descriptor index and its derived
+// dynamic type table. Once stored in Registry.snap it is never mutated;
+// mutation builds a fresh snapshot and swaps the pointer.
+type snapshot struct {
 	files *protoregistry.Files
+	types *dynamicpb.Types
+}
+
+func newSnapshot(files *protoregistry.Files) *snapshot {
+	return &snapshot{files: files, types: dynamicpb.NewTypes(files)}
 }
 
 func NewRegistry() *Registry {
-	return &Registry{files: new(protoregistry.Files)}
+	r := &Registry{}
+	r.snap.Store(newSnapshot(new(protoregistry.Files)))
+	return r
 }
 
-// Files exposes the registry as a protodesc.Resolver (used by grpc reflection).
-func (r *Registry) Files() *protoregistry.Files { return r.files }
+func (r *Registry) current() *snapshot { return r.snap.Load() }
+
+// Snapshot returns the current descriptor set. Read-only by convention:
+// registering into a returned snapshot is a data race with every other
+// holder. It exists for the one consumer that needs the concrete type —
+// match.NewCompiler (RangeFiles + dynamicpb.NewTypes) — everything else
+// should use the Registry's own resolver methods, which stay live across
+// registrations.
+func (r *Registry) Snapshot() *protoregistry.Files { return r.current().files }
+
+// FindFileByPath implements protodesc.Resolver against the live snapshot.
+func (r *Registry) FindFileByPath(path string) (protoreflect.FileDescriptor, error) {
+	return r.current().files.FindFileByPath(path)
+}
+
+// FindDescriptorByName implements protodesc.Resolver against the live snapshot.
+func (r *Registry) FindDescriptorByName(name protoreflect.FullName) (protoreflect.Descriptor, error) {
+	return r.current().files.FindDescriptorByName(name)
+}
+
+// apply runs one mutation as load→build→swap: it copies the current snapshot
+// into a fresh candidate, lets fn extend the candidate, and publishes the
+// candidate only if fn succeeds. The mutex makes concurrent registrations
+// serialize instead of losing updates; the failed-fn path leaves the served
+// snapshot byte-for-byte untouched (all-or-nothing).
+func (r *Registry) apply(fn func(candidate *protoregistry.Files) error) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	candidate := new(protoregistry.Files)
+	var copyErr error
+	r.current().files.RangeFiles(func(fd protoreflect.FileDescriptor) bool {
+		copyErr = candidate.RegisterFile(fd)
+		return copyErr == nil
+	})
+	if copyErr != nil {
+		return fmt.Errorf("copying registry snapshot: %w", copyErr)
+	}
+	if err := fn(candidate); err != nil {
+		return err
+	}
+	r.snap.Store(newSnapshot(candidate))
+	return nil
+}
+
+// addNew registers fd and, first, all of its imports into files. A path that
+// is already present is skipped (first registration wins). Newly registered
+// paths are appended to added when it is non-nil.
+func addNew(files *protoregistry.Files, fd protoreflect.FileDescriptor, added *[]string) error {
+	if _, err := files.FindFileByPath(fd.Path()); err == nil {
+		return nil
+	}
+	imps := fd.Imports()
+	for i := 0; i < imps.Len(); i++ {
+		if err := addNew(files, imps.Get(i).FileDescriptor, added); err != nil {
+			return err
+		}
+	}
+	if err := files.RegisterFile(fd); err != nil {
+		return err
+	}
+	if added != nil {
+		*added = append(*added, fd.Path())
+	}
+	return nil
+}
 
 // AddProtoDir compiles every .proto file found under root, treating root as
 // the single import path (imports inside the files are resolved relative to
@@ -66,27 +146,22 @@ func (r *Registry) AddProtoDir(ctx context.Context, root string) error {
 	if err != nil {
 		return fmt.Errorf("compiling protos under %s: %w", root, err)
 	}
-	for _, fd := range compiled {
-		if err := r.AddFile(fd); err != nil {
-			return err
+	return r.apply(func(candidate *protoregistry.Files) error {
+		for _, fd := range compiled {
+			if err := addNew(candidate, fd, nil); err != nil {
+				return err
+			}
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
-// AddFile registers a file descriptor and, first, all of its imports.
+// AddFile registers a file descriptor and its imports as one atomic swap.
 // A path that is already registered is skipped (first registration wins).
 func (r *Registry) AddFile(fd protoreflect.FileDescriptor) error {
-	if _, err := r.files.FindFileByPath(fd.Path()); err == nil {
-		return nil
-	}
-	imps := fd.Imports()
-	for i := 0; i < imps.Len(); i++ {
-		if err := r.AddFile(imps.Get(i).FileDescriptor); err != nil {
-			return err
-		}
-	}
-	return r.files.RegisterFile(fd)
+	return r.apply(func(candidate *protoregistry.Files) error {
+		return addNew(candidate, fd, nil)
+	})
 }
 
 // AddDescriptorSetFile loads a serialized FileDescriptorSet (e.g. a buf image
@@ -108,12 +183,14 @@ func (r *Registry) AddDescriptorSetFile(path string) error {
 	if err != nil {
 		return fmt.Errorf("loading %s (descriptor sets must be self-contained; build with `buf build -o` or `protoc --include_imports`): %w", path, err)
 	}
-	var regErr error
-	files.RangeFiles(func(fd protoreflect.FileDescriptor) bool {
-		regErr = r.AddFile(fd)
-		return regErr == nil
+	return r.apply(func(candidate *protoregistry.Files) error {
+		var regErr error
+		files.RangeFiles(func(fd protoreflect.FileDescriptor) bool {
+			regErr = addNew(candidate, fd, nil)
+			return regErr == nil
+		})
+		return regErr
 	})
-	return regErr
 }
 
 // LookupMethod resolves "pkg.Service/Method" or "/pkg.Service/Method".
@@ -124,7 +201,7 @@ func (r *Registry) LookupMethod(fullMethod string) (protoreflect.MethodDescripto
 		return nil, fmt.Errorf("invalid method name %q (want package.Service/Method)", fullMethod)
 	}
 	svcName, methodName := name[:idx], name[idx+1:]
-	d, err := r.files.FindDescriptorByName(protoreflect.FullName(svcName))
+	d, err := r.current().files.FindDescriptorByName(protoreflect.FullName(svcName))
 	if err != nil {
 		return nil, fmt.Errorf("service %q is not registered (no schema source declares it)", svcName)
 	}
@@ -143,7 +220,7 @@ func (r *Registry) LookupMethod(fullMethod string) (protoreflect.MethodDescripto
 // registry's files, falling back to the process-global registry.
 func (r *Registry) LookupMessage(name string) (protoreflect.MessageDescriptor, error) {
 	full := protoreflect.FullName(name)
-	d, err := r.files.FindDescriptorByName(full)
+	d, err := r.current().files.FindDescriptorByName(full)
 	if errors.Is(err, protoregistry.NotFound) {
 		d, err = protoregistry.GlobalFiles.FindDescriptorByName(full)
 	}
@@ -160,15 +237,17 @@ func (r *Registry) LookupMessage(name string) (protoreflect.MessageDescriptor, e
 	return md, nil
 }
 
-func (r *Registry) Types() *Types { return &Types{dyn: dynamicpb.NewTypes(r.files)} }
+func (r *Registry) Types() *Types { return &Types{reg: r} }
 
-// Types is a registry-first, global-fallback protobuf type resolver.
+// Types is a registry-first, global-fallback protobuf type resolver. It reads
+// the registry's current snapshot on every call, so a message type registered
+// after Types was constructed still resolves.
 type Types struct {
-	dyn *dynamicpb.Types
+	reg *Registry
 }
 
 func (t *Types) FindMessageByName(n protoreflect.FullName) (protoreflect.MessageType, error) {
-	mt, err := t.dyn.FindMessageByName(n)
+	mt, err := t.reg.current().types.FindMessageByName(n)
 	if err == nil {
 		return mt, nil
 	}
@@ -179,7 +258,7 @@ func (t *Types) FindMessageByName(n protoreflect.FullName) (protoreflect.Message
 }
 
 func (t *Types) FindMessageByURL(url string) (protoreflect.MessageType, error) {
-	mt, err := t.dyn.FindMessageByURL(url)
+	mt, err := t.reg.current().types.FindMessageByURL(url)
 	if err == nil {
 		return mt, nil
 	}
@@ -190,7 +269,7 @@ func (t *Types) FindMessageByURL(url string) (protoreflect.MessageType, error) {
 }
 
 func (t *Types) FindExtensionByName(field protoreflect.FullName) (protoreflect.ExtensionType, error) {
-	et, err := t.dyn.FindExtensionByName(field)
+	et, err := t.reg.current().types.FindExtensionByName(field)
 	if err == nil {
 		return et, nil
 	}
@@ -201,7 +280,7 @@ func (t *Types) FindExtensionByName(field protoreflect.FullName) (protoreflect.E
 }
 
 func (t *Types) FindExtensionByNumber(message protoreflect.FullName, field protoreflect.FieldNumber) (protoreflect.ExtensionType, error) {
-	et, err := t.dyn.FindExtensionByNumber(message, field)
+	et, err := t.reg.current().types.FindExtensionByNumber(message, field)
 	if err == nil {
 		return et, nil
 	}
@@ -214,12 +293,85 @@ func (t *Types) FindExtensionByNumber(message protoreflect.FullName, field proto
 // Services returns every service descriptor across all registered files.
 func (r *Registry) Services() []protoreflect.ServiceDescriptor {
 	var out []protoreflect.ServiceDescriptor
-	r.files.RangeFiles(func(fd protoreflect.FileDescriptor) bool {
+	r.current().files.RangeFiles(func(fd protoreflect.FileDescriptor) bool {
 		svcs := fd.Services()
 		for i := 0; i < svcs.Len(); i++ {
 			out = append(out, svcs.Get(i))
 		}
 		return true
 	})
+	return out
+}
+
+// RegisterSet registers every file of a serialized-set image all-or-nothing:
+// on any error the served registry is untouched. The set must be
+// self-contained (every import present). Idempotent: a path already
+// registered with equivalent content is skipped; the same path with
+// different content fails, naming the file. Returns the paths newly added
+// (empty when every file was already present).
+func (r *Registry) RegisterSet(set *descriptorpb.FileDescriptorSet) ([]string, error) {
+	if len(set.GetFile()) == 0 {
+		return nil, errors.New("descriptor set contains no files")
+	}
+	incoming, err := protodesc.NewFiles(set)
+	if err != nil {
+		return nil, fmt.Errorf("loading descriptor set (descriptor sets must be self-contained; build with `buf build -o` or `protoc --include_imports`): %w", err)
+	}
+	var added []string
+	err = r.apply(func(candidate *protoregistry.Files) error {
+		var rangeErr error
+		incoming.RangeFiles(func(fd protoreflect.FileDescriptor) bool {
+			existing, findErr := candidate.FindFileByPath(fd.Path())
+			if findErr == nil {
+				if !descriptorsEquivalent(existing, fd) {
+					rangeErr = fmt.Errorf("file %q is already registered with different content", fd.Path())
+				}
+				return rangeErr == nil
+			}
+			// A file registered from the incoming set keeps descriptor-internal
+			// references to the incoming copies of its imports even when the
+			// candidate already indexed equivalent copies — safe precisely
+			// because equivalence was just verified, and lookups by name always
+			// resolve the candidate's copy. RangeFiles order is unspecified,
+			// which is fine: addNew registers imports before importers, and a
+			// path skipped at recursion time is still equivalence-checked when
+			// the outer range reaches its own visit.
+			rangeErr = addNew(candidate, fd, &added)
+			return rangeErr == nil
+		})
+		return rangeErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	return added, nil
+}
+
+// descriptorsEquivalent compares two copies of the same proto file for
+// semantic equality, seeing through representation-only differences.
+func descriptorsEquivalent(a, b protoreflect.FileDescriptor) bool {
+	return proto.Equal(
+		normalizeFileProto(protodesc.ToFileDescriptorProto(a)),
+		normalizeFileProto(protodesc.ToFileDescriptorProto(b)),
+	)
+}
+
+// normalizeFileProto strips the two representation-only differences observed
+// between toolchains (design §2.6, verified empirically): source code info,
+// and unknown fields — buf images carry a per-file extension (field 8042)
+// that plain FileDescriptorSet parsing keeps as unknown bytes. Descriptor
+// meaning may not be touched here: loosening equivalence further must never
+// mask a real conflict, which the admin contract requires to fail.
+func normalizeFileProto(fdp *descriptorpb.FileDescriptorProto) *descriptorpb.FileDescriptorProto {
+	clone := proto.Clone(fdp).(*descriptorpb.FileDescriptorProto)
+	clone.SourceCodeInfo = nil
+	wire, err := proto.MarshalOptions{Deterministic: true}.Marshal(clone)
+	if err != nil {
+		return clone
+	}
+	out := new(descriptorpb.FileDescriptorProto)
+	if err := (proto.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(wire, out); err != nil {
+		return clone
+	}
 	return out
 }

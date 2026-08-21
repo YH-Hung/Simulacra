@@ -103,7 +103,7 @@ func newHarness(t *testing.T, stubsYAML string) *harness {
 	}
 
 	calls := journal.New(256)
-	server, err := dataplane.New(reg, stub.NewStore(compiled), calls)
+	server, err := dataplane.New(reg, storeWith(t, compiled), calls)
 	if err != nil {
 		t.Fatalf("dataplane.New: %v", err)
 	}
@@ -236,7 +236,7 @@ func (h *harness) verify(t *testing.T, body string, wantShape match.Shape) journ
 		t.Fatalf("parse verification YAML: %v", err)
 	}
 	desc := h.method(t, spec.Method, wantShape)
-	matcher, err := match.NewCompiler(h.reg.Files()).Compile(desc.Input(), spec.Match, wantShape)
+	matcher, err := match.NewCompiler(h.reg.Snapshot()).Compile(desc.Input(), spec.Match, wantShape)
 	if err != nil {
 		t.Fatalf("compile verification match: %v", err)
 	}
@@ -285,4 +285,15 @@ func richRequest(t *testing.T, h *harness, desc protoreflect.MessageDescriptor, 
   "tree": {"label": "root", "next": {"label": "leaf"}},
   "text": %q
 }`, text))
+}
+
+// storeWith builds a store the way server.Start now does: empty, then one
+// validated file-origin ingest.
+func storeWith(t *testing.T, stubs []*stub.Compiled) *stub.Store {
+	t.Helper()
+	s := stub.NewStore()
+	if _, err := s.ReplaceOrigin(stub.OriginFile, stubs); err != nil {
+		t.Fatal(err)
+	}
+	return s
 }

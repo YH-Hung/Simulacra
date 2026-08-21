@@ -293,7 +293,7 @@ func testFiles(t *testing.T) *protoregistry.Files {
 	if err := reg.AddProtoDir(context.Background(), "../../testdata/protos"); err != nil {
 		t.Fatal(err)
 	}
-	return reg.Files()
+	return reg.Snapshot()
 }
 
 func TestExprMatching(t *testing.T) {
@@ -349,7 +349,7 @@ func TestExprRegisteredDynamicAny(t *testing.T) {
 }`), request); err != nil {
 		t.Fatalf("build registered Any request: %v", err)
 	}
-	compiled, err := NewCompiler(reg.Files()).Compile(method.Input(), &Block{
+	compiled, err := NewCompiler(reg.Snapshot()).Compile(method.Input(), &Block{
 		Expr: `message.payload.id == "in-1"`,
 	}, Unary)
 	if err != nil {
@@ -609,7 +609,7 @@ func anyExprRegistry(t *testing.T) (*schema.Registry, protoreflect.MethodDescrip
 
 func compileAnyExpr(t *testing.T, reg *schema.Registry, input protoreflect.MessageDescriptor, expression string) *Compiled {
 	t.Helper()
-	compiled, err := NewCompiler(reg.Files()).Compile(input, &Block{Expr: expression}, Unary)
+	compiled, err := NewCompiler(reg.Snapshot()).Compile(input, &Block{Expr: expression}, Unary)
 	if err != nil {
 		t.Fatalf("Compile(%s): %v", expression, err)
 	}

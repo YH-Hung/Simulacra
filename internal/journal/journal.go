@@ -21,6 +21,7 @@ type Call struct {
 	Responses  []*dynamicpb.Message
 	Err        *status.Status
 	StubSource string
+	StubID     string
 	Start      time.Time
 	Duration   time.Duration
 }
@@ -39,6 +40,7 @@ type Journal struct {
 	start   int
 	count   int
 	total   uint64
+	subs    map[*Subscription]struct{} // live Watch subscribers; guarded by mu
 }
 
 func New(capacity int) *Journal {
@@ -67,6 +69,7 @@ func (j *Journal) Record(call *Call) {
 		j.start = (j.start + 1) % j.cap
 	}
 	j.entries[index] = retained
+	j.broadcastLocked(retained)
 }
 
 // List returns independent call snapshots oldest first.
@@ -150,3 +153,13 @@ func normalizeMethod(method string) string {
 	}
 	return "/" + strings.TrimPrefix(method, "/")
 }
+
+// Len reports how many calls the ring currently retains.
+func (j *Journal) Len() int {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	return j.count
+}
+
+// Cap reports the ring capacity, fixed at construction.
+func (j *Journal) Cap() int { return j.cap }
