@@ -55,8 +55,21 @@ func (j *Journal) Watch(ctx context.Context, method string) *Subscription {
 // Calls is the stream channel; it closes when the subscription ends.
 func (s *Subscription) Calls() <-chan *Call { return s.calls }
 
-// Err reports why Calls closed. Read it only after Calls is closed.
-func (s *Subscription) Err() error { return s.err }
+// Err reports why Calls closed: nil for a clean Close or context
+// cancellation, ErrSlowConsumer for an eviction. It is safe to call at any
+// time and from any goroutine — it reads under the same lock closeLocked
+// writes under, and returns nil while the subscription is still live.
+//
+// Reading it unlocked would in principle be safe for a caller that has
+// already observed Calls closed (the close provides the happens-before
+// edge), but that contract is invisible to the race detector and easy to
+// violate by one line; a mutex on a once-per-stream teardown call costs
+// nothing next to that.
+func (s *Subscription) Err() error {
+	s.journal.mu.RLock()
+	defer s.journal.mu.RUnlock()
+	return s.err
+}
 
 // Close ends the subscription. Idempotent; Err stays nil on this path.
 func (s *Subscription) Close() {

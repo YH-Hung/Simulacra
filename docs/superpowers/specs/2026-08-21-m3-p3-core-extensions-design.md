@@ -384,7 +384,7 @@ func (j *Journal) Watch(ctx context.Context, method string) *Subscription
 
 func (s *Subscription) Calls() <-chan *Call   // closed on drop, Close, or ctx done
 func (s *Subscription) Close()
-func (s *Subscription) Err() error            // read after Calls closes
+func (s *Subscription) Err() error            // safe any time; nil while live
 ```
 
 **Why a `Subscription` and not the bare `Watch(ctx) (<-chan *Call, func())` of M3 design §6.** A
@@ -411,6 +411,15 @@ Since eviction happens *inside* `Record` — which already holds `mu` — the cl
 is a locked-state helper both paths call, one from under the lock and one after taking it, rather
 than a public method calling itself recursively. A `sync.Once` still wraps the user-facing `Close`
 for idempotence, but the mutex is what carries the guarantee.
+
+**`Err` reads under the lock.** An earlier revision documented it as "read only after
+`Calls` closes", relying on the close to provide the happens-before edge for the unsynchronized
+read of `err`. That is technically sound and practically untenable: the contract is invisible to
+the race detector, and the first test written against it violated it by one line (receiving a
+*value* from `Calls` and then reading `Err`, with no close observed). `Err` therefore takes the
+journal's read lock — the same lock `closeLocked` writes under — and returns nil while the
+subscription is live. It is a once-per-stream teardown call; the mutex costs nothing next to a
+caller-discipline contract Phase 4's handler would have to honor perfectly.
 
 **The context bridge must itself be closeable.** One small goroutine per subscription maps
 `ctx.Done()` onto `Close` — but a goroutine waiting on `ctx.Done()` alone outlives an explicit

@@ -170,8 +170,13 @@ func TestCancelRacesBroadcast(t *testing.T) {
 			cancel()
 		}()
 		wg.Wait()
-		<-sub.Calls() // just ensure no panic and the channel is usable
-		_ = sub.Err()
+		// Drain to close like a real consumer: the stream must terminate,
+		// and cancellation must never be reported as a slow-consumer drop.
+		for range sub.Calls() {
+		}
+		if err := sub.Err(); err != nil {
+			t.Fatalf("Err = %v, want nil after cancellation", err)
+		}
 	}
 }
 
