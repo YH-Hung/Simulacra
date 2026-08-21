@@ -235,8 +235,8 @@ func TestUnaryMatchedCall(t *testing.T) {
 		t.Fatalf("journal calls = %d, want 1", len(recorded))
 	}
 	call := recorded[0]
-	if call.Method != "/shop.v1.OrderService/GetOrder" || call.StubSource == "" {
-		t.Errorf("journal method/source = %q/%q", call.Method, call.StubSource)
+	if call.Method != "/shop.v1.OrderService/GetOrder" || call.StubSource == "" || call.StubID == "" {
+		t.Errorf("journal method/source/id = %q/%q/%q", call.Method, call.StubSource, call.StubID)
 	}
 	if got := call.Metadata.Get("x-tenant"); len(got) != 1 || got[0] != "acme" {
 		t.Errorf("journal metadata x-tenant = %v, want [acme]", got)

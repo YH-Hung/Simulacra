@@ -136,6 +136,7 @@ func (s *Server) bidi(stream grpc.ServerStream, full string, method protoreflect
 	}
 	selected := selection.Selected
 	call.StubSource = selected.Source
+	call.StubID = selected.ID
 	plan := selected.Plan()
 	if len(plan.Trailer) > 0 {
 		stream.SetTrailer(plan.Trailer)
@@ -199,6 +200,7 @@ func (s *Server) clientStream(stream grpc.ServerStream, full string, method prot
 	}
 	selected := selection.Selected
 	call.StubSource = selected.Source
+	call.StubID = selected.ID
 	if err := applyMetadata(stream, selected.Plan()); err != nil {
 		return err
 	}
@@ -217,6 +219,7 @@ func (s *Server) unary(stream grpc.ServerStream, full string, method protoreflec
 	}
 	selected := selection.Selected
 	call.StubSource = selected.Source
+	call.StubID = selected.ID
 	if err := applyMetadata(stream, selected.Plan()); err != nil {
 		return err
 	}
@@ -235,6 +238,7 @@ func (s *Server) serverStream(stream grpc.ServerStream, full string, method prot
 	}
 	selected := selection.Selected
 	call.StubSource = selected.Source
+	call.StubID = selected.ID
 	plan := selected.Plan()
 	if err := applyMetadata(stream, plan); err != nil {
 		return err
