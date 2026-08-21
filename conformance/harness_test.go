@@ -236,7 +236,7 @@ func (h *harness) verify(t *testing.T, body string, wantShape match.Shape) journ
 		t.Fatalf("parse verification YAML: %v", err)
 	}
 	desc := h.method(t, spec.Method, wantShape)
-	matcher, err := match.NewCompiler(h.reg.Files()).Compile(desc.Input(), spec.Match, wantShape)
+	matcher, err := match.NewCompiler(h.reg.Snapshot()).Compile(desc.Input(), spec.Match, wantShape)
 	if err != nil {
 		t.Fatalf("compile verification match: %v", err)
 	}

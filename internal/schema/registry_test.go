@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -257,5 +258,74 @@ func TestTypesWrongKindDoesNotFallbackForExtension(t *testing.T) {
 	}
 	if got, err := empty.FindExtensionByNumber(hostName, extensionNum); err != nil || got.TypeDescriptor().FullName() != extensionName {
 		t.Fatalf("global extension number fallback = %v, %v", got, err)
+	}
+}
+
+// A snapshot taken before a mutation must not observe the mutation: the
+// registry must swap a fresh Files rather than mutate the one it handed out.
+func TestSnapshotIsImmutableAcrossMutation(t *testing.T) {
+	reg := NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), testProtoDir); err != nil {
+		t.Fatal(err)
+	}
+	before := reg.Snapshot()
+	beforeCount := before.NumFiles()
+
+	if err := reg.AddFile(healthpb.File_grpc_health_v1_health_proto); err != nil {
+		t.Fatal(err)
+	}
+	if got := before.NumFiles(); got != beforeCount {
+		t.Fatalf("earlier snapshot grew from %d to %d files; mutation must build a new snapshot", beforeCount, got)
+	}
+	if got := reg.Snapshot().NumFiles(); got <= beforeCount {
+		t.Fatalf("current snapshot has %d files, want > %d after AddFile", got, beforeCount)
+	}
+	if _, err := before.FindFileByPath("grpc/health/v1/health.proto"); err == nil {
+		t.Fatal("old snapshot resolves the newly added file; snapshots must be frozen")
+	}
+}
+
+// A failed load must leave the served snapshot untouched (all-or-nothing,
+// design §2.3) — this now covers AddProtoDir too, which previously could
+// leave a half-loaded registry.
+func TestFailedLoadLeavesRegistryUntouched(t *testing.T) {
+	reg := NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), testProtoDir); err != nil {
+		t.Fatal(err)
+	}
+	before := reg.Snapshot()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "broken.proto"), []byte("syntax = \"proto3\";\npackage broken;\nmessage M { this is not proto\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.AddProtoDir(context.Background(), dir); err == nil {
+		t.Fatal("AddProtoDir of a broken tree succeeded, want error")
+	}
+	if reg.Snapshot() != before {
+		t.Fatal("failed AddProtoDir swapped the snapshot; must be all-or-nothing")
+	}
+}
+
+// Descriptor identity is stable across registrations (design §2.3):
+// pre-existing FileDescriptor values are reused verbatim in each candidate.
+func TestDescriptorIdentityStableAcrossRegistration(t *testing.T) {
+	reg := NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), testProtoDir); err != nil {
+		t.Fatal(err)
+	}
+	d1, err := reg.FindDescriptorByName("shop.v1.OrderService")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.AddFile(healthpb.File_grpc_health_v1_health_proto); err != nil {
+		t.Fatal(err)
+	}
+	d2, err := reg.FindDescriptorByName("shop.v1.OrderService")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d1 != d2 {
+		t.Fatal("descriptor identity changed across an unrelated registration")
 	}
 }

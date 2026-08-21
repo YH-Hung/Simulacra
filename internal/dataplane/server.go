@@ -55,7 +55,7 @@ func New(reg *schema.Registry, store *stub.Store, calls *journal.Journal) (*Serv
 	// Reflection over the dynamic registry: v1 and v1alpha (grpcurl uses both).
 	opts := reflection.ServerOptions{
 		Services:           s,
-		DescriptorResolver: reg.Files(),
+		DescriptorResolver: reg,
 	}
 	v1reflectionpb.RegisterServerReflectionServer(s.grpc, reflection.NewServerV1(opts))
 	v1alphareflectionpb.RegisterServerReflectionServer(s.grpc, reflection.NewServer(opts))

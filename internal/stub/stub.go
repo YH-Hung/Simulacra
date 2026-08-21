@@ -106,7 +106,7 @@ type Compiler struct {
 }
 
 func NewCompiler(reg *schema.Registry) *Compiler {
-	return &Compiler{reg: reg, matcher: match.NewCompiler(reg.Files()), types: reg.Types()}
+	return &Compiler{reg: reg, matcher: match.NewCompiler(reg.Snapshot()), types: reg.Types()}
 }
 
 func Compile(reg *schema.Registry, s Stub, source string) (*Compiled, error) {

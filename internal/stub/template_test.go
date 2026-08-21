@@ -28,7 +28,7 @@ func templateFor(t *testing.T, fields map[string]any) (*Template, *schema.Regist
 	if err != nil {
 		t.Fatalf("LookupMethod: %v", err)
 	}
-	env, err := match.NewCompiler(reg.Files()).Env(method.Input(), match.Unary)
+	env, err := match.NewCompiler(reg.Snapshot()).Env(method.Input(), match.Unary)
 	if err != nil {
 		t.Fatalf("CEL Env: %v", err)
 	}
@@ -49,7 +49,7 @@ func templateParts(t *testing.T) (*schema.Registry, protoreflect.MethodDescripto
 	if err != nil {
 		t.Fatalf("LookupMethod: %v", err)
 	}
-	env, err := match.NewCompiler(reg.Files()).Env(method.Input(), match.Unary)
+	env, err := match.NewCompiler(reg.Snapshot()).Env(method.Input(), match.Unary)
 	if err != nil {
 		t.Fatalf("CEL Env: %v", err)
 	}
@@ -71,7 +71,7 @@ func conformanceMethodParts(t *testing.T, methodName string) (*schema.Registry, 
 	if err != nil {
 		t.Fatalf("LookupMethod: %v", err)
 	}
-	env, err := match.NewCompiler(reg.Files()).Env(method.Input(), match.Unary)
+	env, err := match.NewCompiler(reg.Snapshot()).Env(method.Input(), match.Unary)
 	if err != nil {
 		t.Fatalf("CEL Env: %v", err)
 	}
@@ -499,7 +499,7 @@ func TestTemplateRendersProto2ExtensionJSONName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	env, err := match.NewCompiler(reg.Files()).Env(method.Input(), match.Unary)
+	env, err := match.NewCompiler(reg.Snapshot()).Env(method.Input(), match.Unary)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -542,7 +542,7 @@ func TestTemplateDynamicProto2RequiredFieldLoadsAndRenders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	env, err := match.NewCompiler(reg.Files()).Env(method.Input(), match.Unary)
+	env, err := match.NewCompiler(reg.Snapshot()).Env(method.Input(), match.Unary)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -586,7 +586,7 @@ func TestTemplateDynamicProto2RequiredFieldStillValidatedAtRender(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	env, err := match.NewCompiler(reg.Files()).Env(method.Input(), match.Unary)
+	env, err := match.NewCompiler(reg.Snapshot()).Env(method.Input(), match.Unary)
 	if err != nil {
 		t.Fatal(err)
 	}
