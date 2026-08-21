@@ -2,12 +2,17 @@ package schema
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+
+	"github.com/yinghanhung/simulacra/internal/match"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -428,4 +433,151 @@ func TestRegisterSetRejectsEmptyAndNonSelfContainedSets(t *testing.T) {
 	} else if !strings.Contains(err.Error(), "self-contained") {
 		t.Fatalf("error %q should point at self-containment", err)
 	}
+}
+
+// buildSet compiles nothing: it hand-builds a minimal one-file set with a
+// unique package so disjoint registrations cannot conflict.
+func buildSet(t *testing.T, pkg string) *descriptorpb.FileDescriptorSet {
+	t.Helper()
+	return &descriptorpb.FileDescriptorSet{File: []*descriptorpb.FileDescriptorProto{{
+		Name:    proto.String(pkg + ".proto"),
+		Package: proto.String(pkg),
+		Syntax:  proto.String("proto3"),
+		MessageType: []*descriptorpb.DescriptorProto{{
+			Name: proto.String("Msg"),
+			Field: []*descriptorpb.FieldDescriptorProto{{
+				Name:   proto.String("id"),
+				Number: proto.Int32(1),
+				Type:   descriptorpb.FieldDescriptorProto_TYPE_STRING.Enum(),
+				Label:  descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+			}},
+		}},
+	}}}
+}
+
+// The lost-update check -race cannot make (design §2.2): two registrations
+// racing on the same base snapshot must both land; an atomic pointer alone
+// would silently drop one.
+func TestConcurrentDisjointRegistrationsBothLand(t *testing.T) {
+	for round := 0; round < 50; round++ {
+		reg := NewRegistry()
+		var wg sync.WaitGroup
+		errs := make([]error, 2)
+		for i := 0; i < 2; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				_, errs[i] = reg.RegisterSet(buildSet(t, fmt.Sprintf("race%da", i)))
+			}(i)
+		}
+		wg.Wait()
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("round %d writer %d: %v", round, i, err)
+			}
+		}
+		for i := 0; i < 2; i++ {
+			name := protoreflect.FullName(fmt.Sprintf("race%da.Msg", i))
+			if _, err := reg.FindDescriptorByName(name); err != nil {
+				t.Fatalf("round %d: %s missing after concurrent registration: %v", round, name, err)
+			}
+		}
+	}
+}
+
+// All three historical escape paths running against a mutating registry.
+// Run under -race: the copy-on-write snapshots must make every read safe.
+func TestReadsRaceRegistration(t *testing.T) {
+	reg := NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), testProtoDir); err != nil {
+		t.Fatal(err)
+	}
+	method, err := reg.LookupMethod("shop.v1.OrderService/GetOrder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	types := reg.Types()
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Writer: register a fresh disjoint set per iteration.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := reg.RegisterSet(buildSet(t, fmt.Sprintf("w%d", i))); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	}()
+
+	// Reader 1: resolver lookups (what grpc reflection does).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := reg.FindDescriptorByName("shop.v1.OrderService"); err != nil {
+				t.Error(err)
+				return
+			}
+			if _, err := reg.FindFileByPath(method.ParentFile().Path()); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	}()
+
+	// Reader 2: CEL compile + eval over a snapshot (what stub compilation does).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			compiler := match.NewCompiler(reg.Snapshot())
+			compiled, err := compiler.Compile(method.Input(), &match.Block{Expr: `message.order_id == "x"`}, match.Unary)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			msg := dynamicpb.NewMessage(method.Input())
+			compiled.Eval(match.Input{Message: msg})
+		}
+	}()
+
+	// Reader 3: dynamic type resolution (what templates and Any details do).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := types.FindMessageByName(method.Input().FullName()); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	}()
+
+	time.Sleep(500 * time.Millisecond)
+	close(stop)
+	wg.Wait()
 }
