@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
@@ -327,5 +328,104 @@ func TestDescriptorIdentityStableAcrossRegistration(t *testing.T) {
 	}
 	if d1 != d2 {
 		t.Fatal("descriptor identity changed across an unrelated registration")
+	}
+}
+
+func loadWKTImage(t *testing.T) *descriptorpb.FileDescriptorSet {
+	t.Helper()
+	data, err := os.ReadFile("testdata/wkt_image.binpb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	set := new(descriptorpb.FileDescriptorSet)
+	if err := proto.Unmarshal(data, set); err != nil {
+		t.Fatal(err)
+	}
+	return set
+}
+
+// The §2.6 risk test: a buf image carrying its own copies of the well-known
+// types must register as a no-op against a registry whose WKTs came from
+// protocompile. buf images also carry a per-file extension (field 8042) that
+// lands in unknown fields; equivalence must see through both.
+func TestRegisterSetIdempotentAcrossToolchains(t *testing.T) {
+	reg := NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), "testdata/wktset"); err != nil {
+		t.Fatal(err)
+	}
+	added, err := reg.RegisterSet(loadWKTImage(t))
+	if err != nil {
+		t.Fatalf("RegisterSet of an equivalent buf image: %v", err)
+	}
+	if len(added) != 0 {
+		t.Fatalf("added = %v, want none (every file already registered)", added)
+	}
+}
+
+func TestRegisterSetAddsAllFilesToEmptyRegistryThenNoops(t *testing.T) {
+	reg := NewRegistry()
+	set := loadWKTImage(t)
+	added, err := reg.RegisterSet(set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(added) != len(set.File) {
+		t.Fatalf("added %d files, want all %d", len(added), len(set.File))
+	}
+	if _, err := reg.LookupMethod("scratch.v1.ThingService/GetThing"); err != nil {
+		t.Fatalf("registered method not resolvable: %v", err)
+	}
+	again, err := reg.RegisterSet(set)
+	if err != nil {
+		t.Fatalf("re-registering the identical set: %v", err)
+	}
+	if len(again) != 0 {
+		t.Fatalf("second register added %v, want none", again)
+	}
+}
+
+// Same path, different content → error naming the file, registry untouched.
+func TestRegisterSetConflictRollsBack(t *testing.T) {
+	reg := NewRegistry()
+	set := loadWKTImage(t)
+	if _, err := reg.RegisterSet(set); err != nil {
+		t.Fatal(err)
+	}
+	before := reg.Snapshot()
+
+	conflicting := proto.Clone(set).(*descriptorpb.FileDescriptorSet)
+	for _, f := range conflicting.File {
+		if f.GetName() == "scratch.proto" {
+			f.MessageType[0].Field[0].Number = proto.Int32(99) // id: 1 → 99
+		}
+	}
+	_, err := reg.RegisterSet(conflicting)
+	if err == nil {
+		t.Fatal("conflicting set registered, want error")
+	}
+	if !strings.Contains(err.Error(), "scratch.proto") {
+		t.Fatalf("error %q does not name the conflicting file", err)
+	}
+	if reg.Snapshot() != before {
+		t.Fatal("failed RegisterSet swapped the snapshot; must be all-or-nothing")
+	}
+}
+
+func TestRegisterSetRejectsEmptyAndNonSelfContainedSets(t *testing.T) {
+	reg := NewRegistry()
+	if _, err := reg.RegisterSet(&descriptorpb.FileDescriptorSet{}); err == nil {
+		t.Fatal("empty set accepted, want error")
+	}
+	set := loadWKTImage(t)
+	partial := &descriptorpb.FileDescriptorSet{}
+	for _, f := range set.File {
+		if f.GetName() == "scratch.proto" { // imports absent → not self-contained
+			partial.File = append(partial.File, f)
+		}
+	}
+	if _, err := reg.RegisterSet(partial); err == nil {
+		t.Fatal("non-self-contained set accepted, want error")
+	} else if !strings.Contains(err.Error(), "self-contained") {
+		t.Fatalf("error %q should point at self-containment", err)
 	}
 }

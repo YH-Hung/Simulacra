@@ -302,3 +302,76 @@ func (r *Registry) Services() []protoreflect.ServiceDescriptor {
 	})
 	return out
 }
+
+// RegisterSet registers every file of a serialized-set image all-or-nothing:
+// on any error the served registry is untouched. The set must be
+// self-contained (every import present). Idempotent: a path already
+// registered with equivalent content is skipped; the same path with
+// different content fails, naming the file. Returns the paths newly added
+// (empty when every file was already present).
+func (r *Registry) RegisterSet(set *descriptorpb.FileDescriptorSet) ([]string, error) {
+	if len(set.GetFile()) == 0 {
+		return nil, errors.New("descriptor set contains no files")
+	}
+	incoming, err := protodesc.NewFiles(set)
+	if err != nil {
+		return nil, fmt.Errorf("loading descriptor set (descriptor sets must be self-contained; build with `buf build -o` or `protoc --include_imports`): %w", err)
+	}
+	var added []string
+	err = r.apply(func(candidate *protoregistry.Files) error {
+		var rangeErr error
+		incoming.RangeFiles(func(fd protoreflect.FileDescriptor) bool {
+			existing, findErr := candidate.FindFileByPath(fd.Path())
+			if findErr == nil {
+				if !descriptorsEquivalent(existing, fd) {
+					rangeErr = fmt.Errorf("file %q is already registered with different content", fd.Path())
+				}
+				return rangeErr == nil
+			}
+			// A file registered from the incoming set keeps descriptor-internal
+			// references to the incoming copies of its imports even when the
+			// candidate already indexed equivalent copies — safe precisely
+			// because equivalence was just verified, and lookups by name always
+			// resolve the candidate's copy. RangeFiles order is unspecified,
+			// which is fine: addNew registers imports before importers, and a
+			// path skipped at recursion time is still equivalence-checked when
+			// the outer range reaches its own visit.
+			rangeErr = addNew(candidate, fd, &added)
+			return rangeErr == nil
+		})
+		return rangeErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	return added, nil
+}
+
+// descriptorsEquivalent compares two copies of the same proto file for
+// semantic equality, seeing through representation-only differences.
+func descriptorsEquivalent(a, b protoreflect.FileDescriptor) bool {
+	return proto.Equal(
+		normalizeFileProto(protodesc.ToFileDescriptorProto(a)),
+		normalizeFileProto(protodesc.ToFileDescriptorProto(b)),
+	)
+}
+
+// normalizeFileProto strips the two representation-only differences observed
+// between toolchains (design §2.6, verified empirically): source code info,
+// and unknown fields — buf images carry a per-file extension (field 8042)
+// that plain FileDescriptorSet parsing keeps as unknown bytes. Descriptor
+// meaning may not be touched here: loosening equivalence further must never
+// mask a real conflict, which the admin contract requires to fail.
+func normalizeFileProto(fdp *descriptorpb.FileDescriptorProto) *descriptorpb.FileDescriptorProto {
+	clone := proto.Clone(fdp).(*descriptorpb.FileDescriptorProto)
+	clone.SourceCodeInfo = nil
+	wire, err := proto.MarshalOptions{Deterministic: true}.Marshal(clone)
+	if err != nil {
+		return clone
+	}
+	out := new(descriptorpb.FileDescriptorProto)
+	if err := (proto.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(wire, out); err != nil {
+		return clone
+	}
+	return out
+}
