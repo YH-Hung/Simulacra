@@ -5,8 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/yinghanhung/simulacra/internal/match"
 )
 
 // ParseDocument decodes exactly one stub mapping — the admin API's
@@ -103,4 +106,29 @@ func RenderSequence(docs []string) (string, error) {
 		return "", fmt.Errorf("rendering stub sequence: %w", err)
 	}
 	return string(out), nil
+}
+
+// ParseMatchDocument decodes a stub-grammar match block
+// (VerifyCalls.matcher_document) with the loader's strictness. Empty or
+// whitespace-only input returns a nil block — the match-all value the
+// contract requires ("empty matches any call to method"); match.Compile and
+// journal.Verify already treat nil as match-all.
+func ParseMatchDocument(data []byte) (*match.Block, error) {
+	if strings.TrimSpace(string(data)) == "" {
+		return nil, nil
+	}
+	node, err := decodeSingleDocument(data)
+	if err != nil {
+		return nil, err
+	}
+	if node.Kind != yaml.MappingNode {
+		return nil, errors.New("matcher document must be a mapping (metadata/message/expr)")
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	var b match.Block
+	if err := dec.Decode(&b); err != nil {
+		return nil, fmt.Errorf("parsing matcher document: %w", err)
+	}
+	return &b, nil
 }

@@ -323,3 +323,13 @@ func buildMessage(types *schema.Types, desc protoreflect.MessageDescriptor, fiel
 	}
 	return msg, nil
 }
+
+// CompileMatch compiles a bare match block against a method — the matcher
+// half of Compile, for VerifyCalls. A nil block compiles to match-all.
+func (c *Compiler) CompileMatch(method string, b *match.Block) (*match.Compiled, error) {
+	m, err := c.reg.LookupMethod(method)
+	if err != nil {
+		return nil, err
+	}
+	return c.matcher.Compile(m.Input(), b, match.ShapeOf(m))
+}

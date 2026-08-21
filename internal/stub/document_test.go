@@ -4,6 +4,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/yinghanhung/simulacra/internal/match"
 )
 
 func TestParseDocumentAcceptsYAMLMapping(t *testing.T) {
@@ -131,4 +133,54 @@ func TestRenderSequenceOfNothingIsEmptyList(t *testing.T) {
 func writeTestFile(t *testing.T, path, content string) error {
 	t.Helper()
 	return os.WriteFile(path, []byte(content), 0o644)
+}
+
+func TestParseMatchDocumentEmptyMeansMatchAll(t *testing.T) {
+	for _, in := range []string{"", "   ", "\n"} {
+		b, err := ParseMatchDocument([]byte(in))
+		if err != nil {
+			t.Fatalf("input %q: %v", in, err)
+		}
+		if b != nil {
+			t.Fatalf("input %q: block = %+v, want nil (match-all)", in, b)
+		}
+	}
+}
+
+func TestParseMatchDocumentDecodesStrictly(t *testing.T) {
+	b, err := ParseMatchDocument([]byte("message:\n  order_id: { eq: o-1 }\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b == nil || b.Message["order_id"]["eq"] != "o-1" {
+		t.Fatalf("block = %+v", b)
+	}
+	if _, err := ParseMatchDocument([]byte("bogus: 1\n")); err == nil {
+		t.Fatal("unknown matcher field accepted, want error")
+	}
+	if _, err := ParseMatchDocument([]byte("- message\n")); err == nil {
+		t.Fatal("sequence matcher accepted, want error")
+	}
+}
+
+func TestCompileMatchCompilesAgainstTheMethod(t *testing.T) {
+	reg := testRegistry(t)
+	c := NewCompiler(reg)
+	compiled, err := c.CompileMatch("shop.v1.OrderService/GetOrder", &match.Block{
+		Message: map[string]match.Rules{"order_id": {"eq": "o-1"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compiled == nil {
+		t.Fatal("nil compiled matcher")
+	}
+	if _, err := c.CompileMatch("no.Such/Method", nil); err == nil {
+		t.Fatal("unknown method accepted, want error")
+	}
+	if _, err := c.CompileMatch("shop.v1.OrderService/GetOrder", &match.Block{
+		Message: map[string]match.Rules{"no_such_field": {"eq": "x"}},
+	}); err == nil {
+		t.Fatal("bad field path accepted, want compile error")
+	}
 }
