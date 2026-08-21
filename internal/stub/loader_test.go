@@ -129,3 +129,53 @@ func TestLoadDirsRejectsInvalidYAML(t *testing.T) {
 		t.Fatal("expected a parse error")
 	}
 }
+
+// Every file-loaded stub carries a normalized document that re-parses to the
+// same stub — the file/API single-grammar guarantee (design §3.1).
+func TestLoadDirsStampsRoundTrippableDocuments(t *testing.T) {
+	reg := testRegistry(t)
+	dir := t.TempDir()
+	writeFile(t, dir, "s.yaml", `
+# file comment
+- method: shop.v1.OrderService/GetOrder
+  match:
+    message:
+      order_id: { eq: o-1 }
+  respond:
+    message: {}
+- method: shop.v1.OrderService/GetOrder
+  priority: 5
+  respond:
+    message:
+      order_id: o-2
+`)
+	stubs, errs := LoadDirs(reg, []string{dir})
+	if len(errs) != 0 {
+		t.Fatalf("errs = %v", errs)
+	}
+	if len(stubs) != 2 {
+		t.Fatalf("loaded %d stubs, want 2", len(stubs))
+	}
+	for i, c := range stubs {
+		if c.ID != c.Source || c.ID == "" {
+			t.Fatalf("stub %d: ID = %q, Source = %q; file stubs carry Source as ID", i, c.ID, c.Source)
+		}
+		if c.Document == "" {
+			t.Fatalf("stub %d: empty Document", i)
+		}
+		s, normalized, err := ParseDocument([]byte(c.Document))
+		if err != nil {
+			t.Fatalf("stub %d document does not re-parse: %v\n%s", i, err, c.Document)
+		}
+		if normalized != c.Document {
+			t.Fatalf("stub %d document is not a normalization fixed point", i)
+		}
+		re, err := Compile(reg, s, c.Source)
+		if err != nil {
+			t.Fatalf("stub %d document does not re-compile: %v", i, err)
+		}
+		if re.Method != c.Method || re.Priority != c.Priority || re.Times != c.Times || re.Shape != c.Shape {
+			t.Fatalf("stub %d round trip changed compiled fields: %+v vs %+v", i, re, c)
+		}
+	}
+}

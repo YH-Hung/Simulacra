@@ -76,6 +76,23 @@ type Rule struct {
 	Send    []Step
 }
 
+// Origin records who owns a stub: the hot-reload watcher (file) or an admin
+// API client (api). The store stamps it on ingest (design §3.4); compilers
+// leave it zero.
+type Origin uint8
+
+const (
+	OriginFile Origin = iota
+	OriginAPI
+)
+
+func (o Origin) String() string {
+	if o == OriginAPI {
+		return "api"
+	}
+	return "file"
+}
+
 // Compiled is a stub validated against the schema. Source identifies where it
 // came from ("path/to/file.yaml#index") for error messages.
 type Compiled struct {
@@ -84,6 +101,9 @@ type Compiled struct {
 	Priority int
 	Times    int
 	Source   string
+	ID       string // store-managed: file stubs carry Source, API stubs get "api-<n>"
+	Origin   Origin // store-managed: stamped on ingest
+	Document string // normalized single-stub YAML mapping (admin Stub.document)
 	matcher  *match.Compiled
 	plan     *Plan
 }
