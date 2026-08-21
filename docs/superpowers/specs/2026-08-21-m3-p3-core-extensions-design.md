@@ -410,9 +410,17 @@ already broadcasts under the write lock, and `Close` takes the same lock to unre
 Since eviction happens *inside* `Record` — which already holds `mu` — the close-and-unregister step
 is a locked-state helper both paths call, one from under the lock and one after taking it, rather
 than a public method calling itself recursively. A `sync.Once` still wraps the user-facing `Close`
-for idempotence, but the mutex is what carries the guarantee. One small goroutine per subscription
-maps `ctx.Done()` onto `Close`; §7 races both pairs — `Close` against writer-side eviction, and
-ctx cancellation against a normal broadcast.
+for idempotence, but the mutex is what carries the guarantee.
+
+**The context bridge must itself be closeable.** One small goroutine per subscription maps
+`ctx.Done()` onto `Close` — but a goroutine waiting on `ctx.Done()` alone outlives an explicit
+`Close` for as long as the context lives, which for a `context.Background()` caller (the natural
+choice for a CLI tail) is forever: a permanently leaked goroutine pinning the subscription. So the
+subscription carries an internal `done` channel that every close path closes — explicit `Close`,
+writer-side eviction, and the bridge itself — and the bridge selects on `ctx.Done()` *and* `done`.
+§7 races both hazard pairs — `Close` against writer-side eviction, ctx cancellation against a
+normal broadcast — and additionally asserts the bridge goroutine exits after an explicit `Close`
+under a still-live context.
 
 **Aliasing.** Subscribers receive the same retained `*Call` the ring holds. `Record` already clones
 once for retention and nothing mutates a `Call` afterwards (`Reset` nils slots; it does not touch
@@ -510,6 +518,8 @@ M3 design §12's core row, made specific, plus the tests this design's decisions
 - `-race` tests for both hazard pairs: consumer `Close` against writer-side eviction, and context
   cancellation against a concurrent broadcast (the send-versus-close race of §4).
 - Context cancellation closes the stream with a nil `Err`.
+- Explicit `Close` under a still-live context terminates the bridge goroutine (leak check via
+  goroutine count or a done-signal, not a sleep).
 - `Len` / `Cap`.
 
 **`internal/dataplane`**
