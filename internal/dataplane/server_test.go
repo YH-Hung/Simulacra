@@ -3,6 +3,7 @@ package dataplane
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -237,8 +238,8 @@ func TestUnaryMatchedCall(t *testing.T) {
 		t.Fatalf("journal calls = %d, want 1", len(recorded))
 	}
 	call := recorded[0]
-	if call.Method != "/shop.v1.OrderService/GetOrder" || call.StubSource == "" || call.StubID == "" {
-		t.Errorf("journal method/source/id = %q/%q/%q", call.Method, call.StubSource, call.StubID)
+	if call.Method != "/shop.v1.OrderService/GetOrder" || call.StubSource == "" || call.StubID != call.StubSource {
+		t.Errorf("journal method/source/id = %q/%q/%q (file stubs carry Source as ID)", call.Method, call.StubSource, call.StubID)
 	}
 	if got := call.Metadata.Get("x-tenant"); len(got) != 1 || got[0] != "acme" {
 		t.Errorf("journal metadata x-tenant = %v, want [acme]", got)
@@ -1147,6 +1148,13 @@ func TestRunStepsMapsTemplateFailureToInternal(t *testing.T) {
 func storeWith(t *testing.T, stubs []*stub.Compiled) *stub.Store {
 	t.Helper()
 	s := stub.NewStore()
+	// Mirror LoadDirs: file stubs reach the store carrying their source as
+	// their id. The store mints ids only for API stubs.
+	for i, c := range stubs {
+		if c.ID == "" {
+			c.ID = fmt.Sprintf("%s#%d", c.Source, i)
+		}
+	}
 	if _, err := s.ReplaceOrigin(stub.OriginFile, stubs); err != nil {
 		t.Fatal(err)
 	}
@@ -1198,5 +1206,66 @@ func TestReflectionSeesRuntimeRegisteredService(t *testing.T) {
 	}
 	if len(resp.GetFileDescriptorResponse().GetFileDescriptorProto()) == 0 {
 		t.Fatal("runtime-registered service is not reflectable")
+	}
+}
+
+// StubID must be recorded for every RPC shape, not just unary: each shape
+// has its own journal-writing path in the server, and design §7 asks for all
+// four. File-loaded stubs carry their source as their id, so the two agree.
+func TestStubIDRecordedForEveryShape(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		call func(t *testing.T, reg *schema.Registry, conn *grpc.ClientConn, ctx context.Context)
+	}{
+		{"unary", func(t *testing.T, reg *schema.Registry, conn *grpc.ClientConn, ctx context.Context) {
+			if _, err := invoke(t, reg, conn, metadata.AppendToOutgoingContext(ctx, "x-tenant", "acme"),
+				"/shop.v1.OrderService/GetOrder", `{"order_id":"o-123"}`); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"server-stream", func(t *testing.T, reg *schema.Registry, conn *grpc.ClientConn, ctx context.Context) {
+			stream, method := openStream(t, reg, conn, ctx, "/shop.v1.OrderService/WatchOrder")
+			sendJSON(t, stream, method.Input(), `{"order_id":"o-123"}`)
+			_ = stream.CloseSend()
+			for {
+				if err := stream.RecvMsg(dynamicpb.NewMessage(method.Output())); err != nil {
+					return
+				}
+			}
+		}},
+		{"client-stream", func(t *testing.T, reg *schema.Registry, conn *grpc.ClientConn, ctx context.Context) {
+			stream, method := openStream(t, reg, conn, ctx, "/shop.v1.OrderService/UploadOrders")
+			_ = stream.CloseSend()
+			_ = stream.RecvMsg(dynamicpb.NewMessage(method.Output()))
+		}},
+		{"bidi", func(t *testing.T, reg *schema.Registry, conn *grpc.ClientConn, ctx context.Context) {
+			stream, method := openStream(t, reg, conn, ctx, "/shop.v1.OrderService/Chat")
+			recvText(t, stream, method.Output())
+			_ = stream.CloseSend()
+			for {
+				if err := stream.RecvMsg(dynamicpb.NewMessage(method.Output())); err != nil {
+					return
+				}
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg, conn, calls := startServer(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			tc.call(t, reg, conn, ctx)
+
+			recorded := calls.List()
+			if len(recorded) != 1 {
+				t.Fatalf("journal calls = %d, want 1", len(recorded))
+			}
+			call := recorded[0]
+			if call.StubID == "" {
+				t.Fatalf("%s: StubID empty; the shape's journal path does not stamp it", tc.name)
+			}
+			if call.StubID != call.StubSource {
+				t.Fatalf("%s: StubID %q != StubSource %q", tc.name, call.StubID, call.StubSource)
+			}
+		})
 	}
 }

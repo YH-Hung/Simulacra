@@ -2,6 +2,7 @@ package stub
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync"
@@ -104,6 +105,7 @@ func TestReplaceAtomicallyResetsTimesBudget(t *testing.T) {
 		t.Fatalf("second Select = %v, want exhausted budget", got)
 	}
 
+	fresh.ID = "fresh#0"
 	if _, err := store.ReplaceOrigin(OriginFile, []*Compiled{fresh}); err != nil {
 		t.Fatal(err)
 	}
@@ -324,6 +326,13 @@ func TestSelectOrExplainSnapshotsRegisteredCount(t *testing.T) {
 func storeWith(t *testing.T, stubs ...*Compiled) *Store {
 	t.Helper()
 	s := NewStore()
+	// Mirror LoadDirs: file stubs reach the store carrying their source as
+	// their id. The store mints ids only for API stubs.
+	for i, c := range stubs {
+		if c.ID == "" {
+			c.ID = fmt.Sprintf("%s#%d", c.Source, i)
+		}
+	}
 	if _, err := s.ReplaceOrigin(OriginFile, stubs); err != nil {
 		t.Fatal(err)
 	}
@@ -515,5 +524,79 @@ func TestListReportsHits(t *testing.T) {
 	infos := s.List(ListFilter{})
 	if len(infos) != 1 || infos[0].Hits != 2 {
 		t.Fatalf("Hits = %+v, want 2", infos)
+	}
+}
+
+// A rejected batch must leave everything as it was — not just the method
+// index, but the id counter and the caller's own stub values. The original
+// implementation stamped Origin/ID/Source and advanced nextID as it walked
+// the batch, so a duplicate late in the slice had already mutated its
+// predecessors.
+func TestReplaceOriginRejectedBatchMutatesNothing(t *testing.T) {
+	reg := testRegistry(t)
+	good := plainStub(t, reg)
+	good.ID, good.Source = "keep#0", "keep#0"
+	s := storeWith(t, good)
+
+	first := plainStub(t, reg) // no id: would be assigned during a successful run
+	dupA := plainStub(t, reg)
+	dupA.ID, dupA.Source = "clash#0", "clash#0"
+	dupB := plainStub(t, reg)
+	dupB.ID, dupB.Source = "clash#0", "clash#0"
+
+	if _, err := s.ReplaceOrigin(OriginFile, []*Compiled{first, dupA, dupB}); err == nil {
+		t.Fatal("duplicate batch accepted, want error")
+	}
+	if first.ID != "" {
+		t.Errorf("rejected batch stamped an id on the input: ID = %q, want empty", first.ID)
+	}
+	if first.Origin != OriginFile {
+		t.Errorf("rejected batch stamped Origin = %v", first.Origin)
+	}
+	// The id counter must not have been consumed: the next successful API
+	// ingest should still get api-1.
+	if id := s.Add(plainStub(t, reg)); id != "api-1" {
+		t.Errorf("Add after a rejected batch = %q, want api-1 (counter consumed on failure)", id)
+	}
+}
+
+// A caller-supplied id may not squat the store's generated namespace, or a
+// later Add would mint the same id and make Remove ambiguous.
+func TestReplaceOriginRejectsReservedIDNamespace(t *testing.T) {
+	reg := testRegistry(t)
+	squatter := plainStub(t, reg)
+	squatter.ID, squatter.Source = "api-1", "api-1"
+	s := NewStore()
+	if _, err := s.ReplaceOrigin(OriginFile, []*Compiled{squatter}); err == nil {
+		t.Fatal("caller-supplied api-1 accepted; a later Add would collide with it")
+	} else if !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("error %q should explain the reserved namespace", err)
+	}
+
+	// A file legitimately named "api-1" is NOT in the namespace: its id
+	// carries the "#<index>" suffix.
+	fileNamedAPI := plainStub(t, reg)
+	fileNamedAPI.ID, fileNamedAPI.Source = "api-1#0", "api-1#0"
+	if _, err := s.ReplaceOrigin(OriginFile, []*Compiled{fileNamedAPI}); err != nil {
+		t.Fatalf("file id %q wrongly treated as reserved: %v", fileNamedAPI.ID, err)
+	}
+}
+
+// Every id in the store is unique, whoever minted it.
+func TestGeneratedIDsNeverCollideWithStoredOnes(t *testing.T) {
+	reg := testRegistry(t)
+	s := NewStore()
+	seen := map[string]bool{}
+	for i := 0; i < 5; i++ {
+		id := s.Add(plainStub(t, reg))
+		if seen[id] {
+			t.Fatalf("duplicate generated id %q", id)
+		}
+		seen[id] = true
+	}
+	for _, info := range s.List(ListFilter{}) {
+		if !seen[info.ID] {
+			t.Fatalf("stored id %q was never handed out", info.ID)
+		}
 	}
 }

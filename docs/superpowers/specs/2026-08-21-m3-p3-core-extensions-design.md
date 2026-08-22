@@ -181,7 +181,17 @@ requires no adapter.
   they are equivalent the file is skipped and omitted from `added`. If they differ, the whole
   registration fails with an error naming the file — surfaced as `INVALID_ARGUMENT` in Phase 4.
 - Comparison is between `protodesc.ToFileDescriptorProto(existing)` and the incoming
-  `FileDescriptorProto`, with `SourceCodeInfo` cleared on both sides, compared by `proto.Equal`.
+  `FileDescriptorProto`, with `SourceCodeInfo` cleared on both sides and buf's image extension
+  (field 8042) removed from the **top-level** unknown-field buffer only, compared by `proto.Equal`.
+
+  **The normalization must stay surgical.** The first implementation round-tripped the whole
+  message through `proto.UnmarshalOptions{DiscardUnknown: true}`, which is recursive: it also
+  discarded unknown fields *nested* inside option messages, where custom options live whenever
+  their extension is not linked into the binary. Two same-path files differing only in a custom
+  option then compared equal and were silently accepted — precisely the conflict this contract
+  exists to reject. Field 8042 is stripped by walking the raw unknown-field buffer and dropping
+  that one field number; every other unknown byte survives. A regression test registers two files
+  differing only in a custom option and requires the conflict.
 
 **Named risk — the idempotency comparison is this phase's most likely surprise.** A descriptor set
 produced by `buf build` carries its own copies of the well-known types. Those will meet a registry
@@ -223,7 +233,14 @@ current meaning:
 `"<path-as-given>#<index>"` for file stubs, `"api"` for API stubs.
 
 `Document` is the **normalized single-stub mapping** that `Stub.document` carries over the wire. It
-is produced by re-marshaling the decoded `Stub` at compile time, not by echoing the input bytes.
+is produced by re-rendering the input's own YAML node tree — comments and styling stripped, and
+**aliases expanded** — not by echoing the input bytes and not by re-marshaling the struct.
+
+Alias expansion is what makes a per-stub document stand alone. YAML lets one list item declare an
+anchor (`&oid`) and a sibling item alias it (`*oid`); the whole-file decode resolves that happily,
+but an item rendered in isolation would emit a bare `*oid` whose anchor lives in another document
+— unparseable on its own and broken in an export. Expansion is depth-bounded, so a self-
+referential anchor errors instead of expanding forever.
 Because decoding is strict (`KnownFields(true)`), re-marshaling can lose nothing but comments and
 key order — every field the grammar accepts is modeled on the struct, and every field it does not
 accept was already rejected. That property is what makes one normalized form safe for both
@@ -324,13 +341,25 @@ sets `Origin = OriginAPI`, `Source = "api"`, and a store-assigned ID on the stub
 `ReplaceOrigin` stamps its `origin` argument onto every stub it installs. `Compiled.ID` and
 `Compiled.Origin` are store-managed fields, documented as such.
 
-**One ID rule, enforced where IDs enter.** In `ReplaceOrigin`, an empty `ID` gets a store-assigned
-`"api-<n>"` (the `ReplaceAllStubs` path — fresh documents carry no IDs) and a non-empty `ID` is
-used as given and must be unique across the whole store, else an error naming the duplicates with
-the store untouched. `Add` always assigns, so it cannot conflict and returns only the ID. File
-stubs arrive with `ID = Source` (stamped by `LoadDirs`), which is why two `--stubs` roots
+**One ID rule, enforced where IDs enter.** `"api-<n>"` is a **reserved namespace only the store
+mints**. `Add` always assigns from it. `ReplaceOrigin` assigns from it only for `OriginAPI` (the
+`ReplaceAllStubs` path — fresh documents carry no IDs); a file-origin stub arriving without an ID
+is a loader bug and is rejected, since minting an `api-` ID for it would put a file stub in the
+API namespace. A caller-supplied ID must be unique across the whole store *and* outside the
+reserved namespace — otherwise a later `Add` would mint the same ID and make `Remove` ambiguous.
+The reserved check matches the exact generated form (`api-` followed by digits only), so a file
+literally named `api-1` is unaffected: its ID is `api-1#0`.
+
+File stubs arrive with `ID = Source` (stamped by `LoadDirs`), which is why two `--stubs` roots
 containing the same relative path yield distinct IDs — the walk path includes the root — and why
 the same root passed twice is caught as a duplicate.
+
+**`ReplaceOrigin` validates completely before it mutates anything.** IDs, origins, and the ID
+counter are computed into temporary state; only once the whole batch is known good does it stamp
+the input stubs and swap the index. Stamping while walking the batch — the first implementation —
+meant a duplicate late in the slice had already renamed its predecessors, consumed counter values,
+and (if an input pointer was live under another origin) re-stamped a stored stub's ownership,
+all while returning an error that promised the store was untouched.
 
 **Ownership is enforced in the store, not in the handler.** `Remove` refuses a file-origin stub
 with a typed error carrying the owning file, which Phase 4 maps to `FAILED_PRECONDITION` ("owned

@@ -13,6 +13,7 @@ import (
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 
 	"github.com/yinghanhung/simulacra/internal/match"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -580,4 +581,42 @@ func TestReadsRaceRegistration(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	close(stop)
 	wg.Wait()
+}
+
+// Normalization exists to see through one verified representation
+// difference — buf's image extension — and nothing else. A custom option
+// lands in unknown fields when its extension is not linked in, and two
+// same-path files differing only there are a REAL conflict the contract
+// requires us to reject.
+func TestRegisterSetConflictsOnCustomOptionDifference(t *testing.T) {
+	mk := func(optVal string) *descriptorpb.FileDescriptorSet {
+		opts := &descriptorpb.FileOptions{}
+		var raw []byte
+		raw = protowire.AppendTag(raw, 50000, protowire.BytesType)
+		raw = protowire.AppendString(raw, optVal)
+		opts.ProtoReflect().SetUnknown(raw)
+		return &descriptorpb.FileDescriptorSet{File: []*descriptorpb.FileDescriptorProto{{
+			Name:    proto.String("opt.proto"),
+			Package: proto.String("opt"),
+			Syntax:  proto.String("proto3"),
+			Options: opts,
+			MessageType: []*descriptorpb.DescriptorProto{{
+				Name: proto.String("M"),
+			}},
+		}}}
+	}
+	reg := NewRegistry()
+	if _, err := reg.RegisterSet(mk("ALPHA")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.RegisterSet(mk("ALPHA")); err != nil {
+		t.Fatalf("re-registering an identical file must be a no-op: %v", err)
+	}
+	_, err := reg.RegisterSet(mk("BETA"))
+	if err == nil {
+		t.Fatal("files differing in a custom option were accepted; normalization is too broad and hides real conflicts")
+	}
+	if !strings.Contains(err.Error(), "opt.proto") {
+		t.Fatalf("error %q does not name the conflicting file", err)
+	}
 }

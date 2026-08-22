@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -93,6 +94,29 @@ func NewStore() *Store {
 	return &Store{byMethod: make(map[string][]*entry)}
 }
 
+// idPrefix namespaces store-generated stub ids. Callers may not supply an id
+// in this namespace: generated ids come from a counter that has no view of
+// caller-supplied ids, so sharing the namespace would eventually mint a
+// duplicate and make Remove ambiguous.
+const idPrefix = "api-"
+
+// reservedID reports whether id is in the generated namespace: idPrefix
+// followed by digits and nothing else. File ids are "<path>#<index>", so a
+// file that happens to be named "api-1" yields "api-1#0" and is not
+// reserved — the check is on the exact generated form, not the prefix.
+func reservedID(id string) bool {
+	rest, ok := strings.CutPrefix(id, idPrefix)
+	if !ok || rest == "" {
+		return false
+	}
+	for _, r := range rest {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func originRank(o Origin) int {
 	if o == OriginAPI {
 		return 0
@@ -119,7 +143,7 @@ func (s *Store) Add(c *Compiled) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.nextID++
-	c.ID = fmt.Sprintf("api-%d", s.nextID)
+	c.ID = fmt.Sprintf("%s%d", idPrefix, s.nextID)
 	c.Origin = OriginAPI
 	c.Source = "api"
 	s.nextSeq++
@@ -163,6 +187,12 @@ func (s *Store) Remove(id string) error {
 func (s *Store) ReplaceOrigin(origin Origin, stubs []*Compiled) ([]string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Phase 1 — validate into temporary state. Nothing is mutated here: not
+	// the index, not the id counter, not the caller's stub values. Stamping
+	// as we walked the batch would leave a rejected call having already
+	// renamed its first few stubs and consumed ids, and would re-stamp the
+	// origin of any input pointer that happens to be live under another one.
 	taken := make(map[string]string)
 	for _, entries := range s.byMethod {
 		for _, e := range entries {
@@ -171,22 +201,40 @@ func (s *Store) ReplaceOrigin(origin Origin, stubs []*Compiled) ([]string, error
 			}
 		}
 	}
-	ids := make([]string, 0, len(stubs))
+	// Reserve every caller-supplied id before minting any, so a generated id
+	// cannot collide with an explicit one appearing later in the slice.
 	for _, c := range stubs {
-		c.Origin = origin
 		if c.ID == "" {
-			s.nextID++
-			c.ID = fmt.Sprintf("api-%d", s.nextID)
-			if origin == OriginAPI {
-				c.Source = "api"
-			}
+			continue
+		}
+		if reservedID(c.ID) {
+			return nil, fmt.Errorf("stub id %q uses the reserved %q namespace, which only the store may assign", c.ID, idPrefix)
 		}
 		if owner, dup := taken[c.ID]; dup {
 			return nil, fmt.Errorf("duplicate stub id %q (already used by %s)", c.ID, owner)
 		}
 		taken[c.ID] = c.Source
-		ids = append(ids, c.ID)
 	}
+	nextID := s.nextID
+	ids := make([]string, len(stubs))
+	for i, c := range stubs {
+		if c.ID != "" {
+			ids[i] = c.ID
+			continue
+		}
+		// Only API stubs are minted ids: they come from documents that carry
+		// none. A file stub without one is a loader bug — LoadDirs stamps
+		// ID = Source — and minting an "api-<n>" id for it would put a
+		// file-origin stub in the API namespace.
+		if origin != OriginAPI {
+			return nil, fmt.Errorf("file-origin stub from %q has no id; the loader must set it before ingest", c.Source)
+		}
+		nextID++
+		ids[i] = fmt.Sprintf("%s%d", idPrefix, nextID)
+		taken[ids[i]] = "api"
+	}
+
+	// Phase 2 — commit. Past this point nothing can fail.
 	byMethod := make(map[string][]*entry)
 	for m, entries := range s.byMethod {
 		for _, e := range entries {
@@ -195,7 +243,12 @@ func (s *Store) ReplaceOrigin(origin Origin, stubs []*Compiled) ([]string, error
 			}
 		}
 	}
-	for _, c := range stubs {
+	for i, c := range stubs {
+		c.Origin = origin
+		c.ID = ids[i]
+		if origin == OriginAPI {
+			c.Source = "api"
+		}
 		s.nextSeq++
 		byMethod[c.Method] = append(byMethod[c.Method], &entry{stub: c, seq: s.nextSeq})
 	}
@@ -203,6 +256,7 @@ func (s *Store) ReplaceOrigin(origin Origin, stubs []*Compiled) ([]string, error
 		sortEntries(byMethod[m])
 	}
 	s.byMethod = byMethod
+	s.nextID = nextID
 	return ids, nil
 }
 

@@ -292,6 +292,13 @@ func richRequest(t *testing.T, h *harness, desc protoreflect.MessageDescriptor, 
 func storeWith(t *testing.T, stubs []*stub.Compiled) *stub.Store {
 	t.Helper()
 	s := stub.NewStore()
+	// Mirror LoadDirs: file stubs reach the store carrying their source as
+	// their id. The store mints ids only for API stubs.
+	for i, c := range stubs {
+		if c.ID == "" {
+			c.ID = fmt.Sprintf("%s#%d", c.Source, i)
+		}
+	}
 	if _, err := s.ReplaceOrigin(stub.OriginFile, stubs); err != nil {
 		t.Fatal(err)
 	}

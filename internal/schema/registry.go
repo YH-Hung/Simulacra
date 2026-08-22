@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 
 	"github.com/bufbuild/protocompile"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -356,22 +357,53 @@ func descriptorsEquivalent(a, b protoreflect.FileDescriptor) bool {
 	)
 }
 
+// bufImageField is the per-file extension buf stamps onto each descriptor in
+// an image (buf.alpha.image.v1.ImageFileExtension). Parsing an image as a
+// plain FileDescriptorSet keeps it as unknown bytes on the file itself.
+const bufImageField = 8042
+
 // normalizeFileProto strips the two representation-only differences observed
 // between toolchains (design §2.6, verified empirically): source code info,
-// and unknown fields — buf images carry a per-file extension (field 8042)
-// that plain FileDescriptorSet parsing keeps as unknown bytes. Descriptor
-// meaning may not be touched here: loosening equivalence further must never
-// mask a real conflict, which the admin contract requires to fail.
+// and buf's image extension.
+//
+// It is deliberately surgical. An earlier version round-tripped the whole
+// message with proto.UnmarshalOptions{DiscardUnknown: true}, which also
+// discarded unknown fields *nested* inside option messages — where custom
+// options live whenever their extension is not linked into this binary. Two
+// same-path files differing only in a custom option then compared equal and
+// were silently accepted, which is exactly the conflict the admin contract
+// requires us to reject. Descriptor meaning may not be touched here:
+// loosening equivalence must never mask a real conflict.
 func normalizeFileProto(fdp *descriptorpb.FileDescriptorProto) *descriptorpb.FileDescriptorProto {
 	clone := proto.Clone(fdp).(*descriptorpb.FileDescriptorProto)
 	clone.SourceCodeInfo = nil
-	wire, err := proto.MarshalOptions{Deterministic: true}.Marshal(clone)
-	if err != nil {
-		return clone
+	if unknown := clone.ProtoReflect().GetUnknown(); len(unknown) > 0 {
+		clone.ProtoReflect().SetUnknown(dropUnknownField(unknown, bufImageField))
 	}
-	out := new(descriptorpb.FileDescriptorProto)
-	if err := (proto.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(wire, out); err != nil {
-		return clone
+	return clone
+}
+
+// dropUnknownField removes every occurrence of one field number from a raw
+// unknown-fields buffer, preserving every other unknown field byte-for-byte.
+// A malformed buffer is returned untouched: refusing to interpret it is
+// safer than truncating it into something that might compare equal.
+func dropUnknownField(raw protoreflect.RawFields, drop protowire.Number) protoreflect.RawFields {
+	var out protoreflect.RawFields
+	rest := raw
+	for len(rest) > 0 {
+		num, typ, tagLen := protowire.ConsumeTag(rest)
+		if tagLen < 0 {
+			return raw
+		}
+		valLen := protowire.ConsumeFieldValue(num, typ, rest[tagLen:])
+		if valLen < 0 {
+			return raw
+		}
+		total := tagLen + valLen
+		if num != drop {
+			out = append(out, rest[:total]...)
+		}
+		rest = rest[total:]
 	}
 	return out
 }

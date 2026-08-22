@@ -66,19 +66,64 @@ func decodeSingleDocument(data []byte) (*yaml.Node, error) {
 	return doc.Content[0], nil
 }
 
-// normalizeNode strips comments and input styling in place so rendering is
-// canonical block YAML regardless of how the input was written.
-func normalizeNode(n *yaml.Node) {
+// maxAliasDepth bounds alias expansion. YAML permits an anchor to reference
+// itself, which would otherwise expand forever.
+const maxAliasDepth = 64
+
+// normalizeNode strips comments, styling, and anchors, and expands aliases in
+// place, so rendering yields canonical, self-contained block YAML regardless
+// of how the input was written.
+//
+// Expanding aliases is what makes a per-stub document stand alone. A stub
+// file may declare an anchor in one list item and alias it from another —
+// the whole-file decode resolves that fine — but a single item rendered on
+// its own would emit a bare "*name" whose "&name" lives in a sibling
+// document, and would fail to parse or export. depth counts expansions, not
+// structural nesting.
+func normalizeNode(n *yaml.Node, depth int) error {
+	if n.Kind == yaml.AliasNode {
+		if depth >= maxAliasDepth {
+			return fmt.Errorf("YAML alias %q nests more than %d levels deep (recursive anchor?)", n.Value, maxAliasDepth)
+		}
+		if n.Alias == nil {
+			return fmt.Errorf("YAML alias %q has no anchor", n.Value)
+		}
+		resolved := cloneNode(n.Alias)
+		if err := normalizeNode(resolved, depth+1); err != nil {
+			return err
+		}
+		*n = *resolved
+		return nil
+	}
 	n.HeadComment, n.LineComment, n.FootComment = "", "", ""
 	n.Style = 0
+	n.Anchor = "" // every alias is expanded, so anchors are dead weight
 	for _, c := range n.Content {
-		normalizeNode(c)
+		if err := normalizeNode(c, depth); err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+// cloneNode deep-copies a node so expanding an alias cannot mutate the
+// anchor's own subtree (which other aliases may still reference).
+func cloneNode(n *yaml.Node) *yaml.Node {
+	clone := *n
+	if n.Content != nil {
+		clone.Content = make([]*yaml.Node, len(n.Content))
+		for i, child := range n.Content {
+			clone.Content[i] = cloneNode(child)
+		}
+	}
+	return &clone
 }
 
 // renderNode renders one mapping node as a normalized document.
 func renderNode(n *yaml.Node) (string, error) {
-	normalizeNode(n)
+	if err := normalizeNode(n, 0); err != nil {
+		return "", err
+	}
 	out, err := yaml.Marshal(n)
 	if err != nil {
 		return "", fmt.Errorf("rendering normalized document: %w", err)

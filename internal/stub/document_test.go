@@ -184,3 +184,71 @@ func TestCompileMatchCompilesAgainstTheMethod(t *testing.T) {
 		t.Fatal("bad field path accepted, want compile error")
 	}
 }
+
+// YAML lets one stub alias an anchor declared in a sibling stub. The
+// whole-file decode accepts it, so each per-stub document must be rendered
+// self-contained — a bare "*name" with its "&name" in another document
+// would not parse, and would export a broken file.
+func TestPerStubDocumentsExpandCrossStubAliases(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/aliased.yaml"
+	if err := writeTestFile(t, path, `
+- method: a.B/C
+  match:
+    message:
+      order_id: &oid { eq: "o-1" }
+  respond:
+    message: {}
+- method: a.B/D
+  match:
+    message:
+      order_id: *oid
+  respond:
+    message: {}
+`); err != nil {
+		t.Fatal(err)
+	}
+	stubs, docs, err := parseFile(path)
+	if err != nil {
+		t.Fatalf("parseFile: %v", err)
+	}
+	if len(stubs) != 2 || len(docs) != 2 {
+		t.Fatalf("got %d stubs / %d docs, want 2 / 2", len(stubs), len(docs))
+	}
+	for i, doc := range docs {
+		if strings.Contains(doc, "*oid") || strings.Contains(doc, "&oid") {
+			t.Errorf("doc %d still carries an anchor or alias:\n%s", i, doc)
+		}
+		s, normalized, err := ParseDocument([]byte(doc))
+		if err != nil {
+			t.Fatalf("doc %d does not re-parse standalone: %v\n%s", i, err, doc)
+		}
+		if normalized != doc {
+			t.Errorf("doc %d is not a normalization fixed point", i)
+		}
+		if got := s.Match.Message["order_id"]["eq"]; got != "o-1" {
+			t.Errorf("doc %d lost the aliased value: order_id.eq = %v", i, got)
+		}
+	}
+	// The assembled export must also round-trip.
+	out, err := RenderSequence(docs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exportPath := dir + "/export.yaml"
+	if err := writeTestFile(t, exportPath, out); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := parseFile(exportPath); err != nil {
+		t.Fatalf("exported alias-expanded file does not parse: %v", err)
+	}
+}
+
+func TestNormalizeRejectsRecursiveAnchor(t *testing.T) {
+	// A self-referential anchor must terminate with an error, not hang or
+	// blow the stack.
+	_, _, err := ParseDocument([]byte("method: &a\n  x: *a\n"))
+	if err == nil {
+		t.Fatal("recursive anchor accepted, want error")
+	}
+}
