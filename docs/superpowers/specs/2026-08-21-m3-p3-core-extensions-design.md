@@ -236,15 +236,24 @@ current meaning:
 is produced by re-rendering the input's own YAML node tree — comments and styling stripped, and
 **aliases expanded** — not by echoing the input bytes and not by re-marshaling the struct.
 
+**Why the node tree and not the struct.** Re-marshaling the decoded `Stub` would project the
+document through a type that cannot represent it faithfully: yaml.v3 renders a nil map as `{}`,
+and `omitempty` drops an empty one. `StepSpec` requires *exactly one* of `message`/`status`, so
+either direction corrupts a stream script — a status step would acquire `message: {}`, or an
+intentionally-empty `message: {}` step would lose it and fail to re-compile. Rendering the input's
+own tree sidesteps the round trip entirely: the document is the parsed input, restyled.
+
+What makes that document *complete* is the strict decode beside it. `KnownFields(true)` rejects
+any key the grammar does not model, so a document that decoded successfully contains only fields
+the stub grammar defines — nothing meaningful can sit in the rendered tree that the compiled stub
+did not also see. Fidelity from the node, completeness from strictness: together they are what
+makes one normalized form safe for both origins, asserted by a round-trip test (§7).
+
 Alias expansion is what makes a per-stub document stand alone. YAML lets one list item declare an
 anchor (`&oid`) and a sibling item alias it (`*oid`); the whole-file decode resolves that happily,
 but an item rendered in isolation would emit a bare `*oid` whose anchor lives in another document
 — unparseable on its own and broken in an export. Expansion is depth-bounded, so a self-
 referential anchor errors instead of expanding forever.
-Because decoding is strict (`KnownFields(true)`), re-marshaling can lose nothing but comments and
-key order — every field the grammar accepts is modeled on the struct, and every field it does not
-accept was already rejected. That property is what makes one normalized form safe for both
-origins, and it is asserted by a round-trip test (§7).
 
 ### 3.2 The shared decode boundary
 
@@ -253,9 +262,14 @@ struct through yaml.v3 with `KnownFields(true)`; they differ only in the outer s
 sequence, possibly across `---` documents; the API carries exactly one mapping).
 
 ```go
-func ParseDocument(data []byte) (Stub, error)          // exactly one stub mapping; YAML or JSON
+func ParseDocument(data []byte) (Stub, string, error)      // stub, normalized document
 func ParseMatchDocument(data []byte) (*match.Block, error) // VerifyCalls.matcher_document
 ```
+
+`ParseDocument` returns the normalized document alongside the decoded stub because both fall out
+of the same two passes, and the caller needs both: Phase 4's `CreateStub` compiles the stub and
+stores the document on `Compiled.Document` (§3.1). Rendering it separately would mean parsing the
+same bytes a third time.
 
 Both are implemented as **two passes over the same bytes**:
 
