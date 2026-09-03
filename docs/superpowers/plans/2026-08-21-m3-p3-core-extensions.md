@@ -90,7 +90,7 @@ Dependency order: Task 1 → 2 → 3 (registry); Task 4 → 5 (documents) and Ta
 - Produces: `Registry.Snapshot() *protoregistry.Files`; `Registry` implements `protodesc.Resolver` (`FindFileByPath(string) (protoreflect.FileDescriptor, error)`, `FindDescriptorByName(protoreflect.FullName) (protoreflect.Descriptor, error)`); unexported `(*Registry).apply(fn func(*protoregistry.Files) error) error` and `addNew(files *protoregistry.Files, fd protoreflect.FileDescriptor, added *[]string) error` (Task 2 reuses both). `Files()` no longer exists.
 - Consumes: nothing from other tasks.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `internal/schema/registry_test.go` (imports it will need: `google.golang.org/protobuf/reflect/protoreflect` if not present — check the existing import block and add only what is missing):
 
@@ -167,13 +167,13 @@ func TestDescriptorIdentityStableAcrossRegistration(t *testing.T) {
 
 Add these imports to the test file if absent: `os`, `path/filepath`, `healthpb "google.golang.org/grpc/health/grpc_health_v1"`. If `testdata/protos` does not define `shop.v1.OrderService`, check `server/server_test.go` (it uses `../testdata/protos` and calls `shop.v1.OrderService/GetOrder`) — the path from `internal/schema` is `../../testdata/protos`.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `go test ./internal/schema/ -run 'TestSnapshot|TestFailedLoad|TestDescriptorIdentity' -v`
 
 Expected: compile error — `reg.Snapshot undefined` (and `FindDescriptorByName` undefined on `*Registry`).
 
-- [ ] **Step 3: Rewrite the registry core**
+- [x] **Step 3: Rewrite the registry core**
 
 Replace the type definition, constructor, and every mutator in `internal/schema/registry.go`. The full new content of the changed region (package comment, `LookupMethod`, `LookupMessage`, `Services`, and the `Types` fallback methods keep their current bodies except where shown):
 
@@ -320,13 +320,13 @@ In each of the four `Types` methods, replace `t.dyn` with `t.reg.current().types
 
 New imports in `registry.go`: `sync`, `sync/atomic`. The `dynamicpb` import stays.
 
-- [ ] **Step 4: Run the schema package tests**
+- [x] **Step 4: Run the schema package tests**
 
 Run: `go test ./internal/schema/ -v`
 
 Expected: all PASS, including the three new tests and every pre-existing test (pre-verified fact 8: no in-package test touches `reg.files`).
 
-- [ ] **Step 5: Rename the cross-package `Files()` callers**
+- [x] **Step 5: Rename the cross-package `Files()` callers**
 
 Four mechanical edits (pre-verified fact 9):
 
@@ -335,7 +335,7 @@ Four mechanical edits (pre-verified fact 9):
 - `internal/match/match_test.go:296`: `return reg.Files()` → `return reg.Snapshot()`; lines 352 and 612: `NewCompiler(reg.Files())` → `NewCompiler(reg.Snapshot())`
 - `conformance/harness_test.go:239`: `match.NewCompiler(h.reg.Files())` → `match.NewCompiler(h.reg.Snapshot())`
 
-- [ ] **Step 6: Run the full suite**
+- [x] **Step 6: Run the full suite**
 
 Run: `go build ./... && go vet ./... && go test ./...`
 
@@ -349,7 +349,7 @@ Re-run: `go build ./... && go vet ./... && go test ./...`
 
 Expected: PASS across the board (including conformance).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add internal/schema/registry.go internal/schema/registry_test.go internal/stub/stub.go internal/stub/template_test.go internal/match/match_test.go conformance/harness_test.go internal/dataplane/server.go
@@ -367,7 +367,7 @@ git commit -m "feat(schema): copy-on-write registry with immutable snapshots"
 - Consumes: `apply` and `addNew` from Task 1 (exact signatures in Task 1's Produces).
 - Produces: `Registry.RegisterSet(set *descriptorpb.FileDescriptorSet) (added []string, err error)` — Phase 4's `SchemaService.RegisterSchemas` backend; `added` is `RegisterSchemasResponse.registered_files`.
 
-- [ ] **Step 1: Create the WKT fixture**
+- [x] **Step 1: Create the WKT fixture**
 
 ```bash
 mkdir -p internal/schema/testdata/wktset
@@ -400,7 +400,7 @@ bin/buf build internal/schema/testdata/wktset -o internal/schema/testdata/wkt_im
 
 (If `bin/buf` is missing, run `make tools` first — the Phase 2 Makefile installs the pinned toolchain.)
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 Append to `internal/schema/registry_test.go` (add imports `google.golang.org/protobuf/proto`, `google.golang.org/protobuf/types/descriptorpb`, `strings` as needed):
 
@@ -505,13 +505,13 @@ func TestRegisterSetRejectsEmptyAndNonSelfContainedSets(t *testing.T) {
 }
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [x] **Step 3: Run the tests to verify they fail**
 
 Run: `go test ./internal/schema/ -run TestRegisterSet -v`
 
 Expected: compile error — `reg.RegisterSet undefined`.
 
-- [ ] **Step 4: Implement RegisterSet**
+- [x] **Step 4: Implement RegisterSet**
 
 Append to `internal/schema/registry.go`:
 
@@ -586,13 +586,13 @@ One subtlety worth a comment where `addNew` is called from `RegisterSet`: a file
 
 Note on ordering: `RangeFiles` order is unspecified, and that is fine — `addNew` registers imports before importers recursively, and a file whose path the candidate already holds is skipped at recursion time but still equivalence-checked when the outer range reaches its own visit.
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `go test ./internal/schema/ -v`
 
 Expected: all PASS. The idempotency test is the design's named risk — if `TestRegisterSetIdempotentAcrossToolchains` fails here, diff the two `normalizeFileProto` outputs with `prototext` and extend the normalization for the specific field found (never by skipping conflicting files — design §2.6).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add internal/schema/registry.go internal/schema/registry_test.go internal/schema/testdata
@@ -608,7 +608,7 @@ git commit -m "feat(schema): RegisterSet with toolchain-normalized idempotency"
 - Consumes: `RegisterSet` (Task 2), `Snapshot`/resolver methods (Task 1), plus the existing `stub.Compile` / CEL path via `internal/stub` — **no**: `internal/schema` cannot import `internal/stub` (import cycle: stub → schema). The CEL escape path is exercised with `match.NewCompiler` directly (match imports nothing from schema).
 - Produces: nothing; pure tests.
 
-- [ ] **Step 1: Write the concurrent-writers union test**
+- [x] **Step 1: Write the concurrent-writers union test**
 
 Append to `internal/schema/registry_test.go`:
 
@@ -666,7 +666,7 @@ func TestConcurrentDisjointRegistrationsBothLand(t *testing.T) {
 
 Add imports as needed: `fmt`, `sync`.
 
-- [ ] **Step 2: Write the escape-path race test**
+- [x] **Step 2: Write the escape-path race test**
 
 The three references that escaped the old registry (design §7): reflection-style resolver lookups, CEL compile+eval, dynamic `Any`/type resolution. Append:
 
@@ -771,13 +771,13 @@ func TestReadsRaceRegistration(t *testing.T) {
 
 Add imports: `time`, `github.com/yinghanhung/simulacra/internal/match`, `google.golang.org/protobuf/types/dynamicpb`. (`match` imports `protoregistry` but not `schema`, so no cycle.)
 
-- [ ] **Step 3: Run under race**
+- [x] **Step 3: Run under race**
 
 Run: `go test ./internal/schema/ -race -run 'TestConcurrent|TestReadsRace' -v`
 
 Expected: PASS with no race reports. Then the full package: `go test ./internal/schema/ -race` — PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add internal/schema/registry_test.go
@@ -798,7 +798,7 @@ git commit -m "test(schema): concurrency suite for the copy-on-write registry"
 
 **Design deviation, recorded:** the design (§3.2) wrote `ParseDocument(data []byte) (Stub, error)` and (§3.1) "re-marshaling the decoded Stub". Pre-verified fact 4 rules out struct re-marshaling (nil-vs-empty maps break the step grammar both ways), so the document is rendered from the input's node tree and `ParseDocument` returns it — same intent, one extra return value.
 
-- [ ] **Step 1: Add the Origin type and Compiled fields**
+- [x] **Step 1: Add the Origin type and Compiled fields**
 
 In `internal/stub/stub.go`, above the `Compiled` type:
 
@@ -838,7 +838,7 @@ type Compiled struct {
 }
 ```
 
-- [ ] **Step 2: Write the failing document tests**
+- [x] **Step 2: Write the failing document tests**
 
 Create `internal/stub/document_test.go`:
 
@@ -984,13 +984,13 @@ func writeTestFile(t *testing.T, path, content string) error {
 
 (import `os`). Note the expected indentation in golden strings is yaml.v3's default four spaces.
 
-- [ ] **Step 3: Run to verify failure**
+- [x] **Step 3: Run to verify failure**
 
 Run: `go test ./internal/stub/ -run 'TestParseDocument|TestRenderSequence' -v`
 
 Expected: compile error — `ParseDocument` undefined.
 
-- [ ] **Step 4: Implement document.go**
+- [x] **Step 4: Implement document.go**
 
 Create `internal/stub/document.go`:
 
@@ -1103,7 +1103,7 @@ func RenderSequence(docs []string) (string, error) {
 }
 ```
 
-- [ ] **Step 5: Rework parseFile to harvest per-stub documents**
+- [x] **Step 5: Rework parseFile to harvest per-stub documents**
 
 In `internal/stub/loader.go`, change `parseFile` to return the normalized document beside each stub. The struct decode is untouched (it keeps whole-file error positions); a second pass over the same bytes walks the node tree:
 
@@ -1199,7 +1199,7 @@ In `LoadDirs`, the per-file loop changes to stamp `ID` and `Document`:
 
 (`Origin` is stamped by the store on ingest — design §3.4 — not here.)
 
-- [ ] **Step 6: Add the loader round-trip test**
+- [x] **Step 6: Add the loader round-trip test**
 
 Append to `internal/stub/loader_test.go` (reuse its existing registry/compile helpers — read the file first and follow its pattern for building a registry; it already loads `testdata` protos for compile tests):
 
@@ -1257,13 +1257,13 @@ func TestLoadDirsStampsRoundTrippableDocuments(t *testing.T) {
 
 If `loader_test.go` lacks a `writeStubFile`-style helper, add one (`os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644)` with `t.Helper()` and a fatal on error). Match the existing registry-helper name — do not invent `testRegistry` if the file calls it something else.
 
-- [ ] **Step 7: Run the package**
+- [x] **Step 7: Run the package**
 
 Run: `go test ./internal/stub/ -v`
 
 Expected: all PASS — the new document tests, the loader round trip, and every pre-existing loader/compiler test (parseFile's struct decode is unchanged).
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add internal/stub/stub.go internal/stub/document.go internal/stub/document_test.go internal/stub/loader.go internal/stub/loader_test.go
@@ -1280,7 +1280,7 @@ git commit -m "feat(stub): origins, IDs, and normalized per-stub documents"
 - Consumes: `decodeSingleDocument` (Task 4).
 - Produces: `ParseMatchDocument(data []byte) (*match.Block, error)` — nil block for empty input; `(*Compiler).CompileMatch(method string, b *match.Block) (*match.Compiled, error)`. Phase 4's `VerifyCalls` is `ParseMatchDocument` → `CompileMatch` → `journal.Verify`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `internal/stub/document_test.go`:
 
@@ -1314,13 +1314,13 @@ func TestParseMatchDocumentDecodesStrictly(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `go test ./internal/stub/ -run TestParseMatchDocument -v`
 
 Expected: compile error — `ParseMatchDocument` undefined.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Append to `internal/stub/document.go` (add import `strings` and `github.com/yinghanhung/simulacra/internal/match`):
 
@@ -1365,7 +1365,7 @@ func (c *Compiler) CompileMatch(method string, b *match.Block) (*match.Compiled,
 }
 ```
 
-- [ ] **Step 4: Add a CompileMatch test**
+- [x] **Step 4: Add a CompileMatch test**
 
 Append to `internal/stub/document_test.go` (reuse the registry helper found in Step 6 of Task 4):
 
@@ -1395,7 +1395,7 @@ func TestCompileMatchCompilesAgainstTheMethod(t *testing.T) {
 
 (import `github.com/yinghanhung/simulacra/internal/match` in the test file.)
 
-- [ ] **Step 5: Run and commit**
+- [x] **Step 5: Run and commit**
 
 Run: `go test ./internal/stub/ -v` — expected: all PASS.
 
@@ -1416,7 +1416,7 @@ git commit -m "feat(stub): strict matcher documents and CompileMatch for VerifyC
 - Consumes: `Origin`, `OriginFile`, `OriginAPI`, `Compiled.ID/Origin/Document` (Task 4).
 - Produces: `NewStore() *Store`; `(*Store).Add(c *Compiled) string`; `(*Store).Remove(id string) error` with `var ErrStubNotFound` and `type FileOwnedError struct{ ID, Source string }`; `(*Store).ReplaceOrigin(origin Origin, stubs []*Compiled) ([]string, error)`; `(*Store).List(f ListFilter) []Info` with `type Info` (`ID, Method string; Shape match.Shape; Priority, Times int; Origin Origin; Source string; Hits int; Document string`) and `type ListFilter struct{ Method string; Origin *Origin }`; `(*Store).ResetStubs()`. `Replace` and the stub-taking `NewStore` no longer exist.
 
-- [ ] **Step 1: Write the failing store tests**
+- [x] **Step 1: Write the failing store tests**
 
 Append to `internal/stub/store_test.go`. First a helper beside the file's existing stub-construction helpers (read them and reuse; they build `*Compiled` values with distinct `Source` strings — if any two share a `Source`, give them distinct ones, since `Source` is now the file-stub ID):
 
@@ -1613,13 +1613,13 @@ func TestListReportsHits(t *testing.T) {
 
 Also update the two existing `store.Replace(...)` tests: `TestReplaceAtomicallyResetsTimesBudget` becomes a `ReplaceOrigin(OriginFile, ...)` call asserting the same budget-reset behavior for the replaced origin, and `TestLenCountsEveryMethodAndFollowsReplace` swaps `NewStore(...)`/`Replace(...)` for `storeWith(...)`/`ReplaceOrigin(OriginFile, ...)` — same assertions. Every other `NewStore([]*Compiled{...})` in the file becomes `storeWith(t, ...)`.
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `go test ./internal/stub/ -run 'TestAdd|TestAPIBeats|TestRemove|TestReplaceOrigin|TestResetStubs|TestList' -v`
 
 Expected: compile errors — `NewStore()` arity, `Add`/`Remove`/`ReplaceOrigin`/`List`/`ResetStubs` undefined.
 
-- [ ] **Step 3: Rewrite store.go**
+- [x] **Step 3: Rewrite store.go**
 
 Replace `Store`, `entry`, `NewStore`, `buildIndex`, and `Replace` in `internal/stub/store.go` with:
 
@@ -1859,7 +1859,7 @@ func (s *Store) ResetStubs() {
 
 Delete `buildIndex` and `Replace`. Add import `errors`. Everything listed as "keep verbatim" in the Files block stays byte-identical.
 
-- [ ] **Step 4: Wire server/ onto the new surface**
+- [x] **Step 4: Wire server/ onto the new surface**
 
 `server/server.go:102` — replace
 
@@ -1896,20 +1896,20 @@ with
 
 (the store is untouched on error — same contract the load-error path above it already provides).
 
-- [ ] **Step 5: Mechanically update the remaining test callers**
+- [x] **Step 5: Mechanically update the remaining test callers**
 
 - `internal/stub/store_test.go`: done in Step 1.
 - `internal/dataplane/server_test.go`: the 4 `stub.NewStore(stubs)`-style sites become a local helper identical to `storeWith` but on the `stub.` package (name it `storeWith` too); line 508's `store.Replace(stubs[:1])` becomes `if _, err := store.ReplaceOrigin(stub.OriginFile, stubs[:1]); err != nil { t.Fatal(err) }`. **Caution:** the compiled stubs in that test share sources? If `ReplaceOrigin` reports duplicate ids in any dataplane test, the fixture stubs need distinct `Source` strings — set them where the stubs are compiled, mirroring what `LoadDirs` produces (`"<file>#<index>"`).
 - `server/watcher_test.go`: the 4 `stub.NewStore(initial)` sites become the same helper.
 - `conformance/harness_test.go:106`: same replacement.
 
-- [ ] **Step 6: Run the full suite**
+- [x] **Step 6: Run the full suite**
 
 Run: `go build ./... && go vet ./... && go test ./...`
 
 Expected: PASS everywhere. Pay attention to conformance — it compiles stubs with per-scenario sources; distinct by construction, but this run is the proof.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add internal/stub/store.go internal/stub/store_test.go server/server.go server/watcher.go server/watcher_test.go internal/dataplane/server_test.go conformance/harness_test.go
@@ -1928,7 +1928,7 @@ git commit -m "feat(stub): store-owned origins, ids, and per-origin replacement"
 - Consumes: `Compiled.ID` (Task 4).
 - Produces: `Call.StubID string`; `(*Journal).Watch(ctx context.Context, method string) *Subscription`; `(*Subscription).Calls() <-chan *Call`, `Close()`, `Err() error`; `var ErrSlowConsumer`; `(*Journal).Len() int`, `(*Journal).Cap() int`. Phase 4 maps `Err() == ErrSlowConsumer` → `RESOURCE_EXHAUSTED`, nil → clean end.
 
-- [ ] **Step 1: Write the failing watch tests**
+- [x] **Step 1: Write the failing watch tests**
 
 Create `internal/journal/watch_test.go`:
 
@@ -2128,13 +2128,13 @@ func TestLenAndCap(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `go test ./internal/journal/ -run 'TestWatch|TestSlow|TestClose|TestContext|TestCancel|TestLenAndCap' -v`
 
 Expected: compile error — `j.Watch` undefined.
 
-- [ ] **Step 3: Implement watch.go and the journal edits**
+- [x] **Step 3: Implement watch.go and the journal edits**
 
 Create `internal/journal/watch.go`:
 
@@ -2266,13 +2266,13 @@ func (j *Journal) Len() int {
 func (j *Journal) Cap() int { return j.cap }
 ```
 
-- [ ] **Step 4: Run the journal package under race**
+- [x] **Step 4: Run the journal package under race**
 
 Run: `go test ./internal/journal/ -race -v`
 
 Expected: all PASS, no race reports, including the two dedicated race-pair tests.
 
-- [ ] **Step 5: Stamp StubID in the dataplane**
+- [x] **Step 5: Stamp StubID in the dataplane**
 
 In `internal/dataplane/server.go`, at each of the four sites that set `call.StubSource = selected.Source` (lines ~138, ~201, ~219, ~237), add beside it:
 
@@ -2282,7 +2282,7 @@ In `internal/dataplane/server.go`, at each of the four sites that set `call.Stub
 
 In `internal/dataplane/server_test.go`, find the existing unary-call test that asserts the journal entry (`StubSource`) and extend the assertion: after Task 6's `storeWith` construction, file-origin stubs carry `ID == Source`, so assert `entry.StubID == entry.StubSource` and non-empty. If no existing test asserts `StubSource`, add the check to the journal assertions of the main unary stub test.
 
-- [ ] **Step 6: Run the full suite and commit**
+- [x] **Step 6: Run the full suite and commit**
 
 Run: `go build ./... && go vet ./... && go test ./...` — expected: PASS.
 
@@ -2301,7 +2301,7 @@ git commit -m "feat(journal): watch subscriptions with slow-consumer eviction an
 - Consumes: `RegisterSet` (Task 2), the live `DescriptorResolver: reg` wiring (landed in Task 1 Step 6), `NewStore()`/`ReplaceOrigin` startup path (Task 6).
 - Produces: nothing; closing tests and the phase-complete gate.
 
-- [ ] **Step 1: Write the runtime-reflectability test**
+- [x] **Step 1: Write the runtime-reflectability test**
 
 Append to `internal/dataplane/server_test.go`, modeled on the existing `TestReflectionListsAndResolvesServices` (same stream client; the helper `startServer` returns the registry):
 
@@ -2357,7 +2357,7 @@ func TestReflectionSeesRuntimeRegisteredService(t *testing.T) {
 
 Add imports as needed: `proto "google.golang.org/protobuf/proto"`, `google.golang.org/protobuf/types/descriptorpb`.
 
-- [ ] **Step 2: Write the duplicate-root startup test**
+- [x] **Step 2: Write the duplicate-root startup test**
 
 Append to `server/server_test.go` (same option pattern as `TestStartServesStubbedUnaryCall`):
 
@@ -2391,13 +2391,13 @@ func TestStartRejectsDuplicateStubRoots(t *testing.T) {
 
 (import `strings` if absent.)
 
-- [ ] **Step 3: Run both new tests**
+- [x] **Step 3: Run both new tests**
 
 Run: `go test ./internal/dataplane/ -run TestReflectionSeesRuntime -v && go test ./server/ -run TestStartRejectsDuplicate -v`
 
 Expected: both PASS (the wiring already landed in Tasks 1 and 6; these are the closing proofs). If `TestStartRejectsDuplicateStubRoots` fails because the same root twice yields the same walk paths and therefore the same IDs *within one origin batch* — that is exactly what `ReplaceOrigin`'s `taken` map must catch for stubs inside the batch; if it only checks against other origins, fix `ReplaceOrigin` (the Task 6 code seeds `taken` with other origins and then adds each new id as it validates, so in-batch duplicates are caught — verify against that code).
 
-- [ ] **Step 4: Full phase gates**
+- [x] **Step 4: Full phase gates**
 
 Run, in order:
 
@@ -2410,7 +2410,7 @@ go test ./conformance/ -count=1
 
 Expected: every command passes. The race leg covers all packages this phase touched.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/dataplane/server_test.go server/server_test.go
@@ -2439,3 +2439,54 @@ Phase 3 is complete when: the registry mutates copy-on-write with `RegisterSet` 
 **Placeholder scan:** no TBD/TODO. Two deliberate soft references exist — store-test helper names (`compiledForTest`, `matchingInput`, `testRegistry`) are placeholders *by instruction*: the steps direct the implementer to read the file and use its real helpers, because inventing exact names for helpers this plan does not rewrite would be the drift the No-Placeholders rule exists to prevent. Every new symbol this plan itself introduces is fully specified.
 
 **Type consistency:** `ParseDocument (Stub, string, error)` matches its uses in Tasks 4 (loader round trip) and the Interfaces blocks; `ReplaceOrigin ([]string, error)` consistent across Tasks 6 and 8; `Subscription.Err()`/`ErrSlowConsumer` consistent across Task 7 and the design's Phase 4 mapping; `RegisterSet ([]string, error)` consistent across Tasks 2, 3, 8. `storeWith` appears in Tasks 6 and 7 with the same shape. Registry helpers `apply`/`addNew` defined in Task 1, consumed in Task 2 with matching signatures.
+
+---
+
+## Execution record
+
+Executed 2026-08-22 on branch `feat/m3-p3-core-extensions`, merged to `main` at `e382907`.
+All four phase gates passed at merge: `go build`/`go vet`, `go test ./...`, `-race` across the five
+touched packages, and `go test ./conformance/ -count=1`.
+
+| Task | Commit |
+|---|---|
+| 1. Copy-on-write registry core | `c8ff6db` |
+| 2. RegisterSet with normalized idempotency | `6f45ccd` |
+| 3. Registry concurrency suite | `4d54e09` |
+| 4. Stub origins, documents, decode boundary | `a6b0ceb` |
+| 5. ParseMatchDocument and CompileMatch | `6540740` |
+| 6. Store rework and wiring | `47fbed7` |
+| 7. Journal watch, StubID, counts | `af7e05f` |
+| 8. Runtime reflection and startup validation | `5cd00dc` |
+
+### Where the implementation diverges from the steps above
+
+Read these before treating a step's code block as current:
+
+1. **`ParseDocument` returns three values** (`Stub, string, error`) — flagged in Task 4's "Design
+   deviation, recorded" note and carried through. The design doc was corrected to match in
+   `07cbf06`.
+2. **Task 7 Step 5's `StubID == StubSource` assertion was initially weakened** to "both non-empty"
+   on the mistaken belief that the dataplane fixtures carry store-minted ids. They load through
+   `LoadDirs`, which stamps `ID = Source`, so the step as written was right; restored in `4d0d9c5`,
+   which also added `StubID` coverage for all four RPC shapes.
+3. **The `storeWith` test helpers stamp `ID = Source` before ingest**, mirroring `LoadDirs`. Task 6
+   Step 5 did not anticipate this; it became necessary once the store stopped minting `api-<n>`
+   ids for file-origin stubs (see 4 below).
+
+### Hardening applied after the plan, from review and verification
+
+These changed behavior the steps above specify, and the design doc (§2.6, §3.1, §3.4, §4) is the
+current source of truth for them:
+
+4. `c4c0a5d` — `Subscription.Err()` reads under the journal lock instead of relying on a
+   happens-before contract. Found by `-race -count=1`; the plan's gate had been satisfied by a
+   cached result.
+5. `4d0d9c5` — three correctness gaps: descriptor normalization narrowed to buf's field 8042 only
+   (recursive `DiscardUnknown` was hiding real custom-option conflicts); `ReplaceOrigin` split into
+   validate-then-commit so a rejected batch mutates nothing; the `api-<n>` id namespace reserved,
+   with generated ids limited to API-origin stubs; per-stub documents expand YAML aliases so a stub
+   referencing a sibling's anchor still renders standalone.
+6. `5f1ff87` — the stub watcher re-attaches a root that is replaced atomically. Pre-existing bug
+   surfaced by this phase's stress runs: `RENAME`/`CREATE` arriving in either order within one
+   fsnotify rescan could leave a root unwatched permanently, silently killing hot reload.
