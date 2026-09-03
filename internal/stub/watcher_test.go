@@ -384,3 +384,45 @@ func waitForWorkerStop(t *testing.T, stopped <-chan struct{}) {
 		t.Fatal("callback worker did not stop")
 	}
 }
+
+// An atomic root replacement (rename the directory away, recreate it) emits
+// both a Rename and a Create for the root, and fsnotify does not guarantee
+// their relative order — both land in one rescan batch. When the Create is
+// delivered first, its reconcile runs while the stale watch is still
+// registered and therefore does nothing, and the Rename that follows drops
+// the watch. Without a follow-up reconcile the root stays unwatched for the
+// life of the process: hot reload silently stops, with no error reported.
+func TestWatchReattachesRootWhenCreateArrivesBeforeRename(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "stubs")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	backend := newFakeWatchBackend()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ready := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- watchWithBackend(ctx, []string{root}, WatchOptions{
+			Debounce: 10 * time.Millisecond,
+			OnChange: func(context.Context) {},
+			Ready:    func() { close(ready) },
+		}, backend)
+	}()
+	<-ready
+	initial := backend.addCount(root)
+
+	backend.events <- fsnotify.Event{Name: root, Op: fsnotify.Create}
+	backend.events <- fsnotify.Event{Name: root, Op: fsnotify.Rename}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for backend.addCount(root) <= initial {
+		if time.Now().After(deadline) {
+			t.Fatalf("root never re-watched after an atomic replacement (Add calls still %d); hot reload is dead for this root", backend.addCount(root))
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	cancel()
+	waitForWatchReturn(t, done)
+}

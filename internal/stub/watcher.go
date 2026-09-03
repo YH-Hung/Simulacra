@@ -144,6 +144,17 @@ func watchWithBackendHooks(ctx context.Context, dirs []string, opts WatchOptions
 			}
 			if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
 				state.forgetTree(event.Name)
+				// Schedule a reconcile: the path may already have been
+				// replaced. An atomic swap (rename the directory away, then
+				// recreate it) emits a Rename and a Create in one rescan
+				// batch, and their relative order is not guaranteed. If the
+				// Create was processed first, its reconcile ran while the
+				// stale watch was still registered and did nothing — and the
+				// forget above has just dropped that watch. Reconciling after
+				// the debounce re-attaches either way; without it the root
+				// stays unwatched for the life of the process and hot reload
+				// silently stops.
+				resetRetry()
 			}
 			if event.Op&fsnotify.Create != 0 && state.reconcile(false) {
 				resetRetry()
