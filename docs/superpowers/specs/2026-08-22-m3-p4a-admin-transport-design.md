@@ -145,6 +145,15 @@ closes nor waits for hijacked connections. Measured against a real prior-knowled
 | with `http2.ConfigureServer(srv, h2s)` added | client had to re-dial — connection was terminated |
 | `Shutdown` with a long-lived streaming request open | still returned in **0s**; connection stayed open |
 | tracked-listener force-close after a bound | connection closed, `Serve` returned |
+| `Shutdown` with an in-flight **HTTP/1.1** request | **blocked** — still blocked after 500ms |
+| same, with its context canceled | returned in **0s**, `err=context canceled` (request itself not terminated) |
+
+**`Shutdown` is asymmetric, and both halves bite.** For hijacked h2c connections it returns
+instantly and waits for nothing. For plain HTTP/1.1 — the Connect protocol path the CLI and Go SDK
+use — it blocks until the request finishes, exactly as documented. So it can neither be trusted as
+a barrier nor treated as non-blocking: a teardown that simply calls it can hang there
+indefinitely, never reaching the code that would time out or force. Canceling its context releases
+it promptly, but does **not** terminate the request; only closing the connection does that.
 
 Two conclusions drive the design. First, **`http2.ConfigureServer(srv, h2s)` is mandatory**, not
 optional tuning: without it the graceful-shutdown hook never reaches h2c connections and the admin
@@ -163,8 +172,10 @@ One sequence, reached identically by the `Shutdown` RPC, `Server.Shutdown`, `Gra
 whole thing, so teardown is predictable end to end rather than the sum of independent timeouts:
 
 1. `adminSrv.Shutdown(ctx)` — closes the admin listener and starts the h2 graceful shutdown
-   (GOAWAY) that `ConfigureServer` registered. Returns almost immediately; it is a trigger, not a
-   barrier.
+   (GOAWAY) that `ConfigureServer` registered. **`ctx` is derived from the budget deadline and is
+   also canceled by `force`**, because this call blocks on in-flight HTTP/1.1 requests (§3.3);
+   without that, an escalation could not interrupt it and teardown would sit here until the
+   deadline. Its return means "stop accepting and start draining", never "everything is finished".
 2. **Wait for tracked admin connections to reach zero, bounded by the remaining budget.** This is
    the real drain: it is what lets the in-flight `ShutdownResponse` flush and lets streaming RPCs
    end. Phase 4b's `WatchCalls` makes this load-bearing — a client tailing calls holds a
@@ -213,10 +224,11 @@ func (s *Server) Wait() error   { <-s.teardown; return s.waitErr }
 `Shutdown(ctx)` begins teardown, then waits on `teardown` and `ctx.Done()` together, escalating if
 the context expires first.
 
-**Every bounded wait inside `runTeardown` selects on `force` as well as on its timer**, so an
-escalation short-circuits whichever step is in flight: the connection drain (step 2) stops waiting
-and proceeds straight to the force-close, and the data plane's graceful phase (step 4) is
-abandoned for `Stop`. That is what makes `Stop` return promptly while `GracefulStop` is mid-flight,
+**Every blocking step inside `runTeardown` is force-responsive**, so an escalation short-circuits
+whichever one is in flight: `adminSrv.Shutdown` (step 1) runs under a context that `force` cancels,
+the connection drain (step 2) selects on `force` alongside its timer, and the data plane's graceful
+phase (step 4) is abandoned for `Stop`. Step 1 matters as much as the others — it is the one that
+blocks on HTTP/1.1 traffic, and a `select` that is never reached is no better than no `select`. That is what makes `Stop` return promptly while `GracefulStop` is mid-flight,
 which is precisely the CLI's contract.
 
 ### 3.6 Cross-plane supervision
@@ -345,11 +357,13 @@ this design, and a plausible-looking implementation would be wrong the same way:
 - **A long-lived admin request does not hold teardown open**: issue a streaming/blocking admin
   request, then shut down, and assert completion within the grace bound. This is the Phase 4b
   `WatchCalls` scenario, tested before the RPC that needs it exists.
-- **`Stop` escalates a `GracefulStop` already in flight**: block teardown (a held admin
-  connection), call `GracefulStop` from one goroutine, then call `Stop`, and assert both return
-  **well inside `shutdownGrace`** — the assertion must be against a fraction of the budget, since
-  waiting the full budget is exactly the bug. This fails against a single-`Once` implementation,
-  where `Stop` blocks behind the graceful sequence.
+- **`Stop` escalates a `GracefulStop` already in flight**: block teardown with an **active,
+  blocking HTTP/1.1 request** — not a merely held connection and not an h2c one — then call
+  `GracefulStop` from one goroutine and `Stop` from another, asserting both return **well inside
+  `shutdownGrace`**. The assertion must be against a fraction of the budget, since waiting the full
+  budget is exactly the bug. The HTTP/1.1 detail is what makes this test cover step 1: an h2c
+  connection leaves `adminSrv.Shutdown` returning instantly, so the blocking path goes untested and
+  the bug survives a green suite.
 
 **CLI tests**, following the existing `serve`/`check` pattern: `--admin off` opens no second port;
 an explicit `--admin` address is honored; `check` still requires schema sources; and — covering
@@ -365,6 +379,7 @@ the redefinition in §5 — a signal-driven shutdown **with the admin plane enab
 | h2c interop with native gRPC clients fails or needs configuration | Proven in 4a by a grpc-go client test rather than deferred to Phase 9's grpc-java leg |
 | h2c connections survive shutdown (verified: they do, without `ConfigureServer`) | `http2.ConfigureServer` plus connection tracking and force-close (§3.3–3.4); the same-connection test above is what proves it, since every weaker assertion passes against the broken version |
 | A future refactor drops `http2.ConfigureServer` and silently reintroduces surviving connections | It is not tuning and is not optional; §3.3 records the measurements, and the same-connection test fails without it |
+| `adminSrv.Shutdown` is called with a plain deadline context and blocks on HTTP/1.1 traffic past any escalation | Its context is canceled by `force` (§3.4 step 1); the escalation test drives an active HTTP/1.1 request specifically to exercise it |
 | Teardown is collapsed back into a single `sync.Once`, making the CLI's second Ctrl-C inert | §3.5 states why the two signals are separate; the escalation test bounds itself well under `shutdownGrace`, so the regression fails loudly rather than merely running slowly |
 | Two shutdown entry points (RPC, `Server.Shutdown`) race | Both funnel through `begin()`, whose `stopOnce` starts the coordinator exactly once (§3.5); a double-`Shutdown` test covers it |
 | Admin on by default breaks an existing user's `serve` (port already in use) | Fatal bind failure names the address; `--admin off` is documented in the flag help and the design |
