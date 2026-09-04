@@ -158,10 +158,9 @@ force the issue.
 
 ### 3.4 The teardown sequence
 
-One sequence, one `sync.Once`, reached identically by the `Shutdown` RPC, `Server.Shutdown`,
-`GracefulStop`, `Stop`, and the supervisor. A single deadline —
-`shutdownGrace = 5 * time.Second` — bounds the whole thing, so teardown is predictable end to end
-rather than the sum of independent timeouts:
+One sequence, reached identically by the `Shutdown` RPC, `Server.Shutdown`, `GracefulStop`,
+`Stop`, and the supervisor. A single deadline — `shutdownGrace = 5 * time.Second` — bounds the
+whole thing, so teardown is predictable end to end rather than the sum of independent timeouts:
 
 1. `adminSrv.Shutdown(ctx)` — closes the admin listener and starts the h2 graceful shutdown
    (GOAWAY) that `ConfigureServer` registered. Returns almost immediately; it is a trigger, not a
@@ -184,7 +183,43 @@ timeout field to the proto later is non-breaking.
 The `Shutdown` RPC's response flushes because step 2 waits for its connection to drain, not
 because step 1 blocks. That distinction is the whole reason this section exists.
 
-### 3.5 Cross-plane supervision
+### 3.5 Starting teardown and escalating are separate signals
+
+Wrapping the whole sequence in one `sync.Once` would break the graceful-to-force escalation the
+CLI depends on. `sync.Once.Do` blocks concurrent callers until the first invocation *returns*, so
+if `GracefulStop` entered first, a concurrent `Stop` — the CLI's second-signal path — would block
+inside `Do` until the graceful sequence finished on its own. The escalation would be silently
+inert, and worse, `Stop` itself would hang for up to `shutdownGrace`: the user's second Ctrl-C
+would appear to do nothing.
+
+Starting and escalating are therefore two independent idempotent signals:
+
+```go
+stopOnce  sync.Once     // starts the teardown coordinator exactly once
+forceOnce sync.Once     // escalates to force exactly once
+force     chan struct{} // closed by forceOnce
+teardown  chan struct{} // closed once teardown has fully completed
+```
+
+```go
+func (s *Server) begin()    { s.stopOnce.Do(func() { go s.runTeardown() }) }
+func (s *Server) escalate() { s.forceOnce.Do(func() { close(s.force) }) }
+
+func (s *Server) GracefulStop() { s.begin(); <-s.teardown }
+func (s *Server) Stop()         { s.begin(); s.escalate(); <-s.teardown }
+func (s *Server) Wait() error   { <-s.teardown; return s.waitErr }
+```
+
+`Shutdown(ctx)` begins teardown, then waits on `teardown` and `ctx.Done()` together, escalating if
+the context expires first.
+
+**Every bounded wait inside `runTeardown` selects on `force` as well as on its timer**, so an
+escalation short-circuits whichever step is in flight: the connection drain (step 2) stops waiting
+and proceeds straight to the force-close, and the data plane's graceful phase (step 4) is
+abandoned for `Stop`. That is what makes `Stop` return promptly while `GracefulStop` is mid-flight,
+which is precisely the CLI's contract.
+
+### 3.6 Cross-plane supervision
 
 Joining both serve goroutines is not sufficient. If either `Serve` loop exits unexpectedly — a
 broken listener, an unrecoverable accept error — the sibling plane keeps running, and `Wait`
@@ -192,7 +227,7 @@ blocks forever on the goroutine that never exits, leaving a half-working server 
 neither failure nor shutdown.
 
 A supervisor goroutine watches both results. The **first** exit that is not part of an intentional
-teardown (tracked by the same `sync.Once` that guards §3.4) triggers the full sequence against
+teardown (tracked by the same `stopOnce` that guards §3.5) triggers the full sequence against
 the other plane and the watcher. `Wait` then returns the **originating** error once every join
 completes, so the caller learns why the server died rather than seeing a nil from the plane that
 was merely told to stop.
@@ -242,11 +277,14 @@ today. Left alone, with the admin plane on by default, Ctrl-C would stop the dat
 admin listener kept running and `Wait` would hang forever on a goroutine that never exits — the
 default path, broken for every user.
 
-Redefining both to cover both planes fixes it without touching the CLI: `GracefulStop` runs the
-§3.4 sequence, `Stop` runs it with a zero budget (force-close admin connections, hard-stop the
-data plane), and the CLI's existing 10s-then-force wrapper keeps working unchanged. `Shutdown(ctx)`
-remains graceful-bounded-by-ctx, then force. The second-signal force-stop behavior is preserved
-because it is `Stop` that the signal handler escalates to, and `Stop` now covers everything.
+Redefining both to cover both planes fixes it without touching the CLI: `GracefulStop` starts the
+§3.4 sequence and waits for it, `Stop` starts it and escalates to force, and `Shutdown(ctx)`
+remains graceful-bounded-by-ctx then force. The CLI's existing 10s-then-force wrapper
+(`internal/cli/shutdown.go`, which runs `graceful()` in a goroutine and calls `force()` on a
+second signal, a timeout, or context cancellation) keeps working — **but only because starting and
+escalating are separate signals (§3.5)**. That is a load-bearing dependency, not an incidental
+one: with a single `Once` around the sequence, `force()` would block behind the in-flight
+`graceful()` and the escalation would do nothing.
 
 **Schema-less startup.** Today `server.Start` refuses to start without `ProtoDirs` or
 `DescriptorSetPaths`. That check is relaxed to apply only when the admin plane is disabled:
@@ -307,6 +345,11 @@ this design, and a plausible-looking implementation would be wrong the same way:
 - **A long-lived admin request does not hold teardown open**: issue a streaming/blocking admin
   request, then shut down, and assert completion within the grace bound. This is the Phase 4b
   `WatchCalls` scenario, tested before the RPC that needs it exists.
+- **`Stop` escalates a `GracefulStop` already in flight**: block teardown (a held admin
+  connection), call `GracefulStop` from one goroutine, then call `Stop`, and assert both return
+  **well inside `shutdownGrace`** — the assertion must be against a fraction of the budget, since
+  waiting the full budget is exactly the bug. This fails against a single-`Once` implementation,
+  where `Stop` blocks behind the graceful sequence.
 
 **CLI tests**, following the existing `serve`/`check` pattern: `--admin off` opens no second port;
 an explicit `--admin` address is honored; `check` still requires schema sources; and — covering
@@ -322,7 +365,8 @@ the redefinition in §5 — a signal-driven shutdown **with the admin plane enab
 | h2c interop with native gRPC clients fails or needs configuration | Proven in 4a by a grpc-go client test rather than deferred to Phase 9's grpc-java leg |
 | h2c connections survive shutdown (verified: they do, without `ConfigureServer`) | `http2.ConfigureServer` plus connection tracking and force-close (§3.3–3.4); the same-connection test above is what proves it, since every weaker assertion passes against the broken version |
 | A future refactor drops `http2.ConfigureServer` and silently reintroduces surviving connections | It is not tuning and is not optional; §3.3 records the measurements, and the same-connection test fails without it |
-| Two shutdown entry points (RPC, `Server.Shutdown`) race | Both funnel through one `sync.Once`-guarded sequence; a double-`Shutdown` test covers it |
+| Teardown is collapsed back into a single `sync.Once`, making the CLI's second Ctrl-C inert | §3.5 states why the two signals are separate; the escalation test bounds itself well under `shutdownGrace`, so the regression fails loudly rather than merely running slowly |
+| Two shutdown entry points (RPC, `Server.Shutdown`) race | Both funnel through `begin()`, whose `stopOnce` starts the coordinator exactly once (§3.5); a double-`Shutdown` test covers it |
 | Admin on by default breaks an existing user's `serve` (port already in use) | Fatal bind failure names the address; `--admin off` is documented in the flag help and the design |
 | Default `:6566` collides during parallel test runs | Every test binds `:0` |
 
@@ -346,3 +390,5 @@ the redefinition in §5 — a signal-driven shutdown **with the admin plane enab
    names already read as whole-server operations.
 8. **The admin drain is bounded and ends in a force-close**, sharing one `shutdownGrace` budget
    with the data-plane phase so total teardown time is predictable rather than additive.
+9. **Starting teardown and escalating to force are separate idempotent signals**, not one
+   `sync.Once`, so `Stop` can cut short a `GracefulStop` that is already running.
