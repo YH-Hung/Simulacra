@@ -31,11 +31,12 @@ a self-terminating RPC. Splitting puts every novel risk in the smaller phase:
 
 ### In scope
 
-1. `internal/admin`: `NewHandler(Deps) (http.Handler, error)` — ConnectRPC routes for
-   `ControlService`, `GET /healthz`, h2c wrapping.
+1. `internal/admin`: `Install(*http.Server, Deps) error` — ConnectRPC routes for
+   `ControlService`, `GET /healthz`, h2c wrapping and `http2.ConfigureServer`.
 2. `ControlService` handlers: `GetServerInfo`, `Reset`, `Shutdown`.
-3. `server`: `Options.AdminAddr`, `Server.AdminAddr()`, admin listener and `http.Server` folded
-   into `Start` / `Shutdown` / `Wait`, and the bounded shutdown sequence.
+3. `server`: `Options.AdminAddr`, `Server.AdminAddr()`, a connection-tracking admin listener, the
+   bounded teardown sequence, and cross-plane supervision. `GracefulStop`, `Stop`, `Shutdown`, and
+   `Wait` become **whole-server** operations covering both planes.
 4. `server.Version` — a package var (default `"dev"`) backing `GetServerInfoResponse.version`.
 5. CLI: `serve --admin <addr>|off`, defaulting to `:6566`.
 6. The schema-less startup relaxation, gated on the admin plane being enabled.
@@ -87,20 +88,22 @@ type Deps struct {
 	Shutdown func()
 }
 
-func NewHandler(deps Deps) (http.Handler, error)
+func Install(srv *http.Server, deps Deps) error
 ```
 
-`NewHandler` validates that every field is non-nil, registers
+`Install` validates that every field is non-nil, registers
 `adminv1connect.NewControlServiceHandler` on a `*http.ServeMux` at the path the generated
-constructor returns, adds `GET /healthz` → `200 ok`, and returns the mux wrapped in
-`h2c.NewHandler(mux, &http2.Server{})`.
+constructor returns, adds `GET /healthz` → `200 ok`, sets `srv.Handler` to the mux wrapped in
+`h2c.NewHandler(mux, h2s)`, and calls **`http2.ConfigureServer(srv, h2s)`**.
 
-h2c wrapping belongs here rather than in `server` because it is a property of *the handler*, not
-of the listener: `h2c.NewHandler` is a decorator. Keeping it in `admin` means the package owns its
-whole contract surface — routes, health endpoint, and protocol support — and Phase 4b extends it
-by registering four more services on the same mux, touching nothing in `server`.
+It takes the `*http.Server` rather than returning a handler because the h2c handler and the
+`*http2.Server` driving it must be paired with that specific server for shutdown to work at all
+(§3.3). Handing back a bare `http.Handler` would let a caller wire it up in a way that silently
+leaks connections. `admin` still owns its whole contract surface — routes, health endpoint, and
+protocol configuration — and Phase 4b extends it by registering four more services on the same
+mux, touching nothing in `server`.
 
-**Why funcs for addresses.** Passing bound address strings would force `NewHandler` to run after
+**Why funcs for addresses.** Passing bound address strings would force `Install` to run after
 both listeners bind, which inverts the natural construction order and makes the handler's
 dependencies order-sensitive. Accessors resolve per request and remove the constraint entirely.
 
@@ -108,50 +111,91 @@ dependencies order-sensitive. Accessors resolve per request and remove the const
 
 ## 3. Lifecycle in `server`
 
-### Options and accessors
+### 3.1 Options and accessors
 
 `Options.AdminAddr string` — empty disables the admin plane. `Server.AdminAddr() net.Addr` returns
 the bound address, or nil when disabled.
 
-### Start order
+### 3.2 Start order
 
 1. registry → store → journal → `dataplane.New` (unchanged)
 2. stub watcher (unchanged)
 3. bind the data listener
 4. **bind the admin listener, if `AdminAddr != ""`**
-5. serve both in the background
+5. serve both under the supervisor (§3.4)
 
 An admin bind failure is **fatal**: it tears down the watcher and closes the data listener before
-returning, matching the data plane's existing rule (M3 §11, "Admin listen failure at startup is
-fatal"). A server that was asked for a control plane and cannot provide one must not start
-half-working.
+returning, matching the data plane's existing rule (M3 §11). A server asked for a control plane
+that cannot provide one must not start half-working.
 
 `http.Server.Serve` returns `http.ErrServerClosed` after a clean stop; that is normalized to nil
-exactly as `grpc.ErrServerStopped` already is, so `Wait` does not report a clean shutdown as a
-failure.
+exactly as `grpc.ErrServerStopped` already is.
 
-### Shutdown order: admin first, then data plane
+### 3.3 Shutting down an h2c server — what actually works
 
-This ordering is what makes the `Shutdown` RPC work, and it is the same for every caller:
+**The obvious mechanism does not work, and this was verified rather than assumed.** A native gRPC
+client speaks cleartext HTTP/2 with prior knowledge, so `h2c.NewHandler` **hijacks** the
+connection and hands it to `http2.ServeConn`. `net/http` documents that `Server.Shutdown` neither
+closes nor waits for hijacked connections. Measured against a real prior-knowledge h2c client:
 
-1. `adminSrv.Shutdown(ctx)` — by contract this drains in-flight HTTP requests, **including the
-   request still writing the `ShutdownResponse`**, before returning.
-2. The data plane stops under a bounded grace: graceful first, force-stopped after
-   `shutdownGrace`.
-3. `Wait` joins both serve goroutines and the watcher.
+| Probe | Result |
+|---|---|
+| `srv.Shutdown(ctx)` with a live h2c connection | returned in **0s**, `err=nil` |
+| same client connection, after `Shutdown` returned | **still served an RPC** |
+| with `http2.ConfigureServer(srv, h2s)` added | client had to re-dial — connection was terminated |
+| `Shutdown` with a long-lived streaming request open | still returned in **0s**; connection stayed open |
+| tracked-listener force-close after a bound | connection closed, `Serve` returned |
 
-**Bounded grace, not unbounded.** `ShutdownRequest` is empty and frozen, so the policy is a
-decision, not a parameter. A pure graceful stop waits for in-flight data-plane RPCs including open
-bidirectional streams, which can block forever — and an abandoned stream is exactly what a failed
-test leaves behind. The caller has already received `OK` by then, so it has no way to learn it is
-hung. `shutdownGrace` is an unexported 5s constant; adding a timeout field to the proto later is
-non-breaking if anyone needs one.
+Two conclusions drive the design. First, **`http2.ConfigureServer(srv, h2s)` is mandatory**, not
+optional tuning: without it the graceful-shutdown hook never reaches h2c connections and the admin
+plane keeps serving after the server claims to have stopped. Second, **`Shutdown`'s context bound
+is meaningless here** — it returns immediately because it is not tracking the hijacked connection
+at all, so it provides neither a drain nor an ordering guarantee.
 
-The RPC and the embedder path (`Server.Shutdown`) reach the same sequence, guarded by a
-`sync.Once`, so a client calling `Shutdown` twice — or an SDK racing its own `t.Cleanup` — runs
-teardown once.
+The server therefore tracks connections itself. The admin listener is wrapped so every accepted
+connection is recorded and removed on close, which gives both the drain signal and the ability to
+force the issue.
 
----
+### 3.4 The teardown sequence
+
+One sequence, one `sync.Once`, reached identically by the `Shutdown` RPC, `Server.Shutdown`,
+`GracefulStop`, `Stop`, and the supervisor. A single deadline —
+`shutdownGrace = 5 * time.Second` — bounds the whole thing, so teardown is predictable end to end
+rather than the sum of independent timeouts:
+
+1. `adminSrv.Shutdown(ctx)` — closes the admin listener and starts the h2 graceful shutdown
+   (GOAWAY) that `ConfigureServer` registered. Returns almost immediately; it is a trigger, not a
+   barrier.
+2. **Wait for tracked admin connections to reach zero, bounded by the remaining budget.** This is
+   the real drain: it is what lets the in-flight `ShutdownResponse` flush and lets streaming RPCs
+   end. Phase 4b's `WatchCalls` makes this load-bearing — a client tailing calls holds a
+   connection open indefinitely, and only a bound stops it from holding teardown open too.
+3. **Force-close every remaining tracked connection.** A context timeout alone is not enough:
+   `http.Server.Shutdown` returns without terminating anything, so something must actually close
+   the sockets.
+4. Stop the data plane: `GracefulStop`, force-stopped via `Stop` if the budget is exhausted.
+5. Join both serve goroutines and the watcher.
+
+**Bounded, not unbounded.** `ShutdownRequest` is empty and frozen, so the policy is a decision, not
+a parameter. Unbounded graceful waits on open bidi streams — exactly what a failed test leaves
+behind — after the client has already been told `OK`, so it cannot learn it is hung. Adding a
+timeout field to the proto later is non-breaking.
+
+The `Shutdown` RPC's response flushes because step 2 waits for its connection to drain, not
+because step 1 blocks. That distinction is the whole reason this section exists.
+
+### 3.5 Cross-plane supervision
+
+Joining both serve goroutines is not sufficient. If either `Serve` loop exits unexpectedly — a
+broken listener, an unrecoverable accept error — the sibling plane keeps running, and `Wait`
+blocks forever on the goroutine that never exits, leaving a half-working server that reports
+neither failure nor shutdown.
+
+A supervisor goroutine watches both results. The **first** exit that is not part of an intentional
+teardown (tracked by the same `sync.Once` that guards §3.4) triggers the full sequence against
+the other plane and the watcher. `Wait` then returns the **originating** error once every join
+completes, so the caller learns why the server died rather than seeing a nil from the plane that
+was merely told to stop.
 
 ## 4. ControlService
 
@@ -191,6 +235,19 @@ already does. Default `:6566` — **the admin plane is on by default**, per M3 �
 user-visible change to every existing `serve` invocation: a second port opens. `--admin off` is
 the documented opt-out.
 
+**`GracefulStop` and `Stop` become whole-server operations.** The existing `serve` command hands
+`srv.GracefulStop` and `srv.Stop` to its signal handler
+(`internal/cli/serve.go:65`) and then blocks on `srv.Wait`. Those methods stop only the data plane
+today. Left alone, with the admin plane on by default, Ctrl-C would stop the data plane while the
+admin listener kept running and `Wait` would hang forever on a goroutine that never exits — the
+default path, broken for every user.
+
+Redefining both to cover both planes fixes it without touching the CLI: `GracefulStop` runs the
+§3.4 sequence, `Stop` runs it with a zero budget (force-close admin connections, hard-stop the
+data plane), and the CLI's existing 10s-then-force wrapper keeps working unchanged. `Shutdown(ctx)`
+remains graceful-bounded-by-ctx, then force. The second-signal force-stop behavior is preserved
+because it is `Stop` that the signal handler escalates to, and `Stop` now covers everything.
+
 **Schema-less startup.** Today `server.Start` refuses to start without `ProtoDirs` or
 `DescriptorSetPaths`. That check is relaxed to apply only when the admin plane is disabled:
 
@@ -217,7 +274,7 @@ no ports, no h2c, no facade:
   `false` (skips) — asserted independently for `stubs` and `journal`.
 - `Shutdown` invokes its callback exactly once and still returns a response.
 - `GET /healthz` returns 200 with body `ok`.
-- `NewHandler` rejects incomplete `Deps`.
+- `Install` rejects incomplete `Deps`.
 
 **Integration tests** through `server.Start`, where the real risk lives:
 
@@ -237,8 +294,24 @@ no ports, no h2c, no facade:
   and a data-plane call returns `Unimplemented`.
 - No schema source with admin off still fails.
 
+Three tests exist specifically because the mechanism they cover was wrong in the first draft of
+this design, and a plausible-looking implementation would be wrong the same way:
+
+- **The admin plane is actually dead after `Wait` returns.** Hold an h2c client connection open
+  across shutdown, then attempt another RPC **on that same connection**; it must fail. Asserting
+  only that `Shutdown` returned, or that a fresh dial is refused, passes against the broken
+  mechanism (§3.3) — the surviving connection is invisible to both.
+- **Failure injection in both directions**: kill the data listener out from under `Serve` and
+  assert the admin plane is torn down and `Wait` returns the originating error; then the same with
+  the admin listener. Without the supervisor (§3.5) one of these hangs forever.
+- **A long-lived admin request does not hold teardown open**: issue a streaming/blocking admin
+  request, then shut down, and assert completion within the grace bound. This is the Phase 4b
+  `WatchCalls` scenario, tested before the RPC that needs it exists.
+
 **CLI tests**, following the existing `serve`/`check` pattern: `--admin off` opens no second port;
-an explicit `--admin` address is honored; `check` still requires schema sources.
+an explicit `--admin` address is honored; `check` still requires schema sources; and — covering
+the redefinition in §5 — a signal-driven shutdown **with the admin plane enabled** completes and
+`Wait` returns, plus a context-cancellation equivalent.
 
 ---
 
@@ -247,7 +320,8 @@ an explicit `--admin` address is honored; `check` still requires schema sources.
 | Risk | Mitigation |
 |---|---|
 | h2c interop with native gRPC clients fails or needs configuration | Proven in 4a by a grpc-go client test rather than deferred to Phase 9's grpc-java leg |
-| `http.Server.Shutdown` does not drain the in-flight `Shutdown` response, so the client sees a transport error | The integration test asserts the response is actually received before `Wait` returns; if it proves unreliable, the fallback is a short flush delay before draining, isolated to the server's shutdown sequence |
+| h2c connections survive shutdown (verified: they do, without `ConfigureServer`) | `http2.ConfigureServer` plus connection tracking and force-close (§3.3–3.4); the same-connection test above is what proves it, since every weaker assertion passes against the broken version |
+| A future refactor drops `http2.ConfigureServer` and silently reintroduces surviving connections | It is not tuning and is not optional; §3.3 records the measurements, and the same-connection test fails without it |
 | Two shutdown entry points (RPC, `Server.Shutdown`) race | Both funnel through one `sync.Once`-guarded sequence; a double-`Shutdown` test covers it |
 | Admin on by default breaks an existing user's `serve` (port already in use) | Fatal bind failure names the address; `--admin off` is documented in the flag help and the design |
 | Default `:6566` collides during parallel test runs | Every test binds `:0` |
@@ -266,3 +340,9 @@ an explicit `--admin` address is honored; `check` still requires schema sources.
 5. **`server.Version` defaults to `"dev"`** — the version field needs a source before M4 supplies
    a real one.
 6. **The error-mapping table is deferred to 4b**, where the first handlers that can fail arrive.
+7. **`GracefulStop` and `Stop` change meaning** from data-plane-only to whole-server. This is a
+   behavior change to the `server` package's public API, taken because the alternative — a CLI
+   that hangs on Ctrl-C once the admin plane defaults on — is worse, and because the existing
+   names already read as whole-server operations.
+8. **The admin drain is bounded and ends in a force-close**, sharing one `shutdownGrace` budget
+   with the data-plane phase so total teardown time is predictable rather than additive.
