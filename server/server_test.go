@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +15,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
@@ -145,6 +148,9 @@ func TestStopImmediatelyAfterStartReportsCleanStop(t *testing.T) {
 	}
 }
 
+// The requirement is gated on the admin plane being off, which is the case
+// here (Options.AdminAddr is empty). The admin-on counterpart is
+// TestStartWithoutSchemaSourceSucceedsWhenAdminIsOn in admin_test.go.
 func TestStartRequiresSchemaSource(t *testing.T) {
 	_, err := Start(context.Background(), Options{DataAddr: "127.0.0.1:0", JournalSize: 1024})
 	if err == nil {
@@ -362,3 +368,210 @@ func TestStartRejectsDuplicateStubRoots(t *testing.T) {
 		t.Fatalf("err = %v, want a duplicate-stub-id failure", err)
 	}
 }
+
+// blockingBidiStub parks the data plane inside a bidi handler: after sending
+// the on_open message it waits in RecvMsg, so grpc's GracefulStop has an open
+// stream to wait for and will not return on its own.
+const blockingBidiStub = `
+- method: shop.v1.OrderService/Chat
+  respond:
+    on_open:
+      - message: { text: open }
+`
+
+// startWithStub starts a server with the given stub YAML and no admin plane.
+func startWithStub(t *testing.T, stubYAML string) *Server {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "stub.yaml"), []byte(stubYAML), 0o644); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+	srv, err := Start(context.Background(), Options{
+		ProtoDirs:   []string{"../testdata/protos"},
+		StubDirs:    []string{dir},
+		DataAddr:    "127.0.0.1:0",
+		JournalSize: 16,
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(srv.Stop)
+	return srv
+}
+
+// openChatStream opens the bidi shop.v1.OrderService/Chat stream against the
+// data plane and returns it with its method descriptor.
+func openChatStream(t *testing.T, srv *Server) (grpc.ClientStream, protoreflect.MethodDescriptor) {
+	t.Helper()
+	conn, err := grpc.NewClient(srv.DataAddr().String(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	const method = "/shop.v1.OrderService/Chat"
+	desc, err := srv.reg.LookupMethod(method)
+	if err != nil {
+		t.Fatalf("LookupMethod: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+	stream, err := conn.NewStream(ctx,
+		&grpc.StreamDesc{ClientStreams: true, ServerStreams: true}, method)
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+	return stream, desc
+}
+
+func recvChatText(t *testing.T, stream grpc.ClientStream, desc protoreflect.MethodDescriptor) string {
+	t.Helper()
+	msg := dynamicpb.NewMessage(desc.Output())
+	if err := stream.RecvMsg(msg); err != nil {
+		t.Fatalf("RecvMsg: %v", err)
+	}
+	return msg.Get(desc.Output().Fields().ByName("text")).String()
+}
+
+// waitFor polls cond until it holds, failing the test if the timeout expires.
+// cond is evaluated once before the first sleep and once more after the
+// deadline, so a condition that becomes true during the final sleep is not
+// reported as a timeout.
+func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if cond() {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("timed out after %v waiting for %s", timeout, what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// Stop must cut short a GracefulStop that is already running. With a single
+// sync.Once around the teardown sequence it could not: Once.Do blocks
+// concurrent callers until the first invocation returns, so Stop would wait
+// out the very graceful phase it is meant to abandon.
+func TestStopEscalatesGracefulStopAlreadyInFlight(t *testing.T) {
+	srv := startWithStub(t, blockingBidiStub)
+	stream, desc := openChatStream(t, srv)
+	// Receiving on_open proves the handler is inside its receive loop, so
+	// GracefulStop genuinely has an open stream to wait on. Without this
+	// synchronization the test could race ahead and pass vacuously.
+	if got := recvChatText(t, stream, desc); got != "open" {
+		t.Fatalf("on_open text = %q, want %q", got, "open")
+	}
+
+	gracefulDone := make(chan struct{})
+	go func() { srv.GracefulStop(); close(gracefulDone) }()
+	select {
+	case <-gracefulDone:
+		t.Fatal("GracefulStop returned with an open stream; the stream is not blocking it")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	stopDone := make(chan struct{})
+	go func() { srv.Stop(); close(stopDone) }()
+
+	// The assertion is against a fraction of the budget on purpose: waiting
+	// out the whole shutdownGrace is exactly the regression this catches, and
+	// it would otherwise show up only as a slow suite.
+	bound := time.After(shutdownGrace / 2)
+	for _, w := range []struct {
+		name string
+		done <-chan struct{}
+	}{{"Stop", stopDone}, {"GracefulStop", gracefulDone}} {
+		select {
+		case <-w.done:
+		case <-bound:
+			t.Fatalf("%s did not return within %v; the escalation is inert",
+				w.name, shutdownGrace/2)
+		}
+	}
+	if err := srv.Wait(); err != nil {
+		t.Fatalf("Wait = %v, want nil after a forced stop", err)
+	}
+}
+
+// A Serve loop that exits on its own must start teardown rather than leaving
+// the server half-alive with Wait blocked on a goroutine that never exits.
+func TestDataServeFailureStopsTheServer(t *testing.T) {
+	broken := newBreakableListener(t)
+	srv, err := Start(context.Background(), Options{
+		ProtoDirs:   []string{"../testdata/protos"},
+		DataAddr:    "127.0.0.1:0",
+		JournalSize: 16,
+		Listen: func(network, address string) (net.Listener, error) {
+			return broken, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	broken.breakNow()
+
+	done := make(chan error, 1)
+	go func() { done <- srv.Wait() }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, errListenerBroken) {
+			t.Fatalf("Wait = %v, want %v", err, errListenerBroken)
+		}
+	case <-time.After(shutdownGrace + 5*time.Second):
+		t.Fatal("Wait did not return after the data listener broke")
+	}
+	// A stop issued after the fact must return immediately, not hang.
+	srv.GracefulStop()
+}
+
+var errListenerBroken = errors.New("listener broken for test")
+
+// breakableListener never yields a connection. It exists to fail on demand,
+// the way a listener breaking underneath Serve looks to the serve loop: a
+// plain (non-net.Error) error, which both grpc.Server.Serve and
+// http.Server.Serve treat as fatal rather than retrying.
+type breakableListener struct {
+	net.Listener
+	broken    chan struct{}
+	closed    chan struct{}
+	breakOnce sync.Once
+	closeOnce sync.Once
+}
+
+func newBreakableListener(t *testing.T) *breakableListener {
+	t.Helper()
+	inner, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	l := &breakableListener{
+		Listener: inner,
+		broken:   make(chan struct{}),
+		closed:   make(chan struct{}),
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	return l
+}
+
+// Accept must unblock on Close as well as on breakNow. A fixture whose Accept
+// only ever unblocks on breakNow deadlocks teardown: stopDataPlane joins the
+// serve goroutine after forcing, and grpc's Serve cannot return while Accept
+// is parked.
+func (l *breakableListener) Accept() (net.Conn, error) {
+	select {
+	case <-l.broken:
+		return nil, errListenerBroken
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *breakableListener) Close() error {
+	l.closeOnce.Do(func() { close(l.closed) })
+	return l.Listener.Close()
+}
+
+func (l *breakableListener) breakNow() { l.breakOnce.Do(func() { close(l.broken) }) }

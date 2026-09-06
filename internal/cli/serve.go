@@ -22,6 +22,7 @@ func newServeCmd() *cobra.Command {
 func newServeCmdWithListen(serveListen func(string, string) (net.Listener, error)) *cobra.Command {
 	src := &sources{}
 	var listen string
+	var admin string
 	var journalSize int
 	var watchStubs bool
 	cmd := &cobra.Command{
@@ -37,6 +38,7 @@ func newServeCmdWithListen(serveListen func(string, string) (net.Listener, error
 				DescriptorSetPaths: src.descriptorSets,
 				StubDirs:           src.stubDirs,
 				DataAddr:           listen,
+				AdminAddr:          adminAddrOption(admin),
 				JournalSize:        journalSize,
 				Watch:              watchStubs,
 				Listen:             serveListen,
@@ -49,6 +51,9 @@ func newServeCmdWithListen(serveListen func(string, string) (net.Listener, error
 			output.Printf("simulacra: data plane listening on %s\n", srv.DataAddr())
 			output.Printf("  %d service(s) registered, %d stub(s) loaded — reflection and health enabled\n",
 				srv.ServiceCount(), srv.StubCount())
+			if addr := srv.AdminAddr(); addr != nil {
+				output.Printf("simulacra: admin plane listening on %s\n", addr)
+			}
 
 			sig := make(chan os.Signal, 2)
 			signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
@@ -69,6 +74,11 @@ func newServeCmdWithListen(serveListen func(string, string) (net.Listener, error
 	}
 	src.register(cmd)
 	cmd.Flags().StringVar(&listen, "listen", ":6565", "data-plane listen address")
+	cmd.Flags().StringVar(&admin, "admin", "127.0.0.1:6566",
+		`admin-plane listen address, or "off" to disable the control plane. `+
+			`Loopback only by default — unauthenticated, it must not be reachable `+
+			`from other hosts unless asked for; pass an explicit address such as `+
+			`"0.0.0.0:6566" to allow that.`)
 	cmd.Flags().IntVar(&journalSize, "journal-size", 1024, "number of recent data-plane calls to retain")
 	cmd.Flags().BoolVar(&watchStubs, "watch", true, "watch stub directories and reload changes")
 	return cmd
@@ -103,4 +113,15 @@ func (o *commandOutput) PrintErrln(args ...any) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.cmd.PrintErrln(args...)
+}
+
+// adminAddrOption maps the --admin flag onto server.Options.AdminAddr. One
+// string carries both the address and the on/off decision, reading the way
+// --listen already does; "off" is the documented opt-out from the default
+// admin plane.
+func adminAddrOption(flag string) string {
+	if flag == "off" {
+		return ""
+	}
+	return flag
 }

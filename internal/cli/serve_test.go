@@ -3,14 +3,18 @@ package cli
 import (
 	"bytes"
 	"context"
+	"io"
 	"net"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/spf13/cobra"
+
+	"github.com/yinghanhung/simulacra/server"
 )
 
 func TestServeJournalSizeFlagDefaultsTo1024(t *testing.T) {
@@ -49,6 +53,7 @@ func TestServeExecuteContextCancellationReturnsWithinBound(t *testing.T) {
 	cmd.SetArgs([]string{
 		"--proto", "../../testdata/protos",
 		"--listen", "127.0.0.1:0",
+		"--admin", "off",
 		"--watch=false",
 	})
 	result := make(chan error, 1)
@@ -200,5 +205,144 @@ func TestServeRejectsNonPositiveJournalSize(t *testing.T) {
 				t.Fatalf("Execute error = %v, want journal-size validation", err)
 			}
 		})
+	}
+}
+
+func TestServeAdminFlagDefaultsTo6566(t *testing.T) {
+	cmd := newServeCmd()
+	flag := cmd.Flags().Lookup("admin")
+	if flag == nil {
+		t.Fatal("--admin flag is missing")
+	}
+	if flag.DefValue != "127.0.0.1:6566" {
+		t.Fatalf("--admin default = %q, want %q", flag.DefValue, "127.0.0.1:6566")
+	}
+}
+
+// runServe starts `serve` with args, waits for the readiness line, then cancels
+// and returns the command's error and everything it printed.
+func runServe(t *testing.T, listen func(string, string) (net.Listener, error), needle string, args ...string) (error, string) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := newServeCmdWithListen(listen)
+	ready := make(chan struct{})
+	writer := &notifyWriter{needle: needle, seen: ready}
+	cmd.SetOut(writer)
+	cmd.SetErr(writer)
+	cmd.SetArgs(args)
+	result := make(chan error, 1)
+	go func() { result <- cmd.ExecuteContext(ctx) }()
+	select {
+	case <-ready:
+	case err := <-result:
+		cancel()
+		t.Fatalf("serve returned before printing %q: %v", needle, err)
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatalf("serve never printed %q", needle)
+	}
+	cancel()
+	select {
+	case err := <-result:
+		writer.mu.Lock()
+		defer writer.mu.Unlock()
+		return err, writer.buf.String()
+	case <-time.After(20 * time.Second):
+		t.Fatal("serve did not return within 20s of cancellation")
+		return nil, ""
+	}
+}
+
+func TestServeAdminOffBindsOnlyTheDataPlane(t *testing.T) {
+	var binds atomic.Int32
+	listen := func(network, address string) (net.Listener, error) {
+		binds.Add(1)
+		return net.Listen(network, address)
+	}
+	err, out := runServe(t, listen, "data plane listening",
+		"--proto", "../../testdata/protos",
+		"--listen", "127.0.0.1:0",
+		"--admin", "off",
+		"--watch=false",
+	)
+	if err != nil {
+		t.Fatalf("ExecuteContext = %v", err)
+	}
+	if got := binds.Load(); got != 1 {
+		t.Fatalf("bound %d listener(s) with --admin off, want 1", got)
+	}
+	if strings.Contains(out, "admin plane") {
+		t.Fatalf("output mentions the admin plane with --admin off:\n%s", out)
+	}
+}
+
+func TestServeAdminAddressIsHonoredAndAnnounced(t *testing.T) {
+	var binds atomic.Int32
+	listen := func(network, address string) (net.Listener, error) {
+		binds.Add(1)
+		return net.Listen(network, address)
+	}
+	err, out := runServe(t, listen, "admin plane listening",
+		"--proto", "../../testdata/protos",
+		"--listen", "127.0.0.1:0",
+		"--admin", "127.0.0.1:0",
+		"--watch=false",
+	)
+	if err != nil {
+		t.Fatalf("ExecuteContext = %v", err)
+	}
+	if got := binds.Load(); got != 2 {
+		t.Fatalf("bound %d listener(s) with --admin set, want 2", got)
+	}
+	if !strings.Contains(out, "admin plane listening on 127.0.0.1:") {
+		t.Fatalf("output does not announce the bound admin address:\n%s", out)
+	}
+}
+
+// The §5 redefinition, end to end: the CLI's signal waiter drives the
+// whole-server GracefulStop/Stop pair and Wait returns.
+func TestSignalShutdownStopsBothPlanes(t *testing.T) {
+	srv, err := server.Start(context.Background(), server.Options{
+		ProtoDirs:   []string{"../../testdata/protos"},
+		DataAddr:    "127.0.0.1:0",
+		AdminAddr:   "127.0.0.1:0",
+		JournalSize: 16,
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(srv.Stop)
+	if srv.AdminAddr() == nil {
+		t.Fatal("AdminAddr = nil, want a bound admin listener")
+	}
+
+	sig := make(chan os.Signal, 2)
+	done := make(chan struct{})
+	go func() {
+		waitAndShutdown(sig, 10*time.Second, srv.GracefulStop, srv.Stop, func(...any) {})
+		close(done)
+	}()
+	sig <- os.Interrupt
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("signal shutdown did not complete with the admin plane enabled")
+	}
+	if err := srv.Wait(); err != nil {
+		t.Fatalf("Wait = %v, want nil", err)
+	}
+	if _, err := net.DialTimeout("tcp", srv.AdminAddr().String(), time.Second); err == nil {
+		t.Fatal("the admin plane still accepts connections after the signal shutdown")
+	}
+}
+
+func TestCheckStillRequiresSchemaSources(t *testing.T) {
+	cmd := newCheckCmd()
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"--stubs", t.TempDir()})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "at least one schema source is required") {
+		t.Fatalf("check error = %v, want a schema-source-required error", err)
 	}
 }
