@@ -63,7 +63,7 @@ exists.
 
 | File | Contents |
 |---|---|
-| `internal/cli/client.go` | `adminClient` — address resolution, the shared `http.Client`, the five generated service clients |
+| `internal/cli/client.go` | `adminClient` — address resolution, the shared `http.Client`, the five generated service clients; `clientFactory`, the injection point the `…WithClient` constructors take (§8) |
 | `internal/cli/output.go` | `--output` flag, the protojson encoder, the `tabwriter` table helper |
 | `internal/cli/exit.go` | `errAssertionFailed`, the command exit policy, `Execute`'s mapping |
 | `internal/cli/stub.go` | `stub list\|add\|rm\|export` |
@@ -106,6 +106,11 @@ a client-wide timeout would kill the stream.
 
 That rules out a global timeout; it does not rule out a per-call one. **`--timeout` bounds each
 unary RPC**, default 30s, `0` to disable, applied as a deadline layered on the command context.
+**A negative value is a flag error (exit 2).** Cobra accepts one silently — verified:
+`--timeout -1s` parses to `-1s` with a nil error — and `context.WithTimeout` with a negative
+duration yields an already-expired context, so every RPC would fail instantly with
+`deadline_exceeded` and the user would be debugging the server. The command validates
+`timeout >= 0` before its first call.
 A closed port does fail fast (§11), but a server or proxy that accepts the connection and never
 returns headers does not, and `verify` — the CI-facing command — is exactly where an indefinite
 hang is worst. `stub add` applies it per RPC, not per command.
@@ -189,7 +194,7 @@ be piped without filtering.
 |---|---|
 | 0 | Success |
 | 1 | Assertion failed — `verify` only |
-| 2 | Operational error — unreachable server, bad flags, any non-OK RPC code |
+| 2 | Operational error — unreachable server, bad flags, any non-OK RPC code, or an interrupted command that is not `calls tail` |
 
 **This table governs the Phase 5 client commands only.** `serve` and `check` keep exiting 1 on
 every error: no shipped command changes its exit code in this phase. This was §10.1's open
@@ -219,13 +224,30 @@ point. An unknown top-level command returns the root and keeps exiting 1.
 Scoping the new code to annotated commands is deliberate: **`serve` and `check` keep exiting 1 on
 error**, so no shipped command changes its exit code.
 
-### Interrupt is a success
+### Interrupt is a success for `calls tail` only
 
-A client command cancelled by SIGINT exits **0**, not 2. `calls tail` running until the operator
-stops it is the command working, not failing — and §6.2 promises it. The signal context (§3) is
-what makes this reachable at all; the commands distinguish it by checking whether their own signal
-context was cancelled, rather than by matching on `CodeCanceled`, which a server-side cancellation
-would also produce.
+**`calls tail` interrupted by a signal exits 0. Every other client command interrupted by a signal
+exits 2, after compensating.**
+
+The asymmetry is the point. `calls tail` has no completion criterion — being stopped *is* how it
+ends, so an operator's Ctrl-C, or a supervisor's SIGTERM, is the command working. Every other
+client command has a completion criterion it did not reach: an interrupted `verify` produced no
+verdict, an interrupted `schema register` does not know whether the swap landed, an interrupted
+`stub rm` stopped partway through its ids, and an interrupted `stub add` is exactly the ambiguous
+case §6.1 describes — a `CreateStub` may have mutated the store without the client learning its ID.
+Reporting 0 for any of those would tell a script the work finished.
+
+So `calls tail` treats signal cancellation as success, and the other commands treat it as an
+operational error: they compensate where they can (§6.1), report what they know, and exit 2.
+
+Signal disposition is not inspected. §3's context subscribes to both SIGINT and SIGTERM, and
+`signal.NotifyContext` does not report which one fired, so a rule phrased as "SIGINT is success"
+could not be implemented as written and SIGTERM would fall through it. The rule is per command, not
+per signal, which is both implementable and the distinction that actually matters.
+
+Commands detect this by checking whether **their own signal context** was cancelled, not by
+matching `CodeCanceled` — a server-side cancellation produces that code too, and it is not an
+interrupt.
 
 ### Assertion failures are not errors
 
@@ -288,11 +310,21 @@ recreated with its ID, so there is no state to roll back to; the command reports
 removed before the failure. `FAILED_PRECONDITION` on a file-origin stub (4b §7) passes through
 verbatim.
 
-**`stub export [--out|-o <file>] [--output …]`** → `ExportStubs`. Writes `document` **verbatim** to
-the path, or to stdout when `--out` is omitted; the `N stub(s)` count goes to stderr. Because the RPC
-returns one file-grammar sequence and `stub add` reads that grammar, `export` then `add`
-round-trips through the same splitter. `--output json` emits the whole response (document plus
-`stub_count`) instead.
+**`stub export [--out|-o <file>] [--output …]`** → `ExportStubs`.
+
+The two flags are orthogonal and compose rather than conflict: **`--output` chooses what is
+written, `--out` chooses where it goes.** Neither combination is rejected.
+
+| Invocation | Writes |
+|---|---|
+| `stub export` | the `document` verbatim, to stdout |
+| `stub export --out stubs.yaml` | the `document` verbatim, to `stubs.yaml` |
+| `stub export --output json` | the whole response (document plus `stub_count`), to stdout |
+| `stub export --out stubs.json --output json` | the whole response, to `stubs.json` |
+
+The `N stub(s)` count always goes to stderr, so the destination — file or stdout — carries only the
+payload. Because the RPC returns one file-grammar sequence and `stub add` reads that grammar,
+`stub export` then `stub add` round-trips through the same splitter in the default (text) form.
 
 ### 6.2 `calls`
 
@@ -314,7 +346,7 @@ Stream endings, from 4b §6 and its tests:
 |---|---|
 | `RESOURCE_EXHAUSTED` (slow-consumer eviction, `internal/admin/journal_test.go:369`) | Warn on stderr that calls were dropped, reconnect, **resume from now** — and say plainly that calls in the gap are lost. This is M3 §7's "warns and resumes from now" |
 | `UNAVAILABLE` (`errShuttingDown`, `internal/admin/journal.go:127`, pinned at `server/admin_data_test.go:398`) | Print the server's message, exit **2**. No reconnect |
-| Context cancelled (Ctrl-C) | Exit **0** |
+| Signal (Ctrl-C, or SIGTERM from a supervisor) | Exit **0** — `calls tail` has no completion criterion, so being stopped is how it ends (§5) |
 | Any other code | Print verbatim, exit **2** |
 
 `UNAVAILABLE` is deliberately terminal and deliberately **not** distinguished by message text. A
@@ -419,11 +451,31 @@ A shared `startCommandServer(t)` helper in `internal/cli` owns that, with `t.Cle
 Most tests need nothing but the real server. Two do: a **failed rollback delete** and a **lost
 `CreateStub` response** (§6.1) cannot be produced by a healthy server at all.
 
-The seam is free, because the generated clients are already interfaces —
+The seam has two halves, and the interfaces are only the first.
+
+**What to substitute** is free: the generated clients are already interfaces —
 `adminv1connect.StubServiceClient` and its four siblings declare their RPCs as interface methods
-(`gen/…/adminv1connect/stub.connect.go:50`). `adminClient` holds those interface types, so a test
-substitutes a decorator wrapping the real client that counts calls and fails or drops a chosen one.
-No new abstraction, no mock server, and the production path stays the generated client.
+(`gen/…/adminv1connect/stub.connect.go:50`). `adminClient` holds those interface types, so a
+decorator wrapping the real client can count calls and fail or drop a chosen one. No new
+abstraction, no mock server, and the production path stays the generated client.
+
+**Where to substitute it** needs a named injection point, because a command otherwise builds its
+own `adminClient` from `--addr` inside `RunE` and a test has nothing to reach. The repo already has
+the pattern: `newServeCmd()` delegates to `newServeCmdWithListen(net.Listen)`
+(`internal/cli/serve.go:18`), so the listener is injectable without the exported surface knowing.
+Phase 5 follows it exactly:
+
+```go
+type clientFactory func(*cobra.Command) (*adminClient, error)
+
+func newStubCmd() *cobra.Command { return newStubCmdWithClient(newAdminClient) }
+func newStubCmdWithClient(newClient clientFactory) *cobra.Command { … }
+```
+
+— and the same pair for `calls`, `verify`, and `schema`. `root.go` calls the plain constructors;
+tests call the `WithClient` form, passing a factory that builds the real `adminClient` against the
+in-process server and wraps one of its five clients in the decorator. So the fault-injection tests
+still run against a real server, differing from every other test in exactly one wrapped call.
 
 **What does *not* need the seam**, correcting this design's earlier draft: proving that rollback
 *ran* on the happy path needs only the real server. If rollback never ran, the two stubs created
@@ -436,13 +488,13 @@ paths only — which keeps the mocked surface as small as it can be.
 |---|---|
 | Address resolution | Flag beats env beats default; a bare `host:port` gains `http://`, a full URL is kept verbatim |
 | Exit codes | `verify` failure → 1 with no `error:` prefix; a typo'd flag on `verify` → 2; an unreachable `--addr` → 2; `serve`/`check` failures still → 1 |
-| Interruption | A **real SIGINT** delivered to a running `calls tail` exits 0, not 130 — sent to the process under test, not simulated by cancelling a context, since the whole failure mode is that no signal handler is installed. A serve-side regression guard asserts the first SIGINT to `serve` still starts a *graceful* stop rather than forcing (§3) |
-| Deadlines | `--timeout` bounds a unary call against a server that accepts the connection and never responds; `calls tail` has no `--timeout` flag |
+| Interruption | A **real SIGINT** delivered to a running `calls tail` exits 0, not 130 — sent to the process under test, not simulated by cancelling a context, since the whole failure mode is that no signal handler is installed. The same signal to an in-flight **unary** command exits 2, not 0, and SIGTERM to `calls tail` also exits 0. A serve-side regression guard asserts the first SIGINT to `serve` still starts a *graceful* stop rather than forcing (§3) |
+| Deadlines | `--timeout` bounds a unary call against a server that accepts the connection and never responds; a negative `--timeout` is a flag error (exit 2); `calls tail` has no `--timeout` flag |
 | Output | `--output json` of a failing verify contains `"passed": false`; proto names not camelCase; `calls tail --output json` emits one object per line; an invalid `--output` is a flag error |
 | `stub list` | Method and origin filters; `unlimited` for `times: 0`; the empty-list message |
 | `stub add` | Preflight: a malformed file sends **zero** RPCs (asserted by call count, since "no stubs created" alone would also hold if the server rejected them); multi-stub file creates in order; a rejected stub rolls back every prior create, reports `<file>#<index>`, and leaves `ListStubs` showing what it showed before; a failed rollback (seam) names orphaned IDs and says the rollback was incomplete; a lost `CreateStub` response (seam) reports possible unidentified stubs; rollback still runs when the command context is already cancelled; stdin via `-` |
 | `stub rm` | File-origin stub yields the verbatim `FAILED_PRECONDITION`; no rollback of prior deletes |
-| `stub export` | Document written verbatim; `export` → `add` round-trips to an equal stub set; `-o` is the shorthand for `--out`, not `--output` |
+| `stub export` | Document written verbatim; `export` → `add` round-trips to an equal stub set; `-o` is the shorthand for `--out`, not `--output`; all four `--out` × `--output` combinations write what §6.1's table says, and none is rejected |
 | `calls list` | Method filter, limit, newest-first order |
 | `calls tail` | Delivers a call; eviction warns and resumes; teardown (`UNAVAILABLE`) exits 2; Ctrl-C exits 0. Runs under `-race` |
 | `verify` | `--times` parsing for every key and the range form; an unknown key is a flag error; a repeated key is an error naming it; **`2147483648` and `-2147483649` are rejected as out of range**, with a mutation check that `Atoi`-plus-conversion would silently pass; combination validation is left to the server and its `INVALID_ARGUMENT` is surfaced; nearest-miss text reproduced verbatim |
@@ -479,6 +531,8 @@ most at risk:
 | A root-level signal context regresses `serve`'s two-stage shutdown | The signal context is per client command, never at the entry point (§3); a regression guard asserts the first SIGINT to `serve` still starts a graceful stop (§8) |
 | `stub add` loses a `CreateStub` response and orphans a stub it cannot name | Unavoidable without a contract change (§6.1); the command reports that the store may hold stubs it could not identify rather than claiming a clean rollback |
 | Rollback inherits a cancelled command context and never runs | Rollback uses an independent bounded context (§6.1); tested with the command context already cancelled |
+| An interrupted unary command reports success and a script treats the work as done | Exit 0 on signal is scoped to `calls tail` alone; every other client command exits 2 after compensating (§5) |
+| A negative `--timeout` expires every context and the user debugs the server | Rejected as a flag error before the first call (§3); cobra accepts it silently, so the check must be explicit |
 | `--timeout` fires during a legitimately slow `verify` on a large journal | 30s default with `0` to disable; the deadline is per RPC, not per command |
 | A future client command forgets the `exit` annotation and reports 1 | The annotation is set by the shared constructor the command groups use, not per command |
 
@@ -517,6 +571,14 @@ most at risk:
 15. **Fault injection reuses the generated client interfaces** (§8) — from review, and scoped to
     the two failure paths a healthy server cannot produce; the happy-path rollback assertion needs
     no seam, correcting this design's earlier rationale.
+16. **Signal cancellation exits 0 for `calls tail` and 2 for every other client command** (§5) —
+    from review, narrowing an earlier blanket "interrupt is a success". The rule is per command,
+    not per signal, because `signal.NotifyContext` does not report which signal fired.
+17. **A negative `--timeout` is a flag error** (§3) — from review.
+18. **`--out` and `--output` compose rather than conflict on `stub export`** (§6.1) — from review.
+    Format and destination are orthogonal, so no combination is rejected.
+19. **Commands take a `clientFactory` through a `…WithClient` constructor** (§8) — from review,
+    following `newServeCmdWithListen`'s existing precedent rather than inventing a second pattern.
 
 ---
 
@@ -561,6 +623,10 @@ admin plane and since deleted:
 - `strconv.Atoi("2147483648")` returns `2147483648` with a nil error on this 64-bit host, and
   `int32` of that is `-2147483648`. `strconv.ParseInt("2147483648", 10, 32)` returns
   `value out of range`.
+- cobra accepts a negative duration flag silently: `--timeout -1s` parses to `-1s` with a nil
+  error.
+- `newServeCmd()` already delegates to `newServeCmdWithListen(net.Listen)`
+  (`internal/cli/serve.go:18`), the injection precedent Phase 5 follows.
 - `adminv1connect`'s five clients are declared as **interfaces**
   (`gen/…/adminv1connect/stub.connect.go:50`), so a test decorator needs no new abstraction.
 - Nothing but `Store.Remove` and `ReplaceOrigin` removes API-origin stubs, so `ListStubs` after a
