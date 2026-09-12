@@ -99,10 +99,41 @@ the Connect protocol over HTTP/1.1 — **no h2c client-side**, which is why M3 �
 commands need no HTTP/2 plumbing. 4b proved the path end to end: `server/admin_data_test.go:372`
 runs the data services over exactly this client.
 
-`calls tail` holds a stream open indefinitely, so the client carries **no global timeout**. Unary
-commands inherit the command's context, which cobra cancels on interrupt. A per-call `--timeout`
-is deliberately omitted: a dial to a dead address already fails promptly with `unavailable` (§11),
-and a timeout flag nobody has asked for is a flag to maintain.
+### Deadlines
+
+`calls tail` holds a stream open indefinitely, so the client carries **no `http.Client.Timeout`** —
+a client-wide timeout would kill the stream.
+
+That rules out a global timeout; it does not rule out a per-call one. **`--timeout` bounds each
+unary RPC**, default 30s, `0` to disable, applied as a deadline layered on the command context.
+A closed port does fail fast (§11), but a server or proxy that accepts the connection and never
+returns headers does not, and `verify` — the CI-facing command — is exactly where an indefinite
+hang is worst. `stub add` applies it per RPC, not per command.
+
+`calls tail` does not register `--timeout`: its stream is unbounded by design, and it ends on
+signal, not deadline.
+
+### Interruption
+
+**Cobra installs no signal handling**, verified: `ExecuteC` sets `c.ctx = context.Background()`
+when no context was supplied (`cobra@v1.10.2/command.go:1085`), and `Execute` supplies none
+(`internal/cli/root.go:21`). `serve` handles interrupts today only because it runs its own
+`signal.Notify` (`internal/cli/serve.go:57`). Without a signal-aware context, a client command dies
+on SIGINT by the process default — status 130 — not the 0 §5 promises.
+
+Each client command therefore derives its own context:
+`signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)`, with `defer stop()`.
+
+**The signal context is scoped to client commands and is never installed at the root.** Putting
+`signal.NotifyContext` around `ExecuteContextC` at the entry point would regress `serve`: the first
+SIGINT would both arrive on serve's own channel *and* cancel the command context, and
+`waitAndShutdownContextStop` treats a cancelled context as "no longer granting a graceful wait
+period" — it forces immediately (`internal/cli/shutdown.go:53`). That destroys the two-stage
+"interrupt again to force" contract `serve` prints to the user, which
+`TestShutdownSecondSignalForces` pins. Neither existing test would catch it: both drive
+`waitAndShutdown*` directly with their own contexts, so the regression would surface only in the
+real binary. Three commits in Phase 4a went into separating teardown start from force escalation;
+Phase 5 does not undo that from the entry point.
 
 ---
 
@@ -160,6 +191,10 @@ be piped without filtering.
 | 1 | Assertion failed — `verify` only |
 | 2 | Operational error — unreachable server, bad flags, any non-OK RPC code |
 
+**This table governs the Phase 5 client commands only.** `serve` and `check` keep exiting 1 on
+every error: no shipped command changes its exit code in this phase. This was §10.1's open
+question and it is now closed — see §10.1.
+
 M3 §7 specifies "exit 0 pass / 1 fail (CI-scriptable)" for `verify`. Taken literally with today's
 `Execute`, which exits 1 on every error, a CI job cannot tell a failed assertion from a server it
 could not reach — the job looks like a test failure. Splitting out 2 keeps §7's sentence true for
@@ -173,13 +208,24 @@ Client commands carry `Annotations{"exit": "client"}`; the policy is:
 - Command annotated `client`: `errors.Is(err, errAssertionFailed)` → **1**, any other error → **2**.
 - Anything else (`serve`, `check`, an unknown command, no subcommand): any error → **1**, unchanged.
 
+The annotation is what scopes the table above, so the two statements describe one rule rather than
+competing ones.
+
 `ExecuteC` returns the *found subcommand with its annotations* even when flag parsing fails —
 verified: `--tiems` on an annotated `verify` returns `cmd="verify"`, `annotations=map[exit:client]`,
 `err="unknown flag: --tiems"`. So a typo'd flag on `verify` exits 2, not 1, which is the whole
 point. An unknown top-level command returns the root and keeps exiting 1.
 
 Scoping the new code to annotated commands is deliberate: **`serve` and `check` keep exiting 1 on
-error**, so no shipped command changes its exit code. See §10.1 — this is the open decision.
+error**, so no shipped command changes its exit code.
+
+### Interrupt is a success
+
+A client command cancelled by SIGINT exits **0**, not 2. `calls tail` running until the operator
+stops it is the command working, not failing — and §6.2 promises it. The signal context (§3) is
+what makes this reachable at all; the commands distinguish it by checking whether their own signal
+context was cancelled, rather than by matching on `CodeCanceled`, which a server-side cancellation
+would also produce.
 
 ### Assertion failures are not errors
 
@@ -204,17 +250,35 @@ mirroring the grammar's own meaning (`stub.proto`: "0 means unlimited"). An empt
 `no stubs` to stderr and exits 0.
 
 **`stub add -f <file>… `** (repeatable; `-` reads stdin).
-Each file is split by `stub.SplitDocuments` (§7) into per-stub documents, then sent as one
-`CreateStub` per document, in file order. The contract has no batch RPC and Phase 5 does not add
-one, so the sequence is **not atomic server-side**; the command makes it atomic client-side:
 
-- On the first rejection, `DeleteStub` every ID this invocation created, in reverse order.
-- Print `<file>#<index>: <server diagnostic>` and `no stubs were added`; exit 2.
-- If a rollback delete itself fails, print that the rollback was **incomplete** and name every
-  orphaned ID. The command never claims a clean rollback it did not achieve.
+**Preflight.** Every file is read and split by `stub.SplitDocuments` (§7) **before the first RPC**.
+A file that cannot be read, or that does not parse as the file grammar, fails the command with
+exit 2 and **no RPC is sent at all**. This makes the largest class of failure — a malformed input
+file — genuinely atomic, and leaves the RPC phase to handle only rejections the server alone can
+detect (an unknown method, a CEL diagnostic).
 
-Rollback rather than partial state, because `CreateStub` is not idempotent: a re-run after a
-partial failure duplicates everything that succeeded the first time.
+**The RPC phase is compensated, not atomic.** Documents go out as one `CreateStub` each, in file
+order. On the first rejection the command compensates: `DeleteStub` for every ID it recorded, in
+reverse order, then `<file>#<index>: <server diagnostic>` and `no stubs were added`, exit 2. If a
+rollback delete itself fails, it prints that the rollback was **incomplete** and names every
+orphaned ID.
+
+**This is best-effort compensation, and the design says so rather than claiming atomicity it cannot
+deliver.** `CreateStub` mutates the store before it returns — `internal/admin/stub.go:35` calls
+`Store.Add` and only then builds the response — so a response lost to a dropped connection, a
+deadline, or an interrupt leaves a stub the client never learned the ID of and therefore cannot
+delete. In that case the command reports that the store may hold stubs it could not identify, and
+names the document that was in flight. It never reports a clean rollback it did not achieve.
+**True atomicity needs a server-side batch RPC or an idempotency token on `CreateStub`** — a change
+to a contract frozen in Phase 2, and so not Phase 5's to make.
+
+**Rollback runs under its own bounded context**, derived from `context.Background()` with a short
+deadline, not from the command context. Compensation must still run when the command context is
+already cancelled or past its deadline — which is exactly the situation a lost or timed-out
+`CreateStub` creates — and a rollback inheriting that context would be dead before it sent a byte.
+
+Compensating rather than leaving partial state, because `CreateStub` is not idempotent: a re-run
+after a partial failure duplicates everything that succeeded the first time.
 
 `ReplaceAllStubs` is not used for `add` — it would delete the API stubs already present, which is
 replacement, not addition.
@@ -270,8 +334,15 @@ bare word `never`; `--times at-least=1,at-most=3` is a range. Each key sets its 
 `Times`. **The CLI does not validate combinations.** `journal.Times.Validate` already owns those
 rules and `internal/admin/verify.go:34` already calls it, returning `INVALID_ARGUMENT` with the
 reason; duplicating them client-side is how two surfaces drift. The CLI rejects only what it alone
-can see: an unknown key, a non-integer value, and an absent `--times` (4b §11.6 rejects an absent
-`times` server-side, so the flag is required).
+can see: an unknown key, a value that is not an integer **in int32 range**, and an absent
+`--times` (4b §11.6 rejects an absent `times` server-side, so the flag is required).
+
+Values are parsed with `strconv.ParseInt(value, 10, 32)`, never `Atoi`. The wire fields are
+`int32` (`verify.proto:19–21`), and on a 64-bit host `Atoi` followed by an `int32` conversion wraps
+silently — verified: `Atoi("2147483648")` yields `2147483648`, and `int32` of it is
+`-2147483648`. That would send the server a different assertion than the user wrote, under the
+user's name. `ParseInt(…, 32)` rejects it as out of range instead. This is the same failure 4b §3.3
+closed for stub `priority` and `times`; the CLI closes it at the flag.
 
 Keys accumulate across occurrences and across comma-separated groups, so `--times at-least=1
 --times at-most=3` and `--times at-least=1,at-most=3` are the same assertion. **A key given twice
@@ -343,28 +414,52 @@ Per M3 §12, command tests run against an **in-process server**: `server.Start` 
 `DataAddr` and `AdminAddr` on `127.0.0.1:0`, then `--addr` pointed at `srv.AdminAddr().String()`.
 A shared `startCommandServer(t)` helper in `internal/cli` owns that, with `t.Cleanup` teardown.
 
+### The fault-injection seam
+
+Most tests need nothing but the real server. Two do: a **failed rollback delete** and a **lost
+`CreateStub` response** (§6.1) cannot be produced by a healthy server at all.
+
+The seam is free, because the generated clients are already interfaces —
+`adminv1connect.StubServiceClient` and its four siblings declare their RPCs as interface methods
+(`gen/…/adminv1connect/stub.connect.go:50`). `adminClient` holds those interface types, so a test
+substitutes a decorator wrapping the real client that counts calls and fails or drops a chosen one.
+No new abstraction, no mock server, and the production path stays the generated client.
+
+**What does *not* need the seam**, correcting this design's earlier draft: proving that rollback
+*ran* on the happy path needs only the real server. If rollback never ran, the two stubs created
+before the rejection are still there, so `ListStubs` afterwards shows 2; if it ran, it shows 0. The
+end state discriminates, and nothing else in the system removes API-origin stubs. The earlier claim
+that the two cases "differ only in the intermediate state" was wrong. The seam is for the failure
+paths only — which keeps the mocked surface as small as it can be.
+
 | Layer | Tests |
 |---|---|
 | Address resolution | Flag beats env beats default; a bare `host:port` gains `http://`, a full URL is kept verbatim |
 | Exit codes | `verify` failure → 1 with no `error:` prefix; a typo'd flag on `verify` → 2; an unreachable `--addr` → 2; `serve`/`check` failures still → 1 |
+| Interruption | A **real SIGINT** delivered to a running `calls tail` exits 0, not 130 — sent to the process under test, not simulated by cancelling a context, since the whole failure mode is that no signal handler is installed. A serve-side regression guard asserts the first SIGINT to `serve` still starts a *graceful* stop rather than forcing (§3) |
+| Deadlines | `--timeout` bounds a unary call against a server that accepts the connection and never responds; `calls tail` has no `--timeout` flag |
 | Output | `--output json` of a failing verify contains `"passed": false`; proto names not camelCase; `calls tail --output json` emits one object per line; an invalid `--output` is a flag error |
 | `stub list` | Method and origin filters; `unlimited` for `times: 0`; the empty-list message |
-| `stub add` | Multi-stub file creates in order; a rejected stub rolls back every prior create, reports `<file>#<index>`, and leaves `ListStubs` as it was; a failed rollback names orphaned IDs; stdin via `-` |
+| `stub add` | Preflight: a malformed file sends **zero** RPCs (asserted by call count, since "no stubs created" alone would also hold if the server rejected them); multi-stub file creates in order; a rejected stub rolls back every prior create, reports `<file>#<index>`, and leaves `ListStubs` showing what it showed before; a failed rollback (seam) names orphaned IDs and says the rollback was incomplete; a lost `CreateStub` response (seam) reports possible unidentified stubs; rollback still runs when the command context is already cancelled; stdin via `-` |
 | `stub rm` | File-origin stub yields the verbatim `FAILED_PRECONDITION`; no rollback of prior deletes |
 | `stub export` | Document written verbatim; `export` → `add` round-trips to an equal stub set; `-o` is the shorthand for `--out`, not `--output` |
 | `calls list` | Method filter, limit, newest-first order |
 | `calls tail` | Delivers a call; eviction warns and resumes; teardown (`UNAVAILABLE`) exits 2; Ctrl-C exits 0. Runs under `-race` |
-| `verify` | `--times` parsing for every key and the range form; an unknown key is a flag error; combination validation is left to the server and its `INVALID_ARGUMENT` is surfaced; nearest-miss text reproduced verbatim |
+| `verify` | `--times` parsing for every key and the range form; an unknown key is a flag error; a repeated key is an error naming it; **`2147483648` and `-2147483649` are rejected as out of range**, with a mutation check that `Atoi`-plus-conversion would silently pass; combination validation is left to the server and its `INVALID_ARGUMENT` is surfaced; nearest-miss text reproduced verbatim |
 | `schema register` | Two sets sharing well-known-type imports merge and register; the same path with differing bytes is a client-side error naming both files; a non-self-contained set surfaces the server diagnostic; re-register reports `0 new file(s)` and succeeds |
 | `schema list` | Streaming markers on both sides |
 | `stub.SplitDocuments` | The existing `parseFile` tests already cover the behaviour; one test pins the exported name and multi-document splitting |
 
 Every discriminating test carries a **named mutation check** — the convention the 4b plan
-established, and the guard against a test that a later cleanup step would satisfy anyway. The
-rollback test is the one most at risk: asserting only "the store is unchanged at the end" passes
-even if rollback never ran, because a server that rejected stub 3 and a server that rolled back
-stubs 1–2 differ only in the intermediate state. It must assert the **`DeleteStub` calls happened**,
-not just the end state.
+established, and the guard against a test that a later cleanup step would satisfy anyway. The two
+most at risk:
+
+- **The `--times` bounds test.** `Atoi` followed by an `int32` conversion produces a *valid* wire
+  value, so the server accepts it and the RPC succeeds. A test asserting only "the command
+  succeeded" passes either way; it must assert the **rejection**, and the mutation check swaps
+  `ParseInt(…, 32)` for `Atoi` and confirms the test fails.
+- **The preflight test.** "No stubs were created" is true both when preflight short-circuited and
+  when the server rejected every document, so it must count RPCs, not stubs.
 
 ---
 
@@ -381,16 +476,18 @@ not just the end state.
 | Distinguishing teardown from an unreachable server by message text | Explicitly not done — both are `unavailable` and both exit 2 (§6.2) |
 | int64 fields as JSON strings surprise a script author | Documented (§4); it is protojson's rule, and leaving protojson to change it would cost the contract shape |
 | `ListCalls` or `ExportStubs` responses exceed a client receive limit | Connect's Go client has no default receive cap (verified, §11); the 4 MiB concern 4b carried applies to grpc-go/grpc-java clients, which is Phases 7 and 9, not here |
+| A root-level signal context regresses `serve`'s two-stage shutdown | The signal context is per client command, never at the entry point (§3); a regression guard asserts the first SIGINT to `serve` still starts a graceful stop (§8) |
+| `stub add` loses a `CreateStub` response and orphans a stub it cannot name | Unavoidable without a contract change (§6.1); the command reports that the store may hold stubs it could not identify rather than claiming a clean rollback |
+| Rollback inherits a cancelled command context and never runs | Rollback uses an independent bounded context (§6.1); tested with the command context already cancelled |
+| `--timeout` fires during a legitimately slow `verify` on a large journal | 30s default with `0` to disable; the deadline is per RPC, not per command |
 | A future client command forgets the `exit` annotation and reports 1 | The annotation is set by the shared constructor the command groups use, not per command |
 
 ---
 
 ## 10. Decisions flagged for review
 
-1. **`serve` and `check` keep exiting 1 on error** (§5) — the conservative reading of "no shipped
-   command changes its exit code", taken because the question was not answered before writing. The
-   alternative is uniform 0/1/2 across every command, which is more consistent and moves two
-   commands from 1 to 2. **This is the open decision; say which you want.**
+1. **`serve` and `check` keep exiting 1 on error** (§5) — **decided in review**. The 0/1/2 table is
+   explicitly scoped to the Phase 5 client commands, so no shipped command changes its exit code.
 2. **`--output json` on read commands only** (§4), following M3 §7's wording, rather than inventing
    a CLI-defined JSON shape for the multi-RPC write commands.
 3. **`stub add` rolls back on first rejection** (§6.1) — human decision, over partial state and over
@@ -404,8 +501,22 @@ not just the end state.
 7. **`--times` combination validation stays server-side** (§6.3).
 8. **Descriptor sets are merged client-side into one all-or-nothing call, deduped by path**
    (§6.4), over sequential per-file calls.
-9. **No `--timeout` flag** (§3) — YAGNI, revisited if a real hang appears.
+9. **No `http.Client.Timeout`** (§3) — a client-wide timeout would kill `calls tail`'s stream.
+   Superseded in part by decision 13, which adds the per-RPC deadline this originally conflated
+   with it.
 10. **`SplitDocuments` is an export, not a new implementation** (§7).
+11. **A per-client-command signal context, not a root-level one** (§3) — from review. The review
+    asked for `signal.NotifyContext` plus `ExecuteContextC`; scoping it to client commands is a
+    deliberate narrowing, because the root-level form forces `serve` on the first interrupt.
+12. **`stub add` is preflight-then-compensate, and is documented as best-effort** (§6.1) — from
+    review, replacing a claim of client-side atomicity that `CreateStub`'s mutate-before-return
+    makes impossible.
+13. **`--timeout` bounds each unary RPC, default 30s; `calls tail` does not have it** (§3) — from
+    review, reversing this design's original omission.
+14. **`--times` values parse as int32, not `int`** (§6.3) — from review.
+15. **Fault injection reuses the generated client interfaces** (§8) — from review, and scoped to
+    the two failure paths a healthy server cannot produce; the happy-path rollback assertion needs
+    no seam, correcting this design's earlier rationale.
 
 ---
 
@@ -438,6 +549,22 @@ admin plane and since deleted:
 - connect v1.20.0's client applies a receive cap only when one is configured: the check is guarded
   by `readMaxBytes > 0` (`envelope.go:342`) and nothing sets it by default, so a CLI client has no
   default limit on response size.
+- cobra v1.10.2's `ExecuteC` sets `c.ctx = context.Background()` when no context was supplied
+  (`command.go:1085`), and `internal/cli/root.go:21` supplies none. Cobra installs no signal
+  handling; `serve` runs its own (`internal/cli/serve.go:57`).
+- `waitAndShutdownContextStop` forces immediately once its context is cancelled
+  (`internal/cli/shutdown.go:53`), pinned by `TestShutdownContextCanceledDuringGraceForcesAndJoins`;
+  `TestShutdownSecondSignalForces` pins the two-stage signal path. Both drive the function directly
+  with their own contexts, so neither would catch a root-level signal context.
+- `CreateStub` calls `Store.Add` before building its response (`internal/admin/stub.go:35`), so a
+  lost response leaves a stub the client cannot name.
+- `strconv.Atoi("2147483648")` returns `2147483648` with a nil error on this 64-bit host, and
+  `int32` of that is `-2147483648`. `strconv.ParseInt("2147483648", 10, 32)` returns
+  `value out of range`.
+- `adminv1connect`'s five clients are declared as **interfaces**
+  (`gen/…/adminv1connect/stub.connect.go:50`), so a test decorator needs no new abstraction.
+- Nothing but `Store.Remove` and `ReplaceOrigin` removes API-origin stubs, so `ListStubs` after a
+  failed `stub add` discriminates a rollback that ran from one that did not.
 - `stubDocuments` has exactly one caller, `parseFile` (`internal/stub/loader.go:92`).
 - `server.Start` requires a schema source only when `AdminAddr` is empty
   (`server/server.go:140`), and schema-less startup is already tested
@@ -450,4 +577,8 @@ To execute before the plan quotes code:
 - A `calls tail` client observes `RESOURCE_EXHAUSTED` and can immediately re-establish a watch on
   the same connection.
 - `cmd.Flags().Changed("addr")` is false when only `SIMULACRA_ADDR` is set, under cobra's
-  `ExecuteContextC`.
+  `ExecuteC`.
+- A real SIGINT to a process running `calls tail` under a per-command `signal.NotifyContext` exits
+  0, and the same signal to `serve` still starts a graceful stop rather than forcing.
+- A connect unary call against a listener that accepts and never writes headers blocks until its
+  context deadline, and surfaces as `deadline_exceeded`.
