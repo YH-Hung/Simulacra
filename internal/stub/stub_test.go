@@ -141,3 +141,63 @@ func TestBuildMessageUnknownAnyTypeFails(t *testing.T) {
 		t.Errorf("err = %v, want mention of no.such.Type", err)
 	}
 }
+
+// priority and times cross the admin API as int32, so Compile — shared by stub
+// files and API documents — rejects values outside that range (design §3.3).
+// Both ingest paths are exercised: a document through ParseDocument, and a
+// file through LoadDirs, which serve, hot reload, and check all call.
+func TestCompileBoundsPriorityAndTimesToInt32(t *testing.T) {
+	reg := testRegistry(t)
+	const stubPrefix = "method: shop.v1.OrderService/GetOrder\nrespond:\n  message: {}\n"
+	rejected := []struct {
+		line string
+		want string
+	}{
+		{"times: 2147483648", "times must be at most 2147483647 (got 2147483648)"},
+		{"priority: 2147483648", "priority must be between -2147483648 and 2147483647 (got 2147483648)"},
+		{"priority: -2147483649", "priority must be between -2147483648 and 2147483647 (got -2147483649)"},
+	}
+	for _, tc := range rejected {
+		t.Run("document "+tc.line, func(t *testing.T) {
+			s, _, err := ParseDocument([]byte(stubPrefix + tc.line + "\n"))
+			if err != nil {
+				t.Fatalf("ParseDocument: %v", err)
+			}
+			if _, err := Compile(reg, s, "document"); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Compile error = %v, want one containing %q", err, tc.want)
+			}
+		})
+		t.Run("file "+tc.line, func(t *testing.T) {
+			dir := t.TempDir()
+			writeFile(t, dir, "stubs.yaml", asFileItem(stubPrefix+tc.line+"\n"))
+			stubs, errs := LoadDirs(reg, []string{dir})
+			if len(stubs) != 0 || len(errs) != 1 || !strings.Contains(errs[0].Error(), tc.want) {
+				t.Fatalf("LoadDirs = %d stub(s), errors %v; want no stubs and one error containing %q",
+					len(stubs), errs, tc.want)
+			}
+		})
+	}
+
+	// The int32 boundary values themselves are accepted.
+	for _, doc := range []string{
+		stubPrefix + "priority: -2147483648\ntimes: 2147483647\n",
+		stubPrefix + "priority: 2147483647\n",
+	} {
+		s, _, err := ParseDocument([]byte(doc))
+		if err != nil {
+			t.Fatalf("ParseDocument: %v", err)
+		}
+		c, err := Compile(reg, s, "document")
+		if err != nil {
+			t.Fatalf("Compile at the int32 boundary: %v", err)
+		}
+		if c.Priority != s.Priority || c.Times != s.Times {
+			t.Fatalf("compiled priority/times = %d/%d, want %d/%d", c.Priority, c.Times, s.Priority, s.Times)
+		}
+	}
+}
+
+// asFileItem turns a single-stub document into a one-item stub file.
+func asFileItem(doc string) string {
+	return "- " + strings.ReplaceAll(strings.TrimSuffix(doc, "\n"), "\n", "\n  ") + "\n"
+}

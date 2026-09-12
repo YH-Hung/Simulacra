@@ -251,9 +251,43 @@ func (h *harness) verify(t *testing.T, body string, wantShape match.Shape) journ
 	}
 	if !report.Pass {
 		t.Fatalf("verification failed: matched %d of %d, want %s; misses=%v unexpected=%v",
-			report.Matched, report.Considered, report.Want, report.Misses, report.UnexpectedMatches)
+			report.Matched, report.Considered, report.Want, missSummaries(report.Misses), seqsOf(report.UnexpectedMatches))
 	}
 	return report
+}
+
+// missSummaries and seqsOf render a journal.Report's call snapshots as
+// sequence numbers for a human-readable failure message: neither journal.Miss
+// nor journal.Call has a String method, so formatting them with %v prints
+// pointer addresses instead of the seq/reasons a failure needs. This mirrors
+// internal/journal/verify_test.go's unexported seqsOf helper, which lives in
+// another package and so isn't reusable here.
+func missSummaries(misses []journal.Miss) []string {
+	if misses == nil {
+		return nil
+	}
+	summaries := make([]string, len(misses))
+	for i, miss := range misses {
+		var seq uint64
+		if miss.Call != nil {
+			seq = miss.Call.Seq
+		}
+		summaries[i] = fmt.Sprintf("seq=%d reasons=%v", seq, miss.Reasons)
+	}
+	return summaries
+}
+
+func seqsOf(calls []*journal.Call) []uint64 {
+	if calls == nil {
+		return nil
+	}
+	seqs := make([]uint64, len(calls))
+	for i, call := range calls {
+		if call != nil {
+			seqs[i] = call.Seq
+		}
+	}
+	return seqs
 }
 
 func fieldString(t *testing.T, message *dynamicpb.Message, name protoreflect.Name) string {

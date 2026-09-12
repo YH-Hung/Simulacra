@@ -32,7 +32,7 @@ func (s *Server) startAdminPlane(addr string, listen func(network, address strin
 		// to read the request head; IdleTimeout bounds only time between
 		// requests on a keep-alive connection. Deliberately absent:
 		// ReadTimeout and WriteTimeout, which would each cap the duration of
-		// a whole request/response and so would break Phase 4b's WatchCalls
+		// a whole request/response and so would break WatchCalls, a
 		// server-streaming RPC. Do not add them to "complete" this set.
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
@@ -62,6 +62,9 @@ func (s *Server) startAdminPlane(addr string, listen func(network, address strin
 		// can flush, which is exactly what the drain in stopAdminPlane waits
 		// for.
 		Shutdown: s.begin,
+		// Closed by begin, before runTeardown starts, so WatchCalls ends its
+		// streams instead of holding the admin drain open.
+		Stopping: s.stopping,
 	}
 	if err := admin.Install(srv, deps); err != nil {
 		_ = s.adminLis.Close()
@@ -105,9 +108,10 @@ func (s *Server) stopAdminPlane(deadline time.Time) {
 	cancel()
 
 	// Step 2: the real drain. This is what lets an in-flight ShutdownResponse
-	// flush and lets long-lived requests end. Phase 4b's WatchCalls makes it
-	// load-bearing: a client tailing calls holds a connection open
-	// indefinitely, and only this bound stops it holding teardown open too.
+	// flush and lets long-lived requests end. WatchCalls ends its own streams
+	// when Stopping closes, but a Send already past its shutdown check can
+	// still block on a client that stopped reading; only this bound stops that
+	// holding teardown open.
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
 	select {

@@ -1,11 +1,13 @@
 package stub
 
 import (
+	"errors"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/yinghanhung/simulacra/internal/match"
+	"github.com/yinghanhung/simulacra/internal/schema"
 )
 
 func TestParseDocumentAcceptsYAMLMapping(t *testing.T) {
@@ -250,5 +252,19 @@ func TestNormalizeRejectsRecursiveAnchor(t *testing.T) {
 	_, _, err := ParseDocument([]byte("method: &a\n  x: *a\n"))
 	if err == nil {
 		t.Fatal("recursive anchor accepted, want error")
+	}
+}
+
+// The admin plane classifies an unknown method with errors.Is, so the typed
+// error must survive both compile entry points it passes through.
+func TestUnknownMethodSurvivesCompileAndCompileMatch(t *testing.T) {
+	reg := testRegistry(t)
+	_, err := Compile(reg, Stub{Method: "shop.v1.OrderService/Nope"}, "document")
+	if !errors.Is(err, schema.ErrUnknownMethod) {
+		t.Errorf("Compile error = %v, want it to wrap schema.ErrUnknownMethod", err)
+	}
+	_, err = NewCompiler(reg).CompileMatch("no.such.Service/Get", nil)
+	if !errors.Is(err, schema.ErrUnknownMethod) {
+		t.Errorf("CompileMatch error = %v, want it to wrap schema.ErrUnknownMethod", err)
 	}
 }

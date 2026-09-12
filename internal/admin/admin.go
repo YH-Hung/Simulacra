@@ -21,15 +21,20 @@ import (
 )
 
 // maxRequestBytes caps both a single Connect message and the whole HTTP request
-// stream. The admin plane is unauthenticated by design (auth and TLS are M3
-// non-goals), so without a cap any peer can make the server allocate whatever
-// it sends: a probe drove an 8 MiB GetServerInfo request to a 200 response.
+// stream for every service except SchemaService. The admin plane is
+// unauthenticated by design (auth and TLS are M3 non-goals), so without a cap
+// any peer can make the server allocate whatever it sends: a probe drove an
+// 8 MiB GetServerInfo request to a 200 response.
 //
 // 4 MiB matches grpc-go's own default receive limit, which is the size callers
-// of a gRPC-shaped API already expect. Phase 4b's RegisterSchemas carries
-// descriptor sets and ReplaceAllStubs carries stub documents; if either needs
-// to accept more, raise this deliberately rather than removing the cap.
+// of a gRPC-shaped API already expect.
 const maxRequestBytes = 4 << 20
+
+// maxSchemaRequestBytes is SchemaService's cap. RegisterSchemas carries whole
+// descriptor sets, and `buf build` images include source info by default and
+// grow with the repository (design §8). Raise it deliberately if a real set
+// needs more; never remove the cap.
+const maxSchemaRequestBytes = 32 << 20
 
 // handshakeTimeout bounds the wait for the second half of the h2c client
 // preface. It is a var, not a const, only so tests can shorten it.
@@ -53,6 +58,11 @@ type Deps struct {
 	// supplies it; the handler must not block on teardown, because the
 	// response it is about to write is itself what teardown waits to drain.
 	Shutdown func()
+
+	// Stopping is closed when server teardown begins. WatchCalls ends its
+	// streams on it, so an open tail does not hold teardown for the whole
+	// grace period (design §6).
+	Stopping <-chan struct{}
 }
 
 func (d Deps) validate() error {
@@ -77,6 +87,9 @@ func (d Deps) validate() error {
 	}
 	if d.Shutdown == nil {
 		missing = append(missing, "Shutdown")
+	}
+	if d.Stopping == nil {
+		missing = append(missing, "Stopping")
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("admin: incomplete Deps, missing: %s", strings.Join(missing, ", "))
@@ -104,33 +117,45 @@ func Install(srv *http.Server, deps Deps) error {
 	}
 
 	mux := http.NewServeMux()
-	path, handler := adminv1connect.NewControlServiceHandler(
-		&controlService{deps: deps},
-		// Caps one decoded message. The MaxBytesHandler wrappers below cap the
-		// whole request stream; connect documents the two as complementary and
-		// turns an http.MaxBytesError into a proper Connect error code.
-		connect.WithReadMaxBytes(maxRequestBytes),
-	)
-	mux.Handle(path, handler)
+	// Each service caps both one decoded message (connect.WithReadMaxBytes) and
+	// its own request stream (http.MaxBytesHandler), with the same limit;
+	// connect turns an http.MaxBytesError into RESOURCE_EXHAUSTED. SchemaService
+	// alone carries descriptor sets, so it alone gets the larger cap (design §8).
+	path, handler := adminv1connect.NewControlServiceHandler(&controlService{deps: deps},
+		connect.WithReadMaxBytes(maxRequestBytes))
+	mux.Handle(path, http.MaxBytesHandler(handler, maxRequestBytes))
+	path, handler = adminv1connect.NewSchemaServiceHandler(&schemaService{deps: deps},
+		connect.WithReadMaxBytes(maxSchemaRequestBytes))
+	mux.Handle(path, http.MaxBytesHandler(handler, maxSchemaRequestBytes))
+	path, handler = adminv1connect.NewStubServiceHandler(&stubService{deps: deps},
+		connect.WithReadMaxBytes(maxRequestBytes))
+	mux.Handle(path, http.MaxBytesHandler(handler, maxRequestBytes))
+	path, handler = adminv1connect.NewJournalServiceHandler(&journalService{deps: deps},
+		connect.WithReadMaxBytes(maxRequestBytes))
+	mux.Handle(path, http.MaxBytesHandler(handler, maxRequestBytes))
+	path, handler = adminv1connect.NewVerifyServiceHandler(&verifyService{deps: deps},
+		connect.WithReadMaxBytes(maxRequestBytes))
+	mux.Handle(path, http.MaxBytesHandler(handler, maxRequestBytes))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = io.WriteString(w, "ok")
 	})
 
-	// routes bounds every request that reaches the mux. It is used both for
+	// routes bounds every request that reaches the mux, at the largest route
+	// cap; each route enforces its own cap inside it. It is used both for
 	// streams on connections this package upgrades itself and, inside
 	// h2c.NewHandler, for streams on connections h2c upgrades — the h2 path
 	// never passes through the outer wrapper below, so bounding only there
 	// would leave every post-upgrade RPC unlimited.
-	routes := http.MaxBytesHandler(mux, maxRequestBytes)
+	routes := http.MaxBytesHandler(mux, maxSchemaRequestBytes)
 
 	h2s := &http2.Server{}
 	srv.Handler = &transport{
 		h2s: h2s,
 		// The outer cap covers HTTP/1.1 requests and, importantly, the h2c
 		// upgrade path: x/net's h2cUpgrade does io.ReadAll(r.Body) before any
-		// handler runs.
-		fallback: http.MaxBytesHandler(h2c.NewHandler(routes, h2s), maxRequestBytes),
+		// handler runs, so this cap must be at least the largest route cap.
+		fallback: http.MaxBytesHandler(h2c.NewHandler(routes, h2s), maxSchemaRequestBytes),
 		streams:  routes,
 	}
 	// Mandatory, not tuning. See the doc comment above.

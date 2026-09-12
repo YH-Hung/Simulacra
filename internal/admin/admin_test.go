@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +17,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/encoding/protowire"
+	"google.golang.org/protobuf/proto"
 
 	adminv1 "github.com/yinghanhung/simulacra/gen/simulacra/admin/v1"
 	"github.com/yinghanhung/simulacra/gen/simulacra/admin/v1/adminv1connect"
@@ -41,6 +43,7 @@ func testDeps(t *testing.T) admin.Deps {
 		DataAddr:  func() string { return "127.0.0.1:6565" },
 		AdminAddr: func() string { return "127.0.0.1:6566" },
 		Shutdown:  func() {},
+		Stopping:  make(chan struct{}),
 	}
 }
 
@@ -78,19 +81,25 @@ func TestInstallServesHealthz(t *testing.T) {
 	}
 }
 
-// The route assertion is "not 404", not "returns Unimplemented", so it keeps
-// passing unchanged as Tasks 2–4 fill the handlers in.
-func TestInstallMountsControlServiceRoute(t *testing.T) {
+// Every service is mounted. The assertion is "not 404", not "returns
+// Unimplemented", so it keeps passing unchanged as the handlers are filled in.
+func TestInstallMountsEveryServiceRoute(t *testing.T) {
 	ts := installed(t, testDeps(t))
-	url := ts.URL + adminv1connect.ControlServiceGetServerInfoProcedure
-	resp, err := ts.Client().Post(url, "application/json", strings.NewReader("{}"))
-	if err != nil {
-		t.Fatalf("POST %s: %v", url, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		t.Fatalf("control service route is not mounted: %s returned 404",
-			adminv1connect.ControlServiceGetServerInfoProcedure)
+	for _, procedure := range []string{
+		adminv1connect.ControlServiceGetServerInfoProcedure,
+		adminv1connect.SchemaServiceListServicesProcedure,
+		adminv1connect.StubServiceListStubsProcedure,
+		adminv1connect.JournalServiceListCallsProcedure,
+		adminv1connect.VerifyServiceVerifyCallsProcedure,
+	} {
+		resp, err := ts.Client().Post(ts.URL+procedure, "application/json", strings.NewReader("{}"))
+		if err != nil {
+			t.Fatalf("POST %s: %v", procedure, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusNotFound {
+			t.Errorf("%s is not mounted: 404", procedure)
+		}
 	}
 }
 
@@ -118,6 +127,7 @@ func TestInstallRejectsIncompleteDeps(t *testing.T) {
 		"DataAddr":  func(d *admin.Deps) { d.DataAddr = nil },
 		"AdminAddr": func(d *admin.Deps) { d.AdminAddr = nil },
 		"Shutdown":  func(d *admin.Deps) { d.Shutdown = nil },
+		"Stopping":  func(d *admin.Deps) { d.Stopping = nil },
 	}
 	for field, clearField := range unset {
 		t.Run(field, func(t *testing.T) {
@@ -326,5 +336,95 @@ func TestNormalSizedRequestStillSucceeds(t *testing.T) {
 	if _, err := client.GetServerInfo(context.Background(),
 		connect.NewRequest(&adminv1.GetServerInfoRequest{})); err != nil {
 		t.Fatalf("GetServerInfo: %v", err)
+	}
+}
+
+// padded appends an unknown field of n bytes to msg. Decoding skips it, so the
+// request means exactly what it meant before; only a size cap can tell the two
+// apart.
+func padded[T proto.Message](msg T, n int) T {
+	field := protowire.AppendTag(nil, 1000, protowire.BytesType)
+	msg.ProtoReflect().SetUnknown(protowire.AppendBytes(field, bytes.Repeat([]byte{'A'}, n)))
+	return msg
+}
+
+// Each service caps its own requests (design §8). SchemaService takes whole
+// descriptor sets and accepts up to 32 MiB; every other service stays at 4 MiB.
+// A request the cap lets through is decoded and answered — whatever the answer,
+// it is not ResourceExhausted.
+func TestRequestSizeCapsArePerService(t *testing.T) {
+	ts := installed(t, testDeps(t))
+	ctx := context.Background()
+	schemas := adminv1connect.NewSchemaServiceClient(ts.Client(), ts.URL)
+
+	_, err := schemas.RegisterSchemas(ctx, connect.NewRequest(padded(&adminv1.RegisterSchemasRequest{}, 8<<20)))
+	if code := connect.CodeOf(err); err != nil && (code == connect.CodeResourceExhausted || code == connect.CodeUnknown) {
+		t.Errorf("an 8 MiB RegisterSchemas request = %v; SchemaService must accept it", err)
+	}
+	_, err = schemas.RegisterSchemas(ctx, connect.NewRequest(padded(&adminv1.RegisterSchemasRequest{}, 40<<20)))
+	if code := connect.CodeOf(err); code != connect.CodeResourceExhausted {
+		t.Errorf("a 40 MiB RegisterSchemas request = %v (code %v), want ResourceExhausted", err, code)
+	}
+
+	control := adminv1connect.NewControlServiceClient(ts.Client(), ts.URL)
+	stubs := adminv1connect.NewStubServiceClient(ts.Client(), ts.URL)
+	journals := adminv1connect.NewJournalServiceClient(ts.Client(), ts.URL)
+	verify := adminv1connect.NewVerifyServiceClient(ts.Client(), ts.URL)
+	const oversized = 8 << 20
+	others := map[string]struct {
+		call  func() error
+		codes []connect.Code // any one of these is accepted
+	}{
+		"ControlService.GetServerInfo": {
+			call: func() error {
+				_, err := control.GetServerInfo(ctx, connect.NewRequest(padded(&adminv1.GetServerInfoRequest{}, oversized)))
+				return err
+			},
+			codes: []connect.Code{connect.CodeResourceExhausted},
+		},
+		"StubService.ReplaceAllStubs": {
+			call: func() error {
+				_, err := stubs.ReplaceAllStubs(ctx, connect.NewRequest(padded(&adminv1.ReplaceAllStubsRequest{}, oversized)))
+				return err
+			},
+			codes: []connect.Code{connect.CodeResourceExhausted},
+		},
+		"JournalService.WatchCalls": {
+			call: func() error {
+				// Bounded: a WatchCalls request the cap wrongly admits stays open.
+				watchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				defer cancel()
+				stream, err := journals.WatchCalls(watchCtx, connect.NewRequest(padded(&adminv1.WatchCallsRequest{}, oversized)))
+				if err != nil {
+					return err
+				}
+				defer stream.Close()
+				for stream.Receive() {
+				}
+				return stream.Err()
+			},
+			// Flaky as a single code: over the streaming protocol the server can
+			// reject the oversized request while the client is still writing the
+			// 8 MiB body, so the client sometimes observes the broken transport
+			// (CodeInternal) before it ever reads the server's actual status
+			// (CodeResourceExhausted). Either way the request was rejected, which
+			// is the only thing production behavior promises here — a stream that
+			// the cap wrongly admits instead blocks until the context above
+			// expires, returning CodeDeadlineExceeded, which is neither of these.
+			codes: []connect.Code{connect.CodeResourceExhausted, connect.CodeInternal},
+		},
+		"VerifyService.VerifyCalls": {
+			call: func() error {
+				_, err := verify.VerifyCalls(ctx, connect.NewRequest(padded(&adminv1.VerifyCallsRequest{}, oversized)))
+				return err
+			},
+			codes: []connect.Code{connect.CodeResourceExhausted},
+		},
+	}
+	for name, c := range others {
+		code := connect.CodeOf(c.call())
+		if !slices.Contains(c.codes, code) {
+			t.Errorf("an 8 MiB %s request = code %v, want one of %v", name, code, c.codes)
+		}
 	}
 }

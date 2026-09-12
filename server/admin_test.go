@@ -377,9 +377,9 @@ func TestAdminPlaneStopsServingAfterWait(t *testing.T) {
 	}
 }
 
-// Phase 4b's WatchCalls makes this load-bearing: a client tailing calls holds a
-// connection open indefinitely, and only the bound stops it holding teardown
-// open too. Tested before the RPC that needs it exists.
+// A long-lived admin request must not hold teardown open; only the drain bound
+// ends it. WatchCalls ends its own streams when Stopping closes, but a Send
+// blocked on a client that stopped reading still relies on this bound.
 func TestLongLivedAdminRequestDoesNotHoldTeardownOpen(t *testing.T) {
 	srv := startWithAdmin(t, Options{})
 	holdActiveHTTP1Request(t, srv)
@@ -669,9 +669,8 @@ func TestShutdownWithOpenBidiStreamCompletesWithinTheGraceBound(t *testing.T) {
 
 // TestDataPlaneGetsGuaranteedGraceFloorWhenAdminDrainConsumesTheBudget pins
 // dataGraceFloor. runTeardown runs the admin drain first, and a single stuck
-// HTTP/1.1 request — the normal case once Phase 4b's WatchCalls lets an admin
-// client hold a connection open — makes that drain burn the whole
-// shutdownGrace budget. Without a floor, stopDataPlane would then receive an
+// HTTP/1.1 request makes that drain burn the whole shutdownGrace budget.
+// Without a floor, stopDataPlane would then receive an
 // already-expired deadline and hard-kill the still-open bidi stream with zero
 // graceful window.
 //

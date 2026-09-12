@@ -116,20 +116,23 @@ func (t Times) String() string {
 	}
 }
 
-// Miss explains why a considered call did not satisfy the matcher.
+// Miss explains why a considered call did not satisfy the matcher. Call is the
+// snapshot the verdict was computed from.
 type Miss struct {
-	Seq     uint64
+	Call    *Call
 	Reasons []string
 }
 
-// Report summarizes a journal verification.
+// Report summarizes a journal verification. Misses and UnexpectedMatches carry
+// the call snapshots Verify judged, so a caller rendering them shows exactly
+// the calls the verdict came from.
 type Report struct {
 	Pass              bool
 	Matched           int
 	Considered        int
 	Want              string
 	Misses            []Miss
-	UnexpectedMatches []uint64
+	UnexpectedMatches []*Call
 }
 
 // Verify checks calls for method against matcher and the requested count.
@@ -147,11 +150,11 @@ func Verify(j *Journal, method string, matcher *match.Compiled, times Times) (Re
 	wantMethod := normalizeMethod(method)
 	report := Report{Want: times.String()}
 	type mismatch struct {
-		seq   uint64
+		call  *Call
 		input match.Input
 	}
 	var mismatches []mismatch
-	var matchedSeqs []uint64
+	var matchedCalls []*Call
 	for _, call := range j.List() {
 		if call == nil || (wantMethod != "" && call.Method != wantMethod) {
 			continue
@@ -163,23 +166,23 @@ func Verify(j *Journal, method string, matcher *match.Compiled, times Times) (Re
 		}
 		if matcher == nil || matcher.Eval(input) {
 			report.Matched++
-			matchedSeqs = append(matchedSeqs, call.Seq)
+			matchedCalls = append(matchedCalls, call)
 			continue
 		}
-		mismatches = append(mismatches, mismatch{seq: call.Seq, input: input})
+		mismatches = append(mismatches, mismatch{call: call, input: input})
 	}
 	report.Pass = times.ok(report.Matched)
 	if report.Pass {
 		return report, nil
 	}
 	if !times.under(report.Matched) {
-		report.UnexpectedMatches = matchedSeqs
+		report.UnexpectedMatches = matchedCalls
 		return report, nil
 	}
 	report.Misses = make([]Miss, 0, len(mismatches))
 	for _, missed := range mismatches {
 		report.Misses = append(report.Misses, Miss{
-			Seq:     missed.seq,
+			Call:    missed.call,
 			Reasons: matcher.Explain(missed.input),
 		})
 	}

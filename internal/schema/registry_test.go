@@ -2,6 +2,7 @@ package schema
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -618,5 +619,80 @@ func TestRegisterSetConflictsOnCustomOptionDifference(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "opt.proto") {
 		t.Fatalf("error %q does not name the conflicting file", err)
+	}
+}
+
+// Unknown-method errors are typed so the admin plane can answer NOT_FOUND, and
+// their text is pinned: loader and check diagnostics already print it.
+func TestLookupMethodTypesUnknownMethods(t *testing.T) {
+	reg := NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), testProtoDir); err != nil {
+		t.Fatalf("AddProtoDir: %v", err)
+	}
+	cases := []struct {
+		name     string
+		method   string
+		unknown  bool
+		wantText string
+	}{
+		{"absent service", "/no.such.Service/GetOrder", true,
+			`service "no.such.Service" is not registered (no schema source declares it)`},
+		{"absent method", "/shop.v1.OrderService/NoSuchMethod", true,
+			`method "NoSuchMethod" not found on service "shop.v1.OrderService"`},
+		{"malformed", "garbage", false,
+			`invalid method name "garbage" (want package.Service/Method)`},
+		{"empty method segment", "shop.v1.OrderService/", false,
+			`invalid method name "shop.v1.OrderService/" (want package.Service/Method)`},
+		{"not a service", "shop.v1.GetOrderRequest/Get", false,
+			`"shop.v1.GetOrderRequest" is not a service`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := reg.LookupMethod(tc.method)
+			if err == nil {
+				t.Fatalf("LookupMethod(%q) returned a nil error", tc.method)
+			}
+			if got := errors.Is(err, ErrUnknownMethod); got != tc.unknown {
+				t.Errorf("errors.Is(err, ErrUnknownMethod) = %v, want %v (err: %v)", got, tc.unknown, err)
+			}
+			if err.Error() != tc.wantText {
+				t.Errorf("error text = %q, want %q", err.Error(), tc.wantText)
+			}
+		})
+	}
+}
+
+// A name that cannot be a protobuf identifier is malformed, not absent. The
+// distinction is load-bearing at the admin surface: an unknown method answers
+// NOT_FOUND, which tells an SDK to register its schemas, and no schema could
+// ever declare a method named "Get Order".
+func TestLookupMethodRejectsMalformedIdentifiers(t *testing.T) {
+	reg := NewRegistry()
+	if err := reg.AddProtoDir(context.Background(), testProtoDir); err != nil {
+		t.Fatalf("AddProtoDir: %v", err)
+	}
+	for _, method := range []string{
+		"shop.v1.OrderService/Get Order",
+		"shop.v1.OrderService/1",
+		"bad service/GetOrder",
+		"shop.v1.OrderService/extra/GetOrder",
+		"//shop.v1.OrderService/GetOrder",
+	} {
+		_, err := reg.LookupMethod(method)
+		if err == nil {
+			t.Fatalf("LookupMethod(%q) returned a nil error", method)
+		}
+		if errors.Is(err, ErrUnknownMethod) {
+			t.Errorf("LookupMethod(%q) = %v; a malformed name must stay untyped, not report an absent method", method, err)
+		}
+		if want := fmt.Sprintf("invalid method name %q (want package.Service/Method)", method); err.Error() != want {
+			t.Errorf("LookupMethod(%q) error = %q, want %q", method, err, want)
+		}
+	}
+	// Syntactically valid names that name nothing registered stay typed.
+	for _, method := range []string{"no.such.Service/GetOrder", "shop.v1.OrderService/NoSuchMethod"} {
+		if _, err := reg.LookupMethod(method); !errors.Is(err, ErrUnknownMethod) {
+			t.Errorf("LookupMethod(%q) = %v, want ErrUnknownMethod", method, err)
+		}
 	}
 }

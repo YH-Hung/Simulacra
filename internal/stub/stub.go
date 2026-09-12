@@ -5,6 +5,7 @@ package stub
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -136,6 +137,16 @@ func Compile(reg *schema.Registry, s Stub, source string) (*Compiled, error) {
 func (c *Compiler) Compile(s Stub, source string) (*Compiled, error) {
 	if s.Times < 0 {
 		return nil, fmt.Errorf("%s: times must not be negative (got %d); omit it or use 0 for unlimited", source, s.Times)
+	}
+	// priority and times cross the admin API as int32. Bounding them here, in
+	// the compiler stub files and API documents share, keeps one accepted range
+	// for both and stops it depending on the width of Go's int (design §3.3).
+	if s.Times > math.MaxInt32 {
+		return nil, fmt.Errorf("%s: times must be at most %d (got %d)", source, math.MaxInt32, s.Times)
+	}
+	if s.Priority < math.MinInt32 || s.Priority > math.MaxInt32 {
+		return nil, fmt.Errorf("%s: priority must be between %d and %d (got %d)",
+			source, math.MinInt32, math.MaxInt32, s.Priority)
 	}
 	m, err := c.reg.LookupMethod(s.Method)
 	if err != nil {

@@ -121,8 +121,8 @@ func TestVerifyCountsMatchingCalls(t *testing.T) {
 			if report.Pass && report.UnexpectedMatches != nil {
 				t.Errorf("passing report UnexpectedMatches = %#v, want nil", report.UnexpectedMatches)
 			}
-			if !reflect.DeepEqual(report.UnexpectedMatches, tt.unexpected) {
-				t.Errorf("UnexpectedMatches = %v, want %v", report.UnexpectedMatches, tt.unexpected)
+			if got := seqsOf(report.UnexpectedMatches); !reflect.DeepEqual(got, tt.unexpected) {
+				t.Errorf("UnexpectedMatches seqs = %v, want %v", got, tt.unexpected)
 			}
 			if len(tt.unexpected) > 0 && report.Misses != nil {
 				t.Errorf("over-count report Misses = %#v, want nil", report.Misses)
@@ -137,9 +137,13 @@ func TestVerifyFailureExplainsNonMatchingCall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Verify: %v", err)
 	}
-	wantMisses := []Miss{{Seq: 3, Reasons: []string{`message order_id: expected to equal "o-1"; actual "o-2"`}}}
-	if report.Pass || report.Want != "exactly 3" || !reflect.DeepEqual(report.Misses, wantMisses) {
-		t.Fatalf("report = %#v, want failure with %#v", report, wantMisses)
+	if report.Pass || report.Want != "exactly 3" || len(report.Misses) != 1 {
+		t.Fatalf("report = %#v, want a failure with one miss", report)
+	}
+	miss := report.Misses[0]
+	wantReasons := []string{`message order_id: expected to equal "o-1"; actual "o-2"`}
+	if miss.Call == nil || miss.Call.Seq != 3 || !reflect.DeepEqual(miss.Reasons, wantReasons) {
+		t.Fatalf("miss = %+v, want the seq-3 call with reasons %q", miss, wantReasons)
 	}
 }
 
@@ -267,3 +271,48 @@ func orderDescriptor(t *testing.T) (protoreflect.MessageDescriptor, *protoregist
 
 func strPtr(s string) *string { return &s }
 func int32Ptr(n int32) *int32 { return &n }
+
+// seqsOf lists the sequence numbers of calls, preserving nil so a table can
+// state "no calls" as a nil want.
+func seqsOf(calls []*Call) []uint64 {
+	if calls == nil {
+		return nil
+	}
+	seqs := make([]uint64, len(calls))
+	for i, call := range calls {
+		seqs[i] = call.Seq
+	}
+	return seqs
+}
+
+// A report carries the calls its verdict was computed from — whole calls, not
+// sequence numbers a caller would have to look up again in a journal that may
+// have been reset or overwritten since.
+func TestVerifyReportCarriesTheJudgedCalls(t *testing.T) {
+	j, orderOne, _ := verificationFixture(t)
+	under, err := Verify(j, "/shop.v1.OrderService/GetOrder", orderOne, Times{Exactly: intPtr(3)})
+	if err != nil {
+		t.Fatalf("Verify (too few): %v", err)
+	}
+	over, err := Verify(j, "/shop.v1.OrderService/GetOrder", orderOne, Times{AtMost: intPtr(1)})
+	if err != nil {
+		t.Fatalf("Verify (too many): %v", err)
+	}
+	j.Reset()
+
+	if len(under.Misses) != 1 || under.Misses[0].Call == nil {
+		t.Fatalf("too-few Misses = %+v, want one miss carrying its call", under.Misses)
+	}
+	request := under.Misses[0].Call.Requests[0]
+	if got := request.Get(request.Descriptor().Fields().ByName("order_id")).String(); got != "o-2" {
+		t.Errorf("miss call order_id = %q, want o-2, the call that did not match", got)
+	}
+	if got := seqsOf(over.UnexpectedMatches); !reflect.DeepEqual(got, []uint64{1, 2}) {
+		t.Fatalf("too-many UnexpectedMatches seqs = %v, want [1 2]", got)
+	}
+	for _, call := range over.UnexpectedMatches {
+		if call.Method != "/shop.v1.OrderService/GetOrder" || len(call.Requests) != 1 {
+			t.Errorf("unexpected match = %+v, want a whole GetOrder call", call)
+		}
+	}
+}

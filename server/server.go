@@ -62,9 +62,8 @@ type Options struct {
 // graceful phase share one budget, so that portion of teardown time is
 // predictable rather than the sum of independent timeouts. The admin drain
 // has first claim on that budget — it runs first in runTeardown — and can
-// consume the whole thing: with a single stuck HTTP/1.1 request that is
-// already possible, and it becomes the normal case once Phase 4b's
-// WatchCalls lets a client hold a connection open indefinitely. Regardless of
+// consume the whole thing: a single stuck HTTP/1.1 request, or a WatchCalls
+// Send blocked on a client that stopped reading, is enough. Regardless of
 // how much the admin drain consumed, the data plane is still guaranteed
 // dataGraceFloor of its own graceful window (see that constant's doc
 // comment), so worst-case teardown is shutdownGrace + dataGraceFloor, not
@@ -82,8 +81,8 @@ const shutdownGrace = 5 * time.Second
 
 // dataGraceFloor is the graceful window the data plane is guaranteed even when
 // the admin drain consumed the whole budget. Without it, an admin drain that
-// runs to the deadline — the normal case once Phase 4b's WatchCalls lets a
-// client hold a connection open indefinitely — would hand stopDataPlane an
+// runs to the deadline — a stuck HTTP/1.1 request, or a WatchCalls Send
+// blocked on a client that stopped reading — would hand stopDataPlane an
 // already-expired deadline and hard-kill in-flight RPCs with no graceful phase
 // at all. Worst-case teardown is therefore shutdownGrace + dataGraceFloor.
 const dataGraceFloor = time.Second
@@ -135,7 +134,7 @@ func Start(ctx context.Context, opts Options) (*Server, error) {
 	}
 	// A schema source is required only when the admin plane is off. With it
 	// on, the server may boot empty and take schemas over the control plane
-	// (Phase 4b's RegisterSchemas) — the container/SDK path, where the server
+	// (RegisterSchemas) — the container/SDK path, where the server
 	// must be healthy before any schema exists. With it off, that server could
 	// never answer anything, so it still refuses to start.
 	if opts.AdminAddr == "" && len(opts.ProtoDirs) == 0 && len(opts.DescriptorSetPaths) == 0 {

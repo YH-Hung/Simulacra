@@ -194,6 +194,18 @@ func (r *Registry) AddDescriptorSetFile(path string) error {
 	})
 }
 
+// ErrUnknownMethod reports a well-formed method name that no registered schema
+// declares: the service is absent, or the method is absent on a present
+// service. The admin plane answers it with NOT_FOUND.
+var ErrUnknownMethod = errors.New("unknown method")
+
+// unknownMethodError keeps LookupMethod's established message text, which
+// loader and check diagnostics print, while matching ErrUnknownMethod.
+type unknownMethodError struct{ msg string }
+
+func (e *unknownMethodError) Error() string        { return e.msg }
+func (e *unknownMethodError) Is(target error) bool { return target == ErrUnknownMethod }
+
 // LookupMethod resolves "pkg.Service/Method" or "/pkg.Service/Method".
 func (r *Registry) LookupMethod(fullMethod string) (protoreflect.MethodDescriptor, error) {
 	name := strings.TrimPrefix(fullMethod, "/")
@@ -202,9 +214,18 @@ func (r *Registry) LookupMethod(fullMethod string) (protoreflect.MethodDescripto
 		return nil, fmt.Errorf("invalid method name %q (want package.Service/Method)", fullMethod)
 	}
 	svcName, methodName := name[:idx], name[idx+1:]
+	// A name that cannot be a protobuf identifier is malformed, not absent, and
+	// must stay untyped: ErrUnknownMethod becomes NOT_FOUND at the admin
+	// surface, which tells a client to register its schemas — and no schema can
+	// declare a service called "bad service" or a method called "Get Order".
+	// This also rejects extra separators, which the split above leaves inside
+	// the service name.
+	if !protoreflect.FullName(svcName).IsValid() || !protoreflect.Name(methodName).IsValid() {
+		return nil, fmt.Errorf("invalid method name %q (want package.Service/Method)", fullMethod)
+	}
 	d, err := r.current().files.FindDescriptorByName(protoreflect.FullName(svcName))
 	if err != nil {
-		return nil, fmt.Errorf("service %q is not registered (no schema source declares it)", svcName)
+		return nil, &unknownMethodError{msg: fmt.Sprintf("service %q is not registered (no schema source declares it)", svcName)}
 	}
 	svc, ok := d.(protoreflect.ServiceDescriptor)
 	if !ok {
@@ -212,7 +233,7 @@ func (r *Registry) LookupMethod(fullMethod string) (protoreflect.MethodDescripto
 	}
 	m := svc.Methods().ByName(protoreflect.Name(methodName))
 	if m == nil {
-		return nil, fmt.Errorf("method %q not found on service %q", methodName, svcName)
+		return nil, &unknownMethodError{msg: fmt.Sprintf("method %q not found on service %q", methodName, svcName)}
 	}
 	return m, nil
 }

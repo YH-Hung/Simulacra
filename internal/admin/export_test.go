@@ -10,3 +10,21 @@ func SetHandshakeTimeout(d time.Duration) func() {
 	handshakeTimeout = d
 	return func() { handshakeTimeout = previous }
 }
+
+// Test-only views of the error mapper.
+var (
+	ConnectError    = connectError
+	InvalidArgument = invalidArgument
+)
+
+// Test-only views of call rendering.
+var (
+	RenderCall = renderCall
+	ValidUTF8  = validUTF8
+)
+
+// StubEnvelope is a test-only view of the stub envelope conversion.
+var StubEnvelope = stubEnvelope
+
+// StreamCalls is a test-only view of WatchCalls' send loop.
+var StreamCalls = streamCalls
