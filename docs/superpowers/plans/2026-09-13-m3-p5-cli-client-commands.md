@@ -4438,3 +4438,118 @@ Then confirm the phase's guard rails:
 - **The `stub add` rollback tests assert the end state**, which discriminates here because nothing else removes API-origin stubs. Only the injected-failure paths need the decorator seam.
 
 **Plan complete.**
+
+---
+
+## Post-execution amendments
+
+Executed 2026-09-13 to 2026-09-19 on `feat/m3-p5-cli-client-commands`, twelve tasks, each
+implemented by a fresh worker and reviewed before the next began. The plan's test code carried four
+defects that execution found; all are corrected in the shipped branch but are recorded here because
+the plan text above still shows the original.
+
+1. **Task 6, Step 1 — unused import.** The `stub_test.go` import block lists
+   `"github.com/spf13/cobra"`, which nothing in that file uses. Go rejects it. Task 8 adds no cobra
+   use to that file either, so the import stays out.
+2. **Tasks 9 and 11 — the match grammar, twice.** `recordDataPlaneCall`'s helper and
+   `verify_test.go`'s `--match-file` fixture both wrote a match block as a bare scalar
+   (`order_id: o-1`). `match.Rules` is `map[string]any` keyed by operator, so both were
+   non-functional; the correct form is `order_id: { eq: o-1 }`, as `internal/stub/loader_test.go`
+   already showed. A `respond:` block *is* a bare scalar — that half of the plan was right.
+3. **Task 10, Step 1 — a data race.** `TestCallsTailDeliversARecordedCall` shares a bare
+   `bytes.Buffer` between the test's polling goroutine and cobra's `RunE` goroutine. It reproduced
+   100% under `-race`. Fixed by pulling Task 12's `syncBuffer` forward into `harness_test.go`; the
+   package already had this precedent in `serve_test.go`'s `notifyWriter`.
+4. **Task 3 / Task 12 — a duplicated fixture.** Both tasks define a listener that accepts and never
+   responds. Defined once in Task 3's `harness_test.go` as `hangingListener`; Task 12 reuses it.
+
+**Two defects the per-task structure could not catch**, found only by the whole-branch review:
+
+5. **Every text payload shipped on stderr.** `cmd.Printf` routes through cobra's `OutOrStderr()`,
+   which is `os.Stderr` unless something calls `SetOut` — and `Execute` never does. Measured on the
+   built binary: `schema list` wrote 668 bytes to stderr and zero to stdout, while
+   `schema list --output json` correctly used stdout. Design §4 requires payload on stdout.
+
+   No task review could see it: `runCmd` calls `cmd.SetOut(&stdout)`, which makes `OutOrStderr()`
+   return the *stdout* buffer, so every task's tests asserted the correct behaviour and passed
+   against code that did the opposite. The ten payload sites now use
+   `fmt.Fprintf(cmd.OutOrStdout(), …)`, `runCmd`'s doc comment no longer claims to prove the split,
+   and two binary-level tests in `signal_test.go` pin it with genuinely separate pipes. **Any future
+   command must be checked the same way — the in-process harness is blind to this by construction.**
+
+6. **`stub add` claimed a rollback it could not know it achieved.** `rollback` branched only on
+   whether the compensating deletes succeeded, printing `no stubs were added` even when the
+   triggering `CreateStub` failed with a deadline, cancellation, or interrupt — exactly what
+   design §6.1 forbids, since `CreateStub` mutates the store before returning. §8's lost-response
+   test was never written into the plan either. Both are now in: `createRejected` classifies the
+   cause (server verdicts keep the clean message; everything else reports that the store may hold an
+   unidentified stub and names the in-flight document), and a `losingCreateStubClient` decorator
+   drives the test.
+
+**Deviations from the design, all deliberate.**
+
+- `stub add`'s `created …` and `stub rm`'s `removed …` lines go to **stdout**, not stderr. They are
+  each command's record of what it did, not commentary about it. Design §4's stdout/stderr split is
+  otherwise followed exactly.
+- `internal/admin/contract_test.go` still says "Phase 4" in a comment. Stripping it would have
+  broken this phase's zero-diff guard rail on `internal/admin`; it belongs in its own change.
+
+**Found by post-merge review, after the branch was first declared complete.** All four were
+reproduced before being fixed, and the first three were shipped defects, not test-only issues.
+
+7. **Malformed stub entries bypassed preflight.** `SplitDocuments` only splits YAML nodes; it does
+   not strict-decode. So a file whose second entry carried an unknown field sent a real `CreateStub`
+   for the first entry (`created api-1`) before the server rejected the second — breaking design
+   §6.1's "no RPC is sent at all". `preflightStubs` now runs `stub.ParseDocument` on every document,
+   the same parser the server's `compileDocument` calls, so the CLI still borrows the grammar rather
+   than growing a second one. The boundary is unchanged: an unknown *method* or a CEL error needs
+   the registry and is still caught server-side.
+
+8. **Text output discarded write failures.** Every text payload site ignored `fmt.Fprintf`'s error
+   while the JSON path returned `writeJSON`'s. Under `ulimit -f 0`: `schema list` wrote zero bytes
+   and exited **0**, `--output json` exited 2, and a failing `verify` exited 1 having delivered no
+   verdict — a CI job would have believed an assertion result it never received. Text writes are now
+   checked. Note the ordering that keeps §5 intact: a *write* failure exits 2, but when the write
+   succeeds a failed assertion still exits 1.
+
+9. **Interrupting stdin broke the exit contract.** `stub add -f -` read stdin inside preflight,
+   which ran before the signal context existed, so SIGINT gave 130 and SIGTERM 143 instead of 2. The
+   signal context is now installed before preflight and the read is cancellation-aware. One subtlety
+   worth keeping: when the read completes and the context cancels at the same moment, a plain
+   `select` picks at random, so the cancellation is preferred explicitly — the same rule `rpcError`
+   already follows.
+
+10. **The `calls tail` signal tests raced.** Both synchronised with a 500ms sleep against the child
+    installing its handler. They now wait for a delivered call, which *proves* the handler exists
+    because `newCallsTailCmd` installs the signal context before opening the stream. A mutation that
+    signals immediately fails 20/20.
+
+11. **Amendment 9's fix was incomplete, and the gap it left was a regression.** Making the stdin
+    read cancellation-aware covered `-f -` but not `-f <path>`, which still used a synchronous
+    `os.ReadFile`. On a FIFO — or any file whose read blocks, such as one on a stalled network
+    mount — the newly installed handler caught the signal, the context cancelled, and the read went
+    on blocking. Measured: the command hung indefinitely, then exited **0** once the writer closed
+    and the read returned empty, reporting success for an interrupted run that added nothing.
+
+    It was strictly worse than before. At `6220b5c`, with no handler installed, the same signal
+    killed the process promptly at 130 — a wrong exit code, but a terminating one. Installing the
+    handler traded that for a hang plus a false success.
+
+    `readStdin` is now `readSource`, serving both sources with identical cancellation semantics, and
+    `preflightStubs` routes everything through it. Deliberately **no** FIFO detection: `os.Stat`
+    cannot tell you whether a read will block, so the uniform treatment is both simpler and more
+    correct. The lesson generalises past this command — *"a plain file read does not block"* is
+    false, and any read reachable from a signal-handled path needs the same treatment.
+
+Amendments 7, 9 and 11 are worth remembering together: both came from doing work — reading a file,
+reading stdin — *before* the command's guarantees were in place. When adding a command, establish
+the signal context and finish local validation before the first side effect.
+
+**Follow-ups worth doing, none blocking.**
+
+- `TestSchemaRegisterSendsOneAllOrNothingCall` discriminates only via its fixture's interdependent
+  imports. A counting `SchemaServiceClient`, mirroring `countingStubClient`, would make the test's
+  name true.
+- `calls_test.go` compares journal `seq` values lexicographically. Correct for the two calls it
+  records; a trap if copied into a test with ten or more.
+- `adminClient.Control` has no consumer. Kept per design §2, documented as such.

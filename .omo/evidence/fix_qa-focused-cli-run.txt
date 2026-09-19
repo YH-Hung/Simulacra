@@ -1,0 +1,14 @@
+Manual QA focused CLI regression run
+
+Worktree: /Users/yinghanhung/.codex/worktrees/review-cli-fixes/Simulacra
+Verified SHA: aaf0c098b2f3d3814c036be4a3cca900957b2a2e
+Surface: CLI package tests (Go test runner)
+Exact invocation:
+env GOCACHE=/private/tmp/simulacra-review-gocache go test ./internal/cli -race -count=1 -run 'TestStubAddPreflightSendsNoRPCsForAnUnknownField|TestSchemaListReportsAFailedPayloadWrite|TestStubAddReportsAFailedPayloadWrite|TestVerifyReportsAFailedVerdictWriteAsOperational|TestSchemaRegisterOfAnAlreadyRegisteredSetReportsNoNewFiles|TestInterruptedStdinReadExitsTwo|TestSIGTERMDuringStdinReadExitsTwo|TestCallsTailExitsZeroOnRealSIG'
+
+Initial sandbox attempt: FAIL before test execution for all eight cases because local listener bind was denied (127.0.0.1:0, operation not permitted).
+Escalated rerun of the exact invocation: PASS
+Output:
+ok  	github.com/yinghanhung/simulacra/internal/cli	3.376s
+
+Repository status after run: clean

@@ -89,7 +89,7 @@ func parseFile(path string) ([]Stub, []string, error) {
 		}
 		stubs = append(stubs, doc...)
 	}
-	docs, err := stubDocuments(data)
+	docs, err := SplitDocuments(data)
 	if err != nil {
 		return nil, nil, fmt.Errorf("parsing %s: %w", path, err)
 	}
@@ -99,12 +99,19 @@ func parseFile(path string) ([]Stub, []string, error) {
 	return stubs, docs, nil
 }
 
-// stubDocuments renders each sequence item of each YAML document as a
-// normalized per-stub document. The struct decoder above already rejected
-// non-sequence documents, so the sequence error here can only fire on
-// shapes it also rejected; the count check in parseFile is the belt to
-// that suspender.
-func stubDocuments(data []byte) ([]string, error) {
+// SplitDocuments renders each sequence item of each YAML document as a
+// normalized per-stub document, in file order. It is the one splitter for the
+// file grammar: parseFile uses it to load a directory, and the CLI's
+// `stub add -f` uses it to turn a file into one CreateStub call per stub, so
+// files and the admin API can never diverge on what "one stub" means.
+//
+// Documents are self-contained: aliases are expanded, comments and styling
+// stripped. A file that is not a list of stubs is an error.
+//
+// The struct decoder in parseFile already rejected non-sequence documents, so
+// the sequence error here can only fire on shapes it also rejected; the count
+// check in parseFile is the belt to that suspender.
+func SplitDocuments(data []byte) ([]string, error) {
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	var docs []string
 	for {

@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"errors"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -14,14 +15,26 @@ func newRootCmd() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
-	root.AddCommand(newServeCmd(), newCheckCmd())
+	root.AddCommand(
+		newServeCmd(),
+		newCheckCmd(),
+		newStubCmd(),
+		newCallsCmd(),
+		newVerifyCmd(),
+		newSchemaCmd(),
+	)
 	return root
 }
 
 func Execute() {
 	root := newRootCmd()
-	if err := root.Execute(); err != nil {
+	cmd, err := root.ExecuteC()
+	// A failed assertion has already printed its verdict; it is the command's
+	// output, not a diagnostic about the command (design §5).
+	if err != nil && !errors.Is(err, errAssertionFailed) {
 		root.PrintErrln("error:", err)
-		os.Exit(1)
+	}
+	if code := exitCode(cmd, err); code != 0 {
+		os.Exit(code)
 	}
 }

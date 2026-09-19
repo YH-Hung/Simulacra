@@ -179,3 +179,65 @@ func TestLoadDirsStampsRoundTrippableDocuments(t *testing.T) {
 		}
 	}
 }
+
+// SplitDocuments is the file-grammar splitter the CLI's `stub add` reuses, so
+// that files and the admin API are split by one implementation (design §7).
+func TestSplitDocumentsIsTheExportedFileSplitter(t *testing.T) {
+	t.Run("multi-document file splits in order", func(t *testing.T) {
+		file := []byte("- method: shop.v1.OrderService/GetOrder\n" +
+			"  respond:\n    message: { note: first }\n" +
+			"---\n" +
+			"- method: shop.v1.OrderService/WatchOrder\n" +
+			"  respond:\n    stream: [{ message: { note: second } }]\n")
+		docs, err := SplitDocuments(file)
+		if err != nil {
+			t.Fatalf("SplitDocuments: %v", err)
+		}
+		if len(docs) != 2 {
+			t.Fatalf("got %d documents, want 2: %q", len(docs), docs)
+		}
+		if !strings.Contains(docs[0], "note: first") || strings.Contains(docs[0], "second") {
+			t.Errorf("document 0 = %q, want only the first stub", docs[0])
+		}
+		if !strings.Contains(docs[1], "note: second") {
+			t.Errorf("document 1 = %q, want the second stub", docs[1])
+		}
+		// Each document must stand alone as one mapping, not a list item.
+		if strings.HasPrefix(docs[0], "- ") {
+			t.Errorf("document 0 = %q, want a bare mapping", docs[0])
+		}
+	})
+
+	t.Run("empty sequence yields no documents", func(t *testing.T) {
+		docs, err := SplitDocuments([]byte("[]\n"))
+		if err != nil {
+			t.Fatalf("SplitDocuments([]): %v", err)
+		}
+		if len(docs) != 0 {
+			t.Fatalf("got %d documents, want 0: %q", len(docs), docs)
+		}
+	})
+
+	t.Run("a bare mapping is rejected as not a stub file", func(t *testing.T) {
+		_, err := SplitDocuments([]byte("method: shop.v1.OrderService/GetOrder\n"))
+		if err == nil {
+			t.Fatal("SplitDocuments accepted a bare mapping; stub files hold a list")
+		}
+	})
+
+	t.Run("aliases are expanded so each document stands alone", func(t *testing.T) {
+		file := []byte("- &base\n  method: shop.v1.OrderService/GetOrder\n" +
+			"  respond:\n    message: { note: shared }\n" +
+			"- *base\n")
+		docs, err := SplitDocuments(file)
+		if err != nil {
+			t.Fatalf("SplitDocuments: %v", err)
+		}
+		if len(docs) != 2 {
+			t.Fatalf("got %d documents, want 2", len(docs))
+		}
+		if strings.Contains(docs[1], "*base") || !strings.Contains(docs[1], "note: shared") {
+			t.Errorf("document 1 = %q, want the alias expanded", docs[1])
+		}
+	})
+}
