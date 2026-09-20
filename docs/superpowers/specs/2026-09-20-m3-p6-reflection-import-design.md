@@ -59,6 +59,7 @@ since deleted. Each decision below that depends on one cites it.
 | **F3** | Simulacra's own data plane registers **both** v1 (`reflection.NewServerV1`) and v1alpha (`reflection.NewServer`) — `internal/dataplane/server.go:60-61`. The v1 path wins. | The v1alpha fallback is **unreachable** against our own server. It needs a dedicated v1alpha-only test server (§6). |
 | **F4** | grpc-go's reflection returns the **transitive closure in one response**: `FileContainingSymbol("shop.v1.OrderService")` against Simulacra returned 3 files — `shop/v1/order.proto` plus both of its well-known-type imports. This is grpc-go behavior, not a protocol guarantee. | Against grpc-go upstreams the common case is one round trip per service. The dependency recursion is a correctness safety net for other implementations, not the primary path (§4). |
 | **F5** | A stock grpc-go server advertises its own reflection services in `ListServices` (`grpc.reflection.v1alpha.ServerReflection` appeared in the probe). **Simulacra does not** — its custom `ServiceInfoProvider` (`internal/dataplane/server.go:65`) lists registry services plus health only. | The skip list (§4) is needed for real upstreams, and its test **cannot** use Simulacra as the upstream. It needs a stock grpc-go server (§6). |
+| **F7** | **No client-side rendezvous on a buffered rejection exists.** Probed against a v1alpha-only server: `ClientStream.Header()` returns empty metadata and a **nil** error rather than the status, and `ClientStream.Context()` does not complete until `RecvMsg` consumes the status (100 iterations timed out waiting on it). A terminal status buffered in the transport is unobservable until consumed. | The io.EOF regression test cannot synchronize on the real rejection, and a sleep cannot guarantee the ordering under CI load. It is pinned at a seam instead (§5, §8). |
 | **F6** | Importing an upstream `grpc/health/v1/health.proto` that differs from ours **fails the whole registration**. Reproduced: our compiled-in health exposes `Check`, `List`, `Watch`; a simulated upstream missing one RPC produced `file "grpc/health/v1/health.proto" is already registered with different content` from `RegisterSet`, rejecting the entire set. `List` is a recent grpc-go addition, so older or non-Go upstreams hit this routinely. | Health must be skipped as an import root (§4), not kept as "legitimate to mock". |
 
 ## 4. The closure algorithm
@@ -142,6 +143,17 @@ driven entirely by the receive side:
 Returning on a non-nil `SendMsg` — the obvious way to write it — would surface a bare `io.EOF` to the
 user and skip the fallback entirely against precisely the servers the fallback exists for.
 
+**A `streamOpener` seam, required by F7.** Version selection takes its stream from
+
+```go
+type streamOpener func(ctx context.Context, path string) (grpc.ClientStream, error)
+```
+
+production passing `cc.NewStream`. This exists for one reason: F7 establishes that the racy ordering
+cannot be forced against a real server — there is nothing to wait on — so the io.EOF handling would
+otherwise be untestable except by a sleep that passes under load without exercising the bug. The seam
+makes it deterministic (§8).
+
 **Transport security.** TLS with system roots by default, since "point at staging" is normally TLS.
 `--plaintext` opts out, and is what the dogfood test and any localhost use needs.
 
@@ -184,8 +196,12 @@ give cancellation safety. The sequence is therefore explicit:
    destination untouched.
 5. `os.Rename`. Past this line the import has succeeded and a later signal cannot unpublish it.
 
-An interrupt at any point therefore leaves the destination byte-identical to what it was, with no temp
-file behind — including the case where the interrupt lands *after* the walk finished.
+**The guarantee this buys, stated exactly.** Cancellation observed at the final pre-rename check aborts
+publication and preserves the destination; cancellation racing with publication may arrive too late.
+Step 4 narrows the window but cannot close it — a signal can land between the `ctx.Err()` check and the
+`os.Rename`, and past the rename a successful publication has *intentionally* replaced the destination.
+No temp file is left behind in any case. What is ruled out is a truncated or partially-written
+destination, not every possible interleaving.
 
 **Output.** A summary line to stdout via `newPayloadWriter` (matching `register`): `imported 3 file(s)
 from 1 service(s) → schema.binpb`. `--output json` renders `{files, services, bytes, path}` for CI,
@@ -210,7 +226,7 @@ using the existing `outputFlag`/`writeJSON` helpers.
 | Dogfood round-trip (M3 §12) | Boot `server.Start` with `testdata/protos`; import from its data plane; register the result into a **second** fresh server. **Two assertions, because one is not enough:** (1) `schema list` matches across both — a cheap smoke test; (2) **descriptors compared semantically, per filename**. `schema list` renders only service names, method names, input/output *type names* and streaming flags (`internal/cli/schema.go`) — it omits message fields, enum values and options entirely, so an import that dropped every field of every message would leave both listings identical and register successfully. Only the descriptor comparison establishes "registry in → identical descriptor set out" |
 | Descriptor comparison policy | The comparison reuses the registry's existing normalization, `normalizeFileProto` (`internal/schema/registry.go:398`): source-code-info and buf's image extension stripped, nothing else. Its stated principle governs any addition — *"Descriptor meaning may not be touched here: loosening equivalence must never mask a real conflict."* Each further normalization must be justified in the plan and named in the test, never added to make a failure go away |
 | Health skip (F6) | Import from an upstream whose `health.proto` **differs from our compiled-in one** (drop an RPC, as the F6 probe did) and assert the result registers cleanly into a fresh Simulacra. Without the skip this fails, naming health |
-| `SendMsg` io.EOF ordering (F2) | Against a v1alpha-only server, force the rejection to arrive **before** the send by delaying between `NewStream` and `SendMsg` (50ms reproduced it deterministically); assert the fallback still runs and the import succeeds |
+| `SendMsg` io.EOF handling (F2, F7) | **Not timing-based.** A fake `grpc.ClientStream` supplied through the `streamOpener` seam (§5) returns `io.EOF` from `SendMsg` and `Unimplemented` from `RecvMsg` — the exact pairing F2 observed on the wire — and the test asserts the v1alpha stream is opened next. Table-driven over both send outcomes (`io.EOF` and `nil`) so the fast ordering stays covered. **Named mutation check** (per the phase 5 plan's global constraints): treating any non-nil `SendMsg` as fatal must make the `io.EOF` case fail with a bare `io.EOF` and never reach v1alpha — verified to discriminate. A sleep-based variant was rejected: per F7 it can pass under CI load without ever exercising the bug |
 | CLI | Missing `--reflect`/`-o`; unreachable upstream → exit 2; interrupt mid-walk → exit 2 **and no file at the destination**; **interrupt after the walk completes, with an existing destination file** → exit 2, destination byte-identical, no temp file left (the §6 step-4 check); `--output json` shape |
 
 ## 9. Risks
