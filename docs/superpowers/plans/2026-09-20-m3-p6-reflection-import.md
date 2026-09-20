@@ -19,7 +19,7 @@
 - **Server and upstream diagnostics are surfaced verbatim.** A command may prefix its own source but never rewords or re-classifies what the upstream said (design §6, M3 §11).
 - **Every test that discriminates carries a named mutation check** — state the mutation, confirm the test fails under it, revert. Carried over from the phase 5 plan's global constraints.
 - **Run the full suite with `-count=1`.** Go's test cache will otherwise hide a real regression.
-- **No `time.Sleep` to establish ordering in a test.** Synchronize on something real. This phase has one ordering-sensitive test and F7 gives it a rendezvous.
+- **No `time.Sleep` to establish an assertion's ordering.** Synchronize on something real: this phase's one ordering-sensitive assertion has a rendezvous (F7). A sleep that only widens the window a test exercises — where every possible interleaving must produce the same asserted outcome — is permitted, and must say so at its use site.
 
 ---
 
@@ -71,6 +71,8 @@ Established by throwaway probes before this plan was written, and since deleted.
 **Interfaces:**
 - Consumes: nothing.
 - Produces: `type Fetcher interface{ ListServices(context.Context) ([]string, error); FileContainingSymbol(context.Context, string) ([][]byte, error); FileByFilename(context.Context, string) ([][]byte, error) }`; `var SkippedServices []string`; `func Closure(ctx context.Context, f Fetcher) (*descriptorpb.FileDescriptorSet, error)`.
+
+> **Scope:** this task handles the case F4 describes — the upstream volunteers a file's dependencies alongside it. Fetching dependencies the upstream withheld, conflict detection and the cycle guard are **Task 2**, driven by their own tests. Do not write them here; `FileByFilename` is part of the `Fetcher` interface but goes unused until Task 2.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -226,7 +228,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strings"
 
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/descriptorpb"
@@ -236,7 +237,7 @@ import (
 // returns serialized FileDescriptorProto messages, and a single call may
 // return more than one: grpc-go answers FileContainingSymbol with the whole
 // transitive closure (F4). That is an implementation's choice, not a
-// guarantee, which is why Closure resolves what is missing itself.
+// guarantee, which is why Task 2 makes Closure resolve what is missing.
 type Fetcher interface {
 	ListServices(ctx context.Context) ([]string, error)
 	FileContainingSymbol(ctx context.Context, symbol string) ([][]byte, error)
@@ -266,9 +267,9 @@ var SkippedServices = []string{
 	"grpc.health.v1.Health",
 }
 
-// Closure walks the upstream and returns a self-contained FileDescriptorSet
-// in topological order: every file appears after the files it imports, which
-// is what protoc --include_imports and buf build -o produce, and what our own
+// Closure walks the upstream and returns a FileDescriptorSet in topological
+// order: every file appears after the files it imports, which is what protoc
+// --include_imports and buf build -o produce, and what our own
 // RegisterSchemas requires.
 func Closure(ctx context.Context, f Fetcher) (*descriptorpb.FileDescriptorSet, error) {
 	services, err := f.ListServices(ctx)
@@ -277,11 +278,9 @@ func Closure(ctx context.Context, f Fetcher) (*descriptorpb.FileDescriptorSet, e
 	}
 
 	c := &closure{
-		f:        f,
-		byName:   map[string]*descriptorpb.FileDescriptorProto{},
-		importer: map[string]string{},
-		done:     map[string]bool{},
-		visiting: map[string]bool{},
+		f:      f,
+		byName: map[string]*descriptorpb.FileDescriptorProto{},
+		done:   map[string]bool{},
 	}
 
 	skip := map[string]bool{}
@@ -300,13 +299,280 @@ func Closure(ctx context.Context, f Fetcher) (*descriptorpb.FileDescriptorSet, e
 			return nil, err
 		}
 	}
-
-	if err := c.resolve(ctx); err != nil {
-		return nil, err
-	}
 	return c.emitAll()
 }
 
+// closure is the walk's mutable state.
+type closure struct {
+	f      Fetcher
+	byName map[string]*descriptorpb.FileDescriptorProto
+	out    []*descriptorpb.FileDescriptorProto
+	done   map[string]bool
+}
+
+// absorb decodes descriptors and files them by path, first one winning.
+func (c *closure) absorb(raw [][]byte) error {
+	for _, b := range raw {
+		fd := &descriptorpb.FileDescriptorProto{}
+		if err := proto.Unmarshal(b, fd); err != nil {
+			return fmt.Errorf("parsing a descriptor returned by the upstream: %w", err)
+		}
+		name := fd.GetName()
+		if _, ok := c.byName[name]; ok {
+			continue
+		}
+		c.byName[name] = fd
+	}
+	return nil
+}
+
+// emitAll walks every absorbed file in sorted order, emitting dependencies
+// first. Sorted so the output is deterministic rather than dependent on map
+// iteration order.
+func (c *closure) emitAll() (*descriptorpb.FileDescriptorSet, error) {
+	roots := make([]string, 0, len(c.byName))
+	for name := range c.byName {
+		roots = append(roots, name)
+	}
+	sort.Strings(roots)
+	for _, name := range roots {
+		if err := c.emit(name); err != nil {
+			return nil, err
+		}
+	}
+	return &descriptorpb.FileDescriptorSet{File: c.out}, nil
+}
+
+// emit is the post-order DFS: a file is appended only after every file it
+// imports has been.
+func (c *closure) emit(name string) error {
+	if c.done[name] {
+		return nil
+	}
+	fd, ok := c.byName[name]
+	if !ok {
+		return fmt.Errorf("the upstream did not provide %q, which another file imports", name)
+	}
+	for _, dep := range fd.GetDependency() {
+		if err := c.emit(dep); err != nil {
+			return err
+		}
+	}
+	c.done[name] = true
+	c.out = append(c.out, fd)
+	return nil
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `go test ./internal/schema/upstream/ -run TestClosure -v -count=1`
+Expected: PASS — both `TestClosureEmitsDependenciesBeforeDependents` and `TestClosureSkipsServicesTheDataPlaneImplements`.
+
+- [ ] **Step 5: Mutation check**
+
+Confirm the ordering test discriminates. Temporarily comment out the dependency loop in `emit`, so files are appended without recursing into their imports first:
+
+```go
+	// MUTATION: skip the dependency recursion
+	// for _, dep := range fd.GetDependency() {
+	// 	if err := c.emit(dep); err != nil { return err }
+	// }
+```
+
+Run: `go test ./internal/schema/upstream/ -run TestClosureEmitsDependenciesBeforeDependents -count=1`
+Expected: FAIL with `got [order.proto ts.proto], want [ts.proto order.proto]`. **Revert the mutation** and re-run to confirm PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add internal/schema/upstream/closure.go internal/schema/upstream/closure_test.go
+git commit -m "feat(upstream): topologically ordered descriptor closure with a skip rule"
+```
+
+---
+
+### Task 2: Closure robustness — recursion, diamonds, conflicts, cycles
+
+**Files:**
+- Modify: `internal/schema/upstream/closure.go`
+- Test: `internal/schema/upstream/closure_test.go` (append)
+
+**Interfaces:**
+- Consumes: `Closure`, `Fetcher`, `closure`, `fakeFetcher`, `file`, `names` from Task 1.
+- Produces: no new exported API. `Closure`'s guarantee strengthens from "topologically ordered" to "**self-contained**, topologically ordered": it now fetches dependencies the upstream withheld, rejects contradictory descriptors, and reports cycles.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `internal/schema/upstream/closure_test.go`, and add `"strings"` to its import block:
+
+```go
+// An upstream that returns only the named file, never its dependencies —
+// the opposite of grpc-go's behavior (F4), and the reason the recursion exists.
+func TestClosureFetchesDependenciesTheUpstreamWithheld(t *testing.T) {
+	f := &fakeFetcher{
+		services: []string{"shop.v1.OrderService"},
+		symbols:  map[string][]string{"shop.v1.OrderService": {"order.proto"}},
+		files: map[string]*descriptorpb.FileDescriptorProto{
+			"order.proto": file("order.proto", "ts.proto"),
+			"ts.proto":    file("ts.proto", "base.proto"),
+			"base.proto":  file("base.proto"),
+		},
+	}
+	set, err := Closure(context.Background(), f)
+	if err != nil {
+		t.Fatalf("Closure: %v", err)
+	}
+	got := names(set)
+	want := []string{"base.proto", "ts.proto", "order.proto"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+}
+
+// A diamond: two files importing one shared dependency. It must be fetched
+// once and emitted once.
+func TestClosureFetchesADiamondDependencyOnce(t *testing.T) {
+	f := &fakeFetcher{
+		services: []string{"a.A", "b.B"},
+		symbols: map[string][]string{
+			"a.A": {"a.proto"},
+			"b.B": {"b.proto"},
+		},
+		files: map[string]*descriptorpb.FileDescriptorProto{
+			"a.proto":      file("a.proto", "shared.proto"),
+			"b.proto":      file("b.proto", "shared.proto"),
+			"shared.proto": file("shared.proto"),
+		},
+	}
+	set, err := Closure(context.Background(), f)
+	if err != nil {
+		t.Fatalf("Closure: %v", err)
+	}
+	var shared int
+	for _, n := range names(set) {
+		if n == "shared.proto" {
+			shared++
+		}
+	}
+	if shared != 1 {
+		t.Fatalf("shared.proto emitted %d times, want 1; got %v", shared, names(set))
+	}
+	var fetches int
+	for _, c := range f.calls {
+		if c == "shared.proto" {
+			fetches++
+		}
+	}
+	if fetches != 1 {
+		t.Fatalf("shared.proto fetched %d times, want exactly 1 (calls: %v)", fetches, f.calls)
+	}
+}
+
+// An upstream that does not have a file something imports. The error must
+// name both the missing file and who wanted it.
+func TestClosureMissingDependencyNamesTheImporter(t *testing.T) {
+	f := &fakeFetcher{
+		services: []string{"a.A"},
+		symbols:  map[string][]string{"a.A": {"a.proto"}},
+		files: map[string]*descriptorpb.FileDescriptorProto{
+			"a.proto": file("a.proto", "gone.proto"),
+		},
+	}
+	_, err := Closure(context.Background(), f)
+	if err == nil {
+		t.Fatal("Closure succeeded, want an error naming the missing dependency")
+	}
+	for _, want := range []string{"gone.proto", "a.proto"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not name %q", err, want)
+		}
+	}
+}
+
+// conflictFetcher answers two services with two different definitions of one
+// filename — something fakeFetcher's single files map cannot express.
+type conflictFetcher struct {
+	first, second *descriptorpb.FileDescriptorProto
+}
+
+func (c *conflictFetcher) ListServices(context.Context) ([]string, error) {
+	return []string{"a.A", "b.B"}, nil
+}
+
+func (c *conflictFetcher) FileContainingSymbol(_ context.Context, sym string) ([][]byte, error) {
+	fd := c.first
+	if sym == "b.B" {
+		fd = c.second
+	}
+	raw, err := proto.Marshal(fd)
+	if err != nil {
+		return nil, err
+	}
+	return [][]byte{raw}, nil
+}
+
+func (c *conflictFetcher) FileByFilename(context.Context, string) ([][]byte, error) {
+	return nil, nil
+}
+
+// Two different definitions of one path from one server.
+func TestClosureConflictingDefinitionsAreAnError(t *testing.T) {
+	conflicting := file("dup.proto")
+	conflicting.Package = proto.String("second")
+	_, err := Closure(context.Background(), &conflictFetcher{
+		first:  file("dup.proto"),
+		second: conflicting,
+	})
+	if err == nil {
+		t.Fatal("Closure succeeded, want an error naming the conflicting file")
+	}
+	if !strings.Contains(err.Error(), "dup.proto") {
+		t.Fatalf("error %q does not name the conflicting file", err)
+	}
+}
+
+// Proto forbids circular imports, so this can only come from a broken
+// upstream — but it must be reported rather than recursed into forever.
+func TestClosureDetectsAnImportCycle(t *testing.T) {
+	f := &fakeFetcher{
+		services: []string{"a.A"},
+		symbols:  map[string][]string{"a.A": {"a.proto", "b.proto"}},
+		files: map[string]*descriptorpb.FileDescriptorProto{
+			"a.proto": file("a.proto", "b.proto"),
+			"b.proto": file("b.proto", "a.proto"),
+		},
+	}
+	_, err := Closure(context.Background(), f)
+	if err == nil {
+		t.Fatal("Closure succeeded on a cyclic import graph, want an error")
+	}
+	if !strings.Contains(err.Error(), "cycle") {
+		t.Fatalf("error %q does not report a cycle", err)
+	}
+}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `go test ./internal/schema/upstream/ -run TestClosure -v -count=1 -timeout 60s`
+Expected: the two Task 1 tests PASS; the five new ones FAIL. Specifically:
+- `TestClosureFetchesDependenciesTheUpstreamWithheld` — `the upstream did not provide "ts.proto"`
+- `TestClosureFetchesADiamondDependencyOnce` — same shape, `shared.proto`
+- `TestClosureMissingDependencyNamesTheImporter` — fails the "names the importer" assertion (the Task 1 message names only the missing file)
+- `TestClosureConflictingDefinitionsAreAnError` — `Closure succeeded`
+- `TestClosureDetectsAnImportCycle` — **stack overflow or timeout**, not a clean failure. That is the bug this task fixes.
+
+- [ ] **Step 3: Add conflict detection to `absorb`**
+
+Replace `absorb` in `internal/schema/upstream/closure.go`, and add an `importer` field to the `closure` struct:
+
+```go
 // closure is the walk's mutable state.
 type closure struct {
 	f      Fetcher
@@ -347,7 +613,25 @@ func (c *closure) absorb(raw [][]byte) error {
 	}
 	return nil
 }
+```
 
+Update the constructor in `Closure` to initialize the new maps:
+
+```go
+	c := &closure{
+		f:        f,
+		byName:   map[string]*descriptorpb.FileDescriptorProto{},
+		importer: map[string]string{},
+		done:     map[string]bool{},
+		visiting: map[string]bool{},
+	}
+```
+
+- [ ] **Step 4: Add the dependency recursion**
+
+Add `resolve` to `internal/schema/upstream/closure.go`:
+
+```go
 // resolve fetches dependencies the upstream did not volunteer, until the set
 // is closed. Against grpc-go this usually does nothing (F4).
 func (c *closure) resolve(ctx context.Context) error {
@@ -386,23 +670,22 @@ func (c *closure) resolve(ctx context.Context) error {
 		}
 	}
 }
+```
 
-// emitAll walks every absorbed file in sorted order, emitting dependencies
-// first.
-func (c *closure) emitAll() (*descriptorpb.FileDescriptorSet, error) {
-	roots := make([]string, 0, len(c.byName))
-	for name := range c.byName {
-		roots = append(roots, name)
-	}
-	sort.Strings(roots)
-	for _, name := range roots {
-		if err := c.emit(name, nil); err != nil {
-			return nil, err
-		}
-	}
-	return &descriptorpb.FileDescriptorSet{File: c.out}, nil
-}
+Call it from `Closure`, between the service loop and `emitAll`:
 
+```go
+	if err := c.resolve(ctx); err != nil {
+		return nil, err
+	}
+	return c.emitAll()
+```
+
+- [ ] **Step 5: Add the cycle guard**
+
+Replace `emit` in `internal/schema/upstream/closure.go`. It now carries the path that reached this file, so the error can show the cycle:
+
+```go
 // emit is the post-order DFS. Proto forbids circular imports, so a cycle
 // means a broken upstream; without the visiting guard this would recurse
 // until the stack gave out instead of saying so.
@@ -431,207 +714,20 @@ func (c *closure) emit(name string, stack []string) error {
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+Update the call in `emitAll` to `c.emit(name, nil)`, and add `"strings"` to the file's import block.
 
-Run: `go test ./internal/schema/upstream/ -run TestClosure -v -count=1`
-Expected: PASS — both `TestClosureEmitsDependenciesBeforeDependents` and `TestClosureSkipsServicesTheDataPlaneImplements`.
+> Note the error text changed: after `resolve`, every dependency is present, so an absent file in `emit` is an internal invariant failure rather than a user-facing missing-dependency report. `resolve` owns that message now, which is what `TestClosureMissingDependencyNamesTheImporter` asserts.
 
-- [ ] **Step 5: Mutation check**
+- [ ] **Step 6: Run the tests to verify they pass**
 
-Confirm the ordering test discriminates. Temporarily replace the body of `emit`'s dependency loop with nothing (emit files without recursing into dependencies first):
+Run: `go test ./internal/schema/upstream/ -run TestClosure -v -count=1 -timeout 60s`
+Expected: PASS — all seven `TestClosure*` tests.
 
-```go
-	// MUTATION: skip the dependency recursion
-	// for _, dep := range fd.GetDependency() { ... }
-```
+- [ ] **Step 7: Mutation checks**
 
-Run: `go test ./internal/schema/upstream/ -run TestClosureEmitsDependenciesBeforeDependents -count=1`
-Expected: FAIL with `got [order.proto ts.proto], want [ts.proto order.proto]`. **Revert the mutation** and re-run to confirm PASS.
+Two, each run separately. Revert each before starting the next.
 
-- [ ] **Step 6: Commit**
-
-```bash
-git add internal/schema/upstream/closure.go internal/schema/upstream/closure_test.go
-git commit -m "feat(upstream): topologically ordered descriptor closure with a skip rule"
-```
-
----
-
-### Task 2: Closure robustness — recursion, diamonds, conflicts, cycles
-
-**Files:**
-- Modify: `internal/schema/upstream/closure_test.go` (append tests; `closure.go` already implements this — these tests pin behavior the implementation has but nothing yet proves)
-
-**Interfaces:**
-- Consumes: `Closure`, `Fetcher`, `fakeFetcher`, `file`, `names` from Task 1.
-- Produces: nothing new.
-
-> **Note for the implementer:** Task 1's implementation already contains the recursion, conflict detection and cycle guard — writing them separately would have meant a half-working `Closure` on `main`. This task is where they get proven. If any test here fails, the bug is in Task 1's code and belongs fixed here.
-
-- [ ] **Step 1: Write the failing tests**
-
-Append to `internal/schema/upstream/closure_test.go`:
-
-```go
-// An upstream that returns only the named file, never its dependencies —
-// the opposite of grpc-go's behavior (F4), and the reason the recursion exists.
-func TestClosureFetchesDependenciesTheUpstreamWithheld(t *testing.T) {
-	f := &fakeFetcher{
-		services: []string{"shop.v1.OrderService"},
-		symbols:  map[string][]string{"shop.v1.OrderService": {"order.proto"}},
-		files: map[string]*descriptorpb.FileDescriptorProto{
-			"order.proto": file("order.proto", "ts.proto"),
-			"ts.proto":    file("ts.proto", "base.proto"),
-			"base.proto":  file("base.proto"),
-		},
-	}
-	set, err := Closure(context.Background(), f)
-	if err != nil {
-		t.Fatalf("Closure: %v", err)
-	}
-	got := names(set)
-	want := []string{"base.proto", "ts.proto", "order.proto"}
-	for i := range want {
-		if i >= len(got) || got[i] != want[i] {
-			t.Fatalf("got %v, want %v", got, want)
-		}
-	}
-}
-
-// A diamond: two files importing one shared dependency. It must be fetched
-// once and emitted once.
-func TestClosureFetchesADiamondDependencyOnce(t *testing.T) {
-	f := &fakeFetcher{
-		services: []string{"a.A", "b.B"},
-		symbols: map[string][]string{
-			"a.A": {"a.proto"},
-			"b.B": {"b.proto"},
-		},
-		files: map[string]*descriptorpb.FileDescriptorProto{
-			"a.proto":      file("a.proto", "shared.proto"),
-			"b.proto":      file("b.proto", "shared.proto"),
-			"shared.proto": file("shared.proto"),
-		},
-	}
-	set, err := Closure(context.Background(), f)
-	if err != nil {
-		t.Fatalf("Closure: %v", err)
-	}
-	var shared int
-	for _, n := range names(set) {
-		if n == "shared.proto" {
-			shared++
-		}
-	}
-	if shared != 1 {
-		t.Fatalf("shared.proto emitted %d times, want 1; got %v", shared, names(set))
-	}
-	var fetches int
-	for _, c := range f.calls {
-		if c == "shared.proto" {
-			fetches++
-		}
-	}
-	if fetches > 1 {
-		t.Fatalf("shared.proto fetched %d times, want at most 1 (calls: %v)", fetches, f.calls)
-	}
-}
-
-// An upstream that does not have a file something imports. The error must
-// name both the missing file and who wanted it.
-func TestClosureMissingDependencyNamesTheImporter(t *testing.T) {
-	f := &fakeFetcher{
-		services: []string{"a.A"},
-		symbols:  map[string][]string{"a.A": {"a.proto"}},
-		files: map[string]*descriptorpb.FileDescriptorProto{
-			"a.proto": file("a.proto", "gone.proto"),
-		},
-	}
-	_, err := Closure(context.Background(), f)
-	if err == nil {
-		t.Fatal("Closure succeeded, want an error naming the missing dependency")
-	}
-	for _, want := range []string{"gone.proto", "a.proto"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("error %q does not name %q", err, want)
-		}
-	}
-}
-
-// Two different definitions of one path from one server.
-func TestClosureConflictingDefinitionsAreAnError(t *testing.T) {
-	conflicting := file("dup.proto")
-	conflicting.Package = proto.String("second")
-	f := &conflictFetcher{
-		first:  file("dup.proto"),
-		second: conflicting,
-	}
-	_, err := Closure(context.Background(), f)
-	if err == nil {
-		t.Fatal("Closure succeeded, want an error naming the conflicting file")
-	}
-	if !strings.Contains(err.Error(), "dup.proto") {
-		t.Fatalf("error %q does not name the conflicting file", err)
-	}
-}
-
-// conflictFetcher answers two services with two different definitions of one
-// filename — something fakeFetcher's single files map cannot express.
-type conflictFetcher struct {
-	first, second *descriptorpb.FileDescriptorProto
-}
-
-func (c *conflictFetcher) ListServices(context.Context) ([]string, error) {
-	return []string{"a.A", "b.B"}, nil
-}
-
-func (c *conflictFetcher) FileContainingSymbol(_ context.Context, sym string) ([][]byte, error) {
-	fd := c.first
-	if sym == "b.B" {
-		fd = c.second
-	}
-	raw, err := proto.Marshal(fd)
-	if err != nil {
-		return nil, err
-	}
-	return [][]byte{raw}, nil
-}
-
-func (c *conflictFetcher) FileByFilename(context.Context, string) ([][]byte, error) {
-	return nil, nil
-}
-
-// Proto forbids circular imports, so this can only come from a broken
-// upstream — but it must be reported rather than recursed into forever.
-func TestClosureDetectsAnImportCycle(t *testing.T) {
-	f := &fakeFetcher{
-		services: []string{"a.A"},
-		symbols:  map[string][]string{"a.A": {"a.proto", "b.proto"}},
-		files: map[string]*descriptorpb.FileDescriptorProto{
-			"a.proto": file("a.proto", "b.proto"),
-			"b.proto": file("b.proto", "a.proto"),
-		},
-	}
-	_, err := Closure(context.Background(), f)
-	if err == nil {
-		t.Fatal("Closure succeeded on a cyclic import graph, want an error")
-	}
-	if !strings.Contains(err.Error(), "cycle") {
-		t.Fatalf("error %q does not report a cycle", err)
-	}
-}
-```
-
-Add `"strings"` to the test file's import block.
-
-- [ ] **Step 2: Run the tests**
-
-Run: `go test ./internal/schema/upstream/ -run TestClosure -v -count=1`
-Expected: PASS for all seven `TestClosure*` tests. If `TestClosureDetectsAnImportCycle` instead hangs or panics with a stack overflow, the `visiting` guard in `emit` is wrong — fix it here.
-
-- [ ] **Step 3: Mutation check**
-
-Confirm the cycle test discriminates. Temporarily remove the guard in `emit`:
+**7a — the cycle guard.** Comment out the guard in `emit`:
 
 ```go
 	// MUTATION: drop the cycle guard
@@ -639,18 +735,30 @@ Confirm the cycle test discriminates. Temporarily remove the guard in `emit`:
 ```
 
 Run: `go test ./internal/schema/upstream/ -run TestClosureDetectsAnImportCycle -count=1 -timeout 30s`
-Expected: FAIL — a stack overflow or timeout, not a clean pass. **Revert the mutation** and re-run to confirm PASS.
+Expected: FAIL — a stack overflow or a timeout, not a clean pass. **Revert.**
 
-- [ ] **Step 4: Run the whole package under the race detector**
+**7b — conflict detection.** Replace the `proto.Equal` check in `absorb` with an unconditional `continue`:
+
+```go
+		if _, ok := c.byName[name]; ok {
+			// MUTATION: accept whichever definition arrived first
+			continue
+		}
+```
+
+Run: `go test ./internal/schema/upstream/ -run TestClosureConflictingDefinitionsAreAnError -count=1`
+Expected: FAIL with `Closure succeeded, want an error naming the conflicting file`. **Revert** and re-run the full `TestClosure` set to confirm PASS.
+
+- [ ] **Step 8: Run the whole package under the race detector**
 
 Run: `go test ./internal/schema/upstream/ -race -count=1`
 Expected: PASS, no race reports.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-git add internal/schema/upstream/closure_test.go
-git commit -m "test(upstream): pin closure recursion, diamonds, conflicts and cycles"
+git add internal/schema/upstream/closure.go internal/schema/upstream/closure_test.go
+git commit -m "feat(upstream): resolve withheld dependencies, reject conflicts, detect cycles"
 ```
 
 ---
