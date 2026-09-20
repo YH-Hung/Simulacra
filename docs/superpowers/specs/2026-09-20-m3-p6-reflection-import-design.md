@@ -55,10 +55,11 @@ since deleted. Each decision below that depends on one cites it.
 | # | Fact | Why it matters |
 |---|---|---|
 | **F1** | A `grpc.ClientConn.NewStream` to `/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo` carrying **`grpc_reflection_v1` Go message types** works against a v1alpha-only server. Probed against a stock grpc-go server with only `reflection.NewServer(opts)` registered; `ListServices` decoded correctly. | One transport implementation covers both versions (§5). The two protos are wire-identical by construction — v1 was copied from v1alpha and both are frozen. |
-| **F2** | `Unimplemented` surfaces at **`RecvMsg`**, not at `NewStream` and not at `SendMsg`. Against a server with no reflection registered: `NewStream` → nil, `SendMsg` → nil, `RecvMsg` → `code = Unimplemented desc = unknown service grpc.reflection.v1.ServerReflection`. | The version fallback cannot live in a constructor. It belongs at the first `Recv` (§5). |
+| **F2** | `Unimplemented` surfaces at **`RecvMsg`** — never at `NewStream`, and **not reliably at `SendMsg`**. Against a v1alpha-only server on the v1 path, `SendMsg` is *timing-dependent*: probed at three delays between `NewStream` and `SendMsg`, `0s` → `SendMsg` = nil, `50ms` and `250ms` → `SendMsg` = **`io.EOF`**. `RecvMsg` returned `Unimplemented` in all three. This matches grpc-go's documented `SendMsg` contract: `io.EOF` means the stream is done and the real status must be read with `RecvMsg`. | The version fallback cannot live in a constructor, and it cannot treat a send error as fatal. It belongs at the first `Recv` (§5). |
 | **F3** | Simulacra's own data plane registers **both** v1 (`reflection.NewServerV1`) and v1alpha (`reflection.NewServer`) — `internal/dataplane/server.go:60-61`. The v1 path wins. | The v1alpha fallback is **unreachable** against our own server. It needs a dedicated v1alpha-only test server (§6). |
 | **F4** | grpc-go's reflection returns the **transitive closure in one response**: `FileContainingSymbol("shop.v1.OrderService")` against Simulacra returned 3 files — `shop/v1/order.proto` plus both of its well-known-type imports. This is grpc-go behavior, not a protocol guarantee. | Against grpc-go upstreams the common case is one round trip per service. The dependency recursion is a correctness safety net for other implementations, not the primary path (§4). |
 | **F5** | A stock grpc-go server advertises its own reflection services in `ListServices` (`grpc.reflection.v1alpha.ServerReflection` appeared in the probe). **Simulacra does not** — its custom `ServiceInfoProvider` (`internal/dataplane/server.go:65`) lists registry services plus health only. | The skip list (§4) is needed for real upstreams, and its test **cannot** use Simulacra as the upstream. It needs a stock grpc-go server (§6). |
+| **F6** | Importing an upstream `grpc/health/v1/health.proto` that differs from ours **fails the whole registration**. Reproduced: our compiled-in health exposes `Check`, `List`, `Watch`; a simulated upstream missing one RPC produced `file "grpc/health/v1/health.proto" is already registered with different content` from `RegisterSet`, rejecting the entire set. `List` is a recent grpc-go addition, so older or non-Go upstreams hit this routinely. | Health must be skipped as an import root (§4), not kept as "legitimate to mock". |
 
 ## 4. The closure algorithm
 
@@ -93,12 +94,27 @@ Four decisions inside it:
   self-contained; build with 'buf build -o' or 'protoc --include_imports'"* — an imported set feeds straight into `schema register`.
 - **Cycle guard.** Proto forbids circular imports, so a cycle means a broken upstream. An unguarded DFS
   would hang instead of saying so; a `visiting` set turns it into a named error.
-- **Skip `grpc.reflection.v1.ServerReflection` and `grpc.reflection.v1alpha.ServerReflection`.** They
-  describe the transport, not the API under test. Health is **not** skipped — mocking health is
-  legitimate. Importing reflection into a mock is not a crash (our data plane registers the real
-  reflection service ahead of `UnknownServiceHandler`, so a mocked one is merely shadowed) but it is
-  noise in every `schema list` thereafter. Skipping at service enumeration is sufficient: the reflection
-  files are not dependencies of user services.
+- **Skip every service the data plane implements itself** — `grpc.reflection.v1.ServerReflection`,
+  `grpc.reflection.v1alpha.ServerReflection`, and `grpc.health.v1.Health`. This is a rule, not a list:
+  all three are registered on our `grpc.Server` ahead of `UnknownServiceHandler`
+  (`internal/dataplane/server.go:44-61`), so a stub for any of them is unreachable — **importing them
+  cannot enable mocking them.** They describe the transport and the container contract, not the API
+  under test.
+
+  Health additionally *breaks the import outright* (F6). Our data plane pre-registers its own
+  compiled-in `grpc/health/v1/health.proto` (`internal/dataplane/server.go:51`), and `RegisterSet`
+  rejects a same-path file whose content differs (`internal/schema/registry.go:349`). Because
+  registration is all-or-nothing, one upstream health descriptor that disagrees with ours — an older
+  grpc-go, or any non-Go implementation — fails **the entire set**, and the error names a service the
+  user never asked to import.
+
+  Skipping at service enumeration is what this design does; it is sufficient for the real case, because
+  no ordinary service proto imports health or reflection. **A known limitation, deliberately not solved
+  here:** should `health.proto` arrive as a genuine *transitive dependency* of a user's service, it will
+  still collide on register. Filtering it out of the emitted set is not the answer — that would produce
+  a non-self-contained set, which `RegisterSchemas` rejects for a different reason. The underlying
+  tension is that Simulacra can never accept any health descriptor but its own; that is a registry
+  compatibility policy question, out of scope for this phase (§9).
 - **Conflicting bytes for one filename → error naming the file.** Mirrors `mergeDescriptorSets`
   (`internal/cli/schema.go`). One server returning two definitions of one file is a server bug; saying so
   is more useful than silently keeping the first, even though the user cannot fix the upstream.
@@ -115,6 +131,16 @@ selects the path string. There are no v1alpha Go types in this codebase and no a
 returns `codes.Unimplemented`, discard that stream, open a new one on the v1alpha path, and replay the
 request. Subsequent failures are real errors. The version is decided once per import and cached for the
 rest of the walk.
+
+**A send-side `io.EOF` is not a failure (F2).** The send and the rejection race, so the fallback must be
+driven entirely by the receive side:
+
+- `SendMsg` returning `io.EOF` means *the stream is already done* — it carries no status of its own.
+  Proceed to `RecvMsg` and let the terminal status decide, exactly as if the send had succeeded.
+- Any other `SendMsg` error is a real transport failure and is returned.
+
+Returning on a non-nil `SendMsg` — the obvious way to write it — would surface a bare `io.EOF` to the
+user and skip the fallback entirely against precisely the servers the fallback exists for.
 
 **Transport security.** TLS with system roots by default, since "point at staging" is normally TLS.
 `--plaintext` opts out, and is what the dogfood test and any localhost use needs.
@@ -144,8 +170,22 @@ ran and did not hold".
 **Signal and write ordering.** Per the phase 5 plan's amendment 11 (`docs/superpowers/plans/2026-09-13-m3-p5-cli-client-commands.md`)
 — *establish the signal context and finish local validation before the first side effect* — `signalContext` is installed before dialing and before any
 file is created. The set is buffered in memory (descriptor sets are KBs to low MBs), written to a temp
-file in the destination directory, and `os.Rename`d into place. An interrupt or a mid-walk failure
-therefore never leaves a truncated `schema.binpb` behind, and never clobbers a good existing one.
+file in the destination directory, and `os.Rename`d into place.
+
+**The rename is the commit boundary, and it is not context-aware.** `os.Rename` takes no `context` and
+will happily publish after the walk's context has been cancelled, so atomic replacement alone does *not*
+give cancellation safety. The sequence is therefore explicit:
+
+1. Walk the upstream and buffer the complete set. Any failure here returns before a file exists.
+2. Create the temp file in the destination's directory, `defer os.Remove(tmp)` — a no-op after a
+   successful rename, and the cleanup path for every failure after this point.
+3. Write and `Sync` the temp file.
+4. **Check `ctx.Err()` immediately before `os.Rename`.** Non-nil → return `errInterrupted`, leaving the
+   destination untouched.
+5. `os.Rename`. Past this line the import has succeeded and a later signal cannot unpublish it.
+
+An interrupt at any point therefore leaves the destination byte-identical to what it was, with no temp
+file behind — including the case where the interrupt lands *after* the walk finished.
 
 **Output.** A summary line to stdout via `newPayloadWriter` (matching `register`): `imported 3 file(s)
 from 1 service(s) → schema.binpb`. `--output json` renders `{files, services, bytes, path}` for CI,
@@ -166,9 +206,12 @@ using the existing `outputFlag`/`writeJSON` helpers.
 | `Closure` (fake fetcher, no server) | Diamond dependency fetched once; missing dependency errors naming both the file and its importer; conflicting bytes for one filename errors naming the file; cycle detected rather than hung; topological order asserted; reflection services skipped |
 | Transport, v1 | Against Simulacra's own data plane (F3: the v1 path is what it exercises) |
 | Transport, v1alpha fallback | **Requires a dedicated server** — a stock grpc-go server with only `reflection.NewServer(opts)` registered, because F3 makes the fallback unreachable against ourselves |
-| Skip list | **Requires a stock grpc-go server** as the upstream, because per F5 Simulacra does not advertise its own reflection services and so cannot discriminate this test |
-| Dogfood round-trip (M3 §12) | Boot `server.Start` with `testdata/protos`; import from its data plane; register the result into a **second** fresh server; assert `schema list` output matches across both. States "registry in → identical descriptor set out" as an observable equality rather than a byte comparison |
-| CLI | Missing `--reflect`/`-o`; unreachable upstream → exit 2; interrupt mid-walk → exit 2 **and no file at the destination**; `--output json` shape; existing `schema.binpb` survives a failed import |
+| Skip list, reflection half | **Requires a stock grpc-go server** as the upstream. Per F5 Simulacra does not advertise its own reflection services, so against ourselves this test would pass whether or not the skip exists. (The *health* half is discriminating against Simulacra, which does advertise health — but it is the F6 row below that proves it matters.) |
+| Dogfood round-trip (M3 §12) | Boot `server.Start` with `testdata/protos`; import from its data plane; register the result into a **second** fresh server. **Two assertions, because one is not enough:** (1) `schema list` matches across both — a cheap smoke test; (2) **descriptors compared semantically, per filename**. `schema list` renders only service names, method names, input/output *type names* and streaming flags (`internal/cli/schema.go`) — it omits message fields, enum values and options entirely, so an import that dropped every field of every message would leave both listings identical and register successfully. Only the descriptor comparison establishes "registry in → identical descriptor set out" |
+| Descriptor comparison policy | The comparison reuses the registry's existing normalization, `normalizeFileProto` (`internal/schema/registry.go:398`): source-code-info and buf's image extension stripped, nothing else. Its stated principle governs any addition — *"Descriptor meaning may not be touched here: loosening equivalence must never mask a real conflict."* Each further normalization must be justified in the plan and named in the test, never added to make a failure go away |
+| Health skip (F6) | Import from an upstream whose `health.proto` **differs from our compiled-in one** (drop an RPC, as the F6 probe did) and assert the result registers cleanly into a fresh Simulacra. Without the skip this fails, naming health |
+| `SendMsg` io.EOF ordering (F2) | Against a v1alpha-only server, force the rejection to arrive **before** the send by delaying between `NewStream` and `SendMsg` (50ms reproduced it deterministically); assert the fallback still runs and the import succeeds |
+| CLI | Missing `--reflect`/`-o`; unreachable upstream → exit 2; interrupt mid-walk → exit 2 **and no file at the destination**; **interrupt after the walk completes, with an existing destination file** → exit 2, destination byte-identical, no temp file left (the §6 step-4 check); `--output json` shape |
 
 ## 9. Risks
 
@@ -177,3 +220,4 @@ using the existing `outputFlag`/`writeJSON` helpers.
 | v1/v1alpha wire-compatibility assumption (F1) silently breaks | Both protos are frozen; F1 probes the actual behavior rather than assuming it. The v1alpha fallback test would fail loudly if it regressed. |
 | An upstream returns a partial closure that our recursion cannot complete | The missing-dependency error names the file and its importer, so the diagnostic points at the upstream's bug rather than ours. |
 | Imported sets bloat with an upstream's entire service surface | Out of scope by design — `ListServices` is the unit of import. A `--service` filter is a natural follow-up alongside D2. |
+| **Simulacra cannot accept any health descriptor but its own** (F6). Skipping health as an import root covers the real case, but not health arriving as a transitive dependency of a user's service. | Out of scope here: the fix is a registry-level compatibility policy (treat a pre-registered well-known file as satisfied when the incoming one is compatible rather than byte-equal), which touches `internal/schema` and the admin contract. Recorded so the next person meeting this error knows it is known, and where it belongs. Post-M3. |
