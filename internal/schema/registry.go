@@ -404,6 +404,15 @@ func normalizeFileProto(fdp *descriptorpb.FileDescriptorProto) *descriptorpb.Fil
 	return clone
 }
 
+// NormalizeFileProto exposes the registry's file-equality policy: two
+// same-path descriptors are the same file when their normalized forms are
+// equal. Importers and tests that need to compare descriptors against what
+// the registry would accept must use this rather than fork the policy --
+// the surgical scope documented on normalizeFileProto is the contract.
+func NormalizeFileProto(fdp *descriptorpb.FileDescriptorProto) *descriptorpb.FileDescriptorProto {
+	return normalizeFileProto(fdp)
+}
+
 // dropUnknownField removes every occurrence of one field number from a raw
 // unknown-fields buffer, preserving every other unknown field byte-for-byte.
 // A malformed buffer is returned untouched: refusing to interpret it is

@@ -19,7 +19,14 @@
 - **Server and upstream diagnostics are surfaced verbatim.** A command may prefix its own source but never rewords or re-classifies what the upstream said (design §6, M3 §11).
 - **Every test that discriminates carries a named mutation check** — state the mutation, confirm the test fails under it, revert. Carried over from the phase 5 plan's global constraints.
 - **Run the full suite with `-count=1`.** Go's test cache will otherwise hide a real regression.
-- **No `time.Sleep` to establish an assertion's ordering.** Synchronize on something real: this phase's one ordering-sensitive assertion has a rendezvous (F7). A sleep that only widens the window a test exercises — where every possible interleaving must produce the same asserted outcome — is permitted, and must say so at its use site.
+- **No `time.Sleep` to establish ordering a test's assertion depends on.** Synchronize on something real.
+  **Executing Task 6 proved this constraint's earlier carve-out wrong and it has been withdrawn.** The
+  carve-out permitted a sleep that "only widens the window," on the reasoning that every interleaving
+  would still produce the asserted outcome. For a signal test that is false: there is a window *before
+  the child installs its signal handler* in which the signal kills it by the default disposition, and
+  `exec` then reports **exit status -1**, not the asserted 2. Both subtests failed deterministically on
+  a cold build. A subprocess signal test therefore needs a real readiness proof — see Task 6, and
+  `internal/cli/signal_test.go:127`, where phase 5 recorded the same lesson for the tail tests.
 
 ---
 
@@ -1899,7 +1906,19 @@ func TestSchemaImportInterruptedExitsTwoAndPreservesDestination(t *testing.T) {
 }
 ```
 
-> **On the `time.Sleep` here:** this one is permitted by the global constraint because it does not establish the *assertion's* ordering — the test passes whether the signal lands during the dial, the walk, or the write, since every one of those paths must exit 2 and preserve the destination. It only makes the test exercise the interesting window. This is the same trade-off `signal_test.go` already documents.
+> **Readiness, not a sleep.** An earlier draft slept 300ms before signalling, justified as merely widening
+> the window. That was wrong and the test failed deterministically on a cold build with `exit status -1`
+> — the signal arriving before `signalContext` was installed, so the child died by the default
+> disposition. Use `acceptedUpstream(t)` instead: a listener that never answers but closes a channel on
+> its first accept. `schema import` installs its signal context *before* it dials, and `grpc.NewClient`
+> connects lazily, so an accepted TCP connection proves the handler is already in place. This mirrors
+> `waitForTailedCall` (`internal/cli/signal_test.go:127`), which replaced the same guess for the tail tests.
+>
+> **The destination-preserved and no-temp-file assertions here are belt-and-braces, not load-bearing.**
+> The upstream never answers, so the walk never completes and `publish` is never reached — they cannot
+> fail in this test. The commit boundary's real coverage is Task 5's
+> `TestPublishRefusesToRenameAfterCancellation`. Say so in a comment so a later reader does not
+> mistake them for proof.
 
 - [ ] **Step 2: Run the tests**
 
@@ -2162,11 +2181,11 @@ Run before declaring the phase done. Every command must pass; paste real output 
 - [ ] Manual smoke against a real binary:
 
 ```bash
-go build -o /tmp/simulacra . && /tmp/simulacra serve --proto testdata/protos &
+go build -o /tmp/simulacra ./cmd/simulacra && /tmp/simulacra serve --proto testdata/protos --listen 127.0.0.1:7565 --admin 127.0.0.1:7566 &
 ```
 
 ```bash
-/tmp/simulacra schema import --reflect localhost:6565 --plaintext -o /tmp/schema.binpb && /tmp/simulacra schema register -f /tmp/schema.binpb
+/tmp/simulacra schema import --reflect 127.0.0.1:7565 --plaintext -o /tmp/schema.binpb && /tmp/simulacra schema register --addr 127.0.0.1:7566 -f /tmp/schema.binpb
 ```
 
 Expected: the import reports the files it wrote; the register reports `0 new file(s)` against the same server (they are already registered) and exits 0.

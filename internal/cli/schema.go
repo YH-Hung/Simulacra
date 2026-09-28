@@ -20,7 +20,7 @@ func newSchemaCmdWithClient(newClient clientFactory) *cobra.Command {
 		Use:   "schema",
 		Short: "Inspect and register the descriptors a running server serves",
 	}
-	cmd.AddCommand(newSchemaRegisterCmd(newClient), newSchemaListCmd(newClient))
+	cmd.AddCommand(newSchemaRegisterCmd(newClient), newSchemaListCmd(newClient), newSchemaImportCmd())
 	return cmd
 }
 
