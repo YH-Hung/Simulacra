@@ -53,7 +53,7 @@ contradicted:
 Two types, one package:
 
 - **`Client`** talks only to a running server's admin API. It holds an admin address, a data address,
-  and the five generated connect clients. `simulacratest.Connect(adminAddr, dataAddr string) *Client`
+  and the five generated connect clients. `simulacratest.Connect(t, adminAddr, dataAddr string) *Client`
   builds one. The data address is explicit, not read from `GetServerInfo`: in a container (phase 8),
   the server reports its in-container address, not the mapped port the test must dial. `Connect` gives
   an external-server mode now, and it is the type `simulacratc` will return in phase 8.
@@ -66,9 +66,11 @@ touches the store, registry, or journal directly; it exercises the same surface 
 SDK, and `curl`.
 
 **Transport.** A connect-go client over plain HTTP/1.1, as the CLI does (`internal/cli/client.go`) —
-no h2c client-side. Each `Client` owns its `http.Transport`; `Server`'s cleanup calls
-`CloseIdleConnections` so a suite of hundreds of tests does not accumulate idle connections to
-servers that no longer exist.
+no h2c client-side. Each `Client` owns its `http.Transport`, so each `Client` must release it. Every
+constructor that acquires a resource takes `t`, as `Dial` does: `Connect(t, adminAddr, dataAddr)`
+registers `t.Cleanup(transport.CloseIdleConnections)`. `Start` builds its `Client` through the same
+constructor and so gets the same cleanup, and phase 8's `simulacratc` will too. A suite of hundreds of
+tests therefore accumulates no idle connections, whether its servers are in-process or external.
 
 **`t` is passed to each call that does I/O, not captured at `Start`.** A server started in a parent
 test is routinely used inside `t.Run` subtests. `FailNow` must run on the goroutine of the test that
@@ -76,17 +78,26 @@ is failing, so a `t` captured at `Start` would fail the wrong test, from the wro
 are plain values; only their terminal call takes `t`. Every method accepts `testing.TB`, so benchmarks
 work too.
 
-**Contexts.** Each RPC runs under `t.Context()` (Go 1.24+; the module is on 1.25), so a cancelled
-test cancels its calls. Cleanup is the exception: `t.Context()` is already cancelled when cleanups run,
-so `Start`'s cleanup calls `Shutdown` with its own 10-second context — above the server's 6-second
-worst-case teardown (`shutdownGrace` 5s + `dataGraceFloor` 1s, `server/server.go`); the watcher join
-that bound excludes does not apply, because `Start` passes `Watch: false` — and reports a failure with
-`t.Errorf`. A `Shutdown` that hits the 10-second context escalates to a hard stop, so cleanup always
-returns.
+**Contexts: deliberately not `t.Context()`.** `t.Context()` is "canceled just before
+Cleanup-registered functions are called" — and that is its *only* cancellation event. For a helper that
+runs synchronously it therefore buys nothing, and it breaks exactly the calls that belong in cleanup:
+`t.Cleanup(func() { sim.Verify(m).Exactly(t, 1) })`, or a shared server's `Reset`. Instead each admin
+RPC runs under `context.Background()` bounded by a per-call timeout of 30 seconds — the CLI's
+`defaultTimeout` (`internal/cli/client.go:26`), for the same reason: a server that accepts the
+connection and never answers must not hang the test until `go test -timeout`. A helper therefore works
+the same in a test body and in a cleanup function.
 
-**Cleanup order.** `Dial` registers its `conn.Close` after `Start` registered shutdown, and cleanups
-run last-in-first-out, so the test's client connections close before the server stops. Graceful
-shutdown never waits on the test's own connections.
+`Start`'s own cleanup calls `Shutdown` with a 10-second context — above the server's 6-second worst-case
+teardown (`shutdownGrace` 5s + `dataGraceFloor` 1s, `server/server.go`); the watcher join that bound
+excludes does not apply, because `Start` passes `Watch: false` — and reports a failure with `t.Errorf`.
+A `Shutdown` that hits the 10-second context escalates to a hard stop, so cleanup always returns.
+
+**Cleanup order.** Cleanups run last-in-first-out. `Start` registers shutdown, then its `Client`'s
+transport cleanup; `Dial` and any user cleanup registered after `Start` run **before** both. So the
+test's client connections close before the server stops, graceful shutdown never waits on them, and a
+verifying cleanup registered after `Start` runs against a live server. A cleanup registered *before*
+`Start` runs after the server is gone and fails with a transport error — the package doc says to
+register verifying cleanups after `Start`.
 
 ## 4. API surface
 
@@ -99,8 +110,8 @@ sim := simulacratest.Start(t,
     simulacratest.WithJournalSize(1024))             // default 1024, matching `serve`
 conn := sim.Dial(t)                                   // *grpc.ClientConn to the data plane
 
-// External server: same helpers, no lifecycle
-c := simulacratest.Connect("localhost:6566", "localhost:6565")
+// External server: same helpers, no server lifecycle; idle connections released on cleanup
+c := simulacratest.Connect(t, "localhost:6566", "localhost:6565")
 
 // Helpers on *Client (Server embeds it)
 c.DataAddr() string
@@ -174,18 +185,31 @@ Values are rendered the way the matcher's literal parser reads them (`literalFor
 
 ### `Respond(t, msg proto.Message)`
 
-1. Render `msg` with `protojson.MarshalOptions{UseProtoNames: true}` — field names as written in the
-   `.proto` (PROPOSAL §5), enums by name, 64-bit integers as strings, well-known types in their
-   natural forms. Presence is preserved: unset fields are omitted, set-to-default presence fields are
-   emitted.
-2. Set **`respond.literal: true`** (§8), so no string in the body is re-read as a template.
-3. Run the **round-trip guard**, then send.
+1. **Check the type against the RPC.** `msg`'s full name must equal the method's output type, taken
+   from the `ensure` cache (§6): the method descriptor's `Output()` when the service came from
+   `GlobalFiles`, otherwise `MethodInfo.output_type` from `ListServices` — a bare `FullName()`
+   (`internal/admin/schema.go:76`), so it compares directly. A mismatch is misuse:
+   `Respond: got shop.v1.GetOrderRequest, GetOrder returns shop.v1.GetOrderResponse`. Without this
+   check a wrong message whose fields happen to fit is accepted: `GetOrderRequest` and
+   `GetOrderResponse` both declare `string order_id = 1`, so a request holding only `order_id` renders
+   to JSON the server decodes into a `GetOrderResponse` without complaint, and the guard below —
+   which decodes into `msg`'s own type — cannot see it. When the method is unknown to both the server
+   and the test binary, the check is skipped; `CreateStub` fails `NOT_FOUND` regardless.
+2. Render `msg` with `protojson.MarshalOptions{UseProtoNames: true, Resolver: c.types}` — field names
+   as written in the `.proto` (PROPOSAL §5), enums by name, 64-bit integers as strings, well-known
+   types in their natural forms. Presence is preserved: unset fields are omitted, set-to-default
+   presence fields are emitted. `c.types` is the client's resolver (§6).
+3. Set **`respond.literal: true`** (§8), so no string in the body is re-read as a template.
+4. Run the **round-trip guard**, then send.
 
 **The round-trip guard** reproduces the server's decode path locally — `yaml.v3` into
-`map[string]any`, `encoding/json`, then `protojson.Unmarshal` into a fresh message of `msg`'s type
-(the path `stub.BuildMessage` takes, `internal/stub/stub.go:319`) — and compares the result with `msg`
-by **both** `proto.Equal` and deterministic-marshal bytes. `proto.Equal` alone is not enough: it
-compares floats with `==`, so it cannot see `-0.0` becoming `+0.0`.
+`map[string]any`, `encoding/json`, then `protojson.UnmarshalOptions{Resolver: c.types}` into a fresh
+message of `msg`'s type (the path `stub.BuildMessage` takes, `internal/stub/stub.go:319`) — and compares
+the result with `msg` by **both** `proto.Equal` and deterministic-marshal bytes. `proto.Equal` alone is
+not enough: it compares floats with `==`, so it cannot see `-0.0` becoming `+0.0`. The resolver
+matters: protojson's default is `GlobalTypes`, which does not hold extensions or `Any` payload types
+that exist only in files the test registered — `conformance.v1.ext_tag` decodes as an unknown field
+under the default and correctly under `c.types`.
 
 If the two differ, `Respond` refuses rather than install a response that differs from the one the test
 passed. The known case is **unknown fields**: protojson drops them silently and the grammar cannot carry
@@ -197,9 +221,10 @@ them. Any other loss the YAML hop introduces (F6) is caught the same way.
   server parses codes with `codes.Code.UnmarshalJSON` (`internal/stub/status.go:37`), which accepts
   that form and does not accept `codes.Code.String()`'s `FailedPrecondition` (F4).
 - **Message** is sent as-is. Status messages are never templated.
-- **Details** come from `st.Proto().Details`. Each `Any` is unpacked against `protoregistry.GlobalTypes`
-  and rendered as `{type: <full name>, value: <protojson>}`, each through the same round-trip guard.
-  A detail whose type is not linked into the test binary is refused, naming its type URL.
+- **Details** come from `st.Proto().Details`. Each `Any` is unpacked with
+  `anypb.UnmarshalNew(a, proto.UnmarshalOptions{Resolver: c.types})` and rendered as
+  `{type: <full name>, value: <protojson>}`, each through the same round-trip guard. A detail whose
+  type neither the test binary links nor the test registered is refused, naming its type URL.
 - An `OK` status is passed through, and the server's existing diagnostic ("status code OK is not
   allowed here") is what the test sees.
 
@@ -225,6 +250,26 @@ deduplicated by path, converts each with `protodesc.ToFileDescriptorProto`, and 
 walk shares nothing with phase 6's reflection `Closure`: it is a short DFS over in-memory descriptors
 with no fetcher.
 
+### The client's type resolver
+
+Registering a file on the server does not make its types resolvable **in the test process**:
+protojson and `proto.Unmarshal` resolve extensions and `Any` payloads through `GlobalTypes` by
+default, and a file the test built at run time — a `dynamicpb` schema, a descriptor set read from
+disk — is not there. So each `Client` keeps a local `protoregistry.Files` and the
+`dynamicpb.NewTypes` view over it, and `RegisterFiles` adds each file there as well as sending it.
+
+- **The caller's own descriptor instances** are registered, not re-parsed copies. A `dynamicpb`
+  message carries the descriptor it was built from, so its extension types must be built from that
+  same instance (F7).
+- **A path already present** locally is skipped, matching the server registry's
+  first-registration-wins rule for `AddFile` (`internal/schema/registry.go:162`).
+- **`c.types` resolves `GlobalTypes` first, then the local view.** Generated messages must get their
+  generated extension and payload types; the local view only fills in what the binary does not link.
+
+`c.types` is the resolver for everything the SDK serializes or captures: `Respond`'s rendering and
+round-trip guard (§5), `RespondStatus`'s detail unpacking (§5), and `Calls`' typed capture (§7).
+Files that `ensure` registers from `GlobalFiles` need no local entry; `GlobalTypes` already holds them.
+
 ### Automatic
 
 `Stub`, `StubYAML`, and `Verify` call `ensure(method)` before their RPC. `Calls` does not:
@@ -243,7 +288,9 @@ with no fetcher.
    registered"), passed through verbatim, followed by one SDK-sourced hint line naming `RegisterFiles`
    and `WithProtoDir`.
 
-The cache is mutex-guarded so parallel subtests sharing one server do not register twice.
+Each cache entry records the service's methods and their output types — from the method descriptors
+in step 3, from `ListServices`' `MethodInfo` in step 2 — which is what `Respond`'s type check reads
+(§5). The cache is mutex-guarded so parallel subtests sharing one server do not register twice.
 
 **Why step 2 exists.** A server provisioned with `WithProtoDir` or `WithDescriptorSet`, or an external
 server, may hold the same files compiled from source with representation differences — a vendored copy
@@ -306,8 +353,10 @@ calls[0].Proto() *adminv1.Call
   has wrapped, `Calls` returns what is retained.
 - **Typed capture is checked.** `Request` and `Response` require exactly one message — otherwise they
   fail, pointing at `Proto()` for streams — and compare `DecodedMessage.type_name` with the target's
-  full name before `proto.Unmarshal`. Unmarshalling into the wrong type usually "succeeds" with the
-  data in unknown fields: exactly the silent mock bug PROPOSAL §2 exists to rule out.
+  full name before unmarshalling. Unmarshalling into the wrong type usually "succeeds" with the data
+  in unknown fields: exactly the silent mock bug PROPOSAL §2 exists to rule out. They unmarshal with
+  `proto.UnmarshalOptions{Resolver: c.types}` (§6), so a registered extension lands in its extension
+  field rather than in unknown bytes.
 - **Metadata** merges `values` and `binary_values` back into grpc-go's `metadata.MD` form.
 
 ## 8. Core change: `respond.literal`
@@ -384,6 +433,7 @@ registers `0 new`.
 | Admin or transport error | `t.Fatalf`. The SDK adds only its own prefix (`simulacratest: CreateStub: `); the server's message passes through unchanged — P6's rule: never reword or reclassify an upstream diagnostic. |
 | Verification verdict | `t.Errorf`, return `false` (§7). |
 | Builder misuse | Collected; one `t.Fatalf` from the terminal call (§5). |
+| `Respond` message is not the method's output type | `t.Fatalf` naming both full names (§5, step 1). |
 | Round-trip guard mismatch | `t.Fatalf` naming the message type and that the stub grammar cannot represent the value; points at `StubYAML`. |
 | Unregistered service | Server's `NOT_FOUND` verbatim, plus one SDK hint line (§6). |
 | Shutdown failure in cleanup | `t.Errorf` (§3). |
@@ -398,11 +448,14 @@ discriminating test carries a named mutation check (state the mutation, confirm 
 | Layer | Tests |
 |---|---|
 | Builder, no server | Golden JSON documents for every matcher value type: each integer width, `uint64 > MaxInt64`, `float32` widening, named and unnamed enum values. Refusal of `[]byte`, messages, maps, NaN, ±Inf. All 16 non-OK codes in the table are parsed by grpc-go's own `codes.Code.UnmarshalJSON`. Duplicate header key and non-UTF-8 header value refused. Round-trip guard refuses a message carrying unknown fields. |
+| Response type check | `Respond(t, &shopv1.GetOrderRequest{OrderId: "o-1"})` on `GetOrder` is refused with both names, for a service resolved from `GlobalFiles` and for one resolved from `ListServices`. Mutation: remove the check — the stub is then created, and the generated client receives a `GetOrderResponse` carrying `order_id`, proving the server alone would not catch it. |
 | `respond.literal` (`internal/stub`) | A `{{ message.order_id }}` string with `literal: true` comes back unchanged at every site position: top level, nested message, map value, repeated element, `Any` payload, server-stream step, bidi `send`. Regression: the same stub without the flag still renders the template. `CreateStub` with `literal: true` returns it in the envelope's `document`. Mutation: drop the flag in `compileTemplate`. |
 | Registration | `ListServices` lists the service after `Stub()`. Against a `WithProtoDir` server, no `RegisterSchemas` is sent — observed through a decorator on the admin client, the seam P5 §8 introduced, exposed to tests via `export_test.go`. An unregistered service yields `NOT_FOUND` verbatim plus the hint. `RegisterFiles` of the generated shop file onto a proto-dir server registers `0 new`. |
-| Typed responses, end to end | A generated grpc-go client calls a stub built from `Respond(msg)`; the reply equals `msg` by `proto.Equal` **and** deterministic bytes. Cases: a literal `{{ }}` string, 64-bit extremes, `Timestamp`, enums, `Any`. A table of hard cases on the conformance protos as `dynamicpb` messages, registered explicitly: proto3 `optional` presence, `oneof`, maps with message values, proto2 extensions and groups, editions. `RespondStatus` with `PreconditionFailure`, `BadRequest`, `RetryInfo` arrives with equal details. |
-| Verify and Calls | Failure output contains **the same text a direct `VerifyCalls` returns**, compared against the RPC's own response, never hard-coded strings. The recording double embeds `testing.TB` (its unexported method makes a from-scratch fake impossible) and overrides `Errorf`/`Fatalf`, with `Fatalf` calling `runtime.Goexit` inside a goroutine the test joins. `Calls` is oldest first; a `type_name` mismatch is refused; `-bin` metadata merges back. |
+| Typed responses, end to end | A generated grpc-go client calls a stub built from `Respond(msg)`; the reply equals `msg` by `proto.Equal` **and** deterministic bytes. Cases: a literal `{{ }}` string, 64-bit extremes, `Timestamp`, enums, `Any`. A table of hard cases on the conformance protos as `dynamicpb` messages, registered explicitly: proto3 `optional` presence, `oneof`, maps with message values, proto2 extensions and groups, editions. The extension case (`conformance.v1.ext_tag`) is the discriminating one for the resolver — mutation: render and guard with protojson's default resolver, which fails it with an unknown-field error. `RespondStatus` with `PreconditionFailure`, `BadRequest`, `RetryInfo` arrives with equal details. |
+| Verify and Calls | Failure output contains **the same text a direct `VerifyCalls` returns**, compared against the RPC's own response, never hard-coded strings. The recording double embeds `testing.TB` (its unexported method makes a from-scratch fake impossible) and overrides `Errorf`/`Fatalf`, with `Fatalf` calling `runtime.Goexit` inside a goroutine the test joins. `Calls` is oldest first; a `type_name` mismatch is refused; `-bin` metadata merges back; a captured `dynamicpb` request carrying a registered extension has it in the extension field, not in unknown bytes. |
 | Concurrency and lifecycle | One parent server shared across parallel `t.Run` subtests, each passing its own `t`, with `ensure`'s cache under `-race`. `Reset` removes API stubs, empties the journal, and restores a file stub's `times` budget. `Connect` against an in-process server's addresses runs the same helpers. Cleanup closes `Dial` connections before shutdown. |
+| Cleanup-time calls | A subtest registers `t.Cleanup(func() { sim.Verify(m).Exactly(t, 1) })` and `t.Cleanup(func() { sim.Reset(t) })` after `Start`; both run against the live server and the subtest passes. Mutation: run RPCs under `t.Context()` — both fail with cancellation. |
+| Transport release | A server started directly with `server.Start` and a counting listener supplied through `server.Options.Listen` (the facade's existing seam) sees the admin connection a `Connect`-ed client opened close when that client's subtest ends — synchronized on the listener's own signal, no sleep. Mutation: drop the `Connect` cleanup — the connection stays open. |
 
 The package doc comment carries one complete, compiled example.
 
@@ -451,7 +504,17 @@ Verified while writing this design, from the source at `aa064ed`:
 - The server binary links `errdetails` (blank import, `internal/stub/status.go`).
 - Response metadata is `map[string]string`; `-bin` values are raw bytes in a string; other values must
   be printable ASCII (`internal/stub/metadata.go:22`).
-- `serve`'s default journal size is 1024 (`internal/cli/serve.go:82`).
+- `serve`'s default journal size is 1024 (`internal/cli/serve.go:82`); the CLI's per-RPC default
+  timeout is 30 seconds (`internal/cli/client.go:26`).
+- `ListServices` fills `MethodInfo.output_type` with the bare `FullName()` (`internal/admin/schema.go:76`).
+- `testing.T.Context` is documented as "canceled just before Cleanup-registered functions are called"
+  (Go 1.25 `go doc testing.T.Context`).
+- `shop.v1.GetOrderRequest` and `shop.v1.GetOrderResponse` both declare `string order_id = 1`
+  (`testdata/protos/shop/v1/order.proto`), so a request holding only `order_id` fits the response type.
+- `conformance.v1.ext_tag` is a proto2 extension of `LegacyReply`
+  (`conformance/protos/conformance/v1/legacy.proto:18`), absent from `GlobalTypes` in any test binary.
+- `Registry.AddFile` skips a path that is already registered — first registration wins
+  (`internal/schema/registry.go:162`).
 - `adminv1connect`'s five clients are interfaces, so a decorator needs no new abstraction (P5 §11).
 
 To establish by throwaway probes before the plan quotes code:
@@ -470,3 +533,8 @@ To establish by throwaway probes before the plan quotes code:
   including both 64-bit extremes.
 - **F6** — protojson output → yaml.v3 → `encoding/json` → protojson is lossless across the hard cases
   in §11, or the exact losses are listed (suspected: `-0.0`).
+- **F7** — A `dynamicpb.NewTypes` view over a local `protoregistry.Files` holding the caller's own
+  descriptor instances resolves `conformance.v1.ext_tag` for protojson and `proto.Unmarshal` into
+  `dynamicpb` messages built from those instances. Also record what happens when the message was built
+  from a *different* instance of the same file — an error or a panic — so the SDK can turn either into a
+  clear refusal rather than a crash.
