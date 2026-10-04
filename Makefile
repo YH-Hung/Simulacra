@@ -6,7 +6,7 @@ GOBIN := $(CURDIR)/bin
 # shell metacharacters.
 BUF := PATH="$(GOBIN):$$PATH" $(GOBIN)/buf
 
-TOOLS := $(GOBIN)/buf $(GOBIN)/protoc-gen-go $(GOBIN)/protoc-gen-connect-go
+TOOLS := $(GOBIN)/buf $(GOBIN)/protoc-gen-go $(GOBIN)/protoc-gen-connect-go $(GOBIN)/protoc-gen-go-grpc
 
 # BREAKING_AGAINST is the git ref breaking-api compares api/ against. It is
 # overridable because origin/main is the right baseline only on pull requests:
@@ -21,21 +21,23 @@ BREAKING_AGAINST ?= origin/main
 # These are file targets, not phony: make skips the recipe when the binaries
 # are already newer than tools/go.mod and tools/go.sum, so routine invocations
 # of generate/lint-api/breaking-api don't reinstall the toolchain every time.
-# All three are listed, not just buf, so deleting any one of them reinstalls;
+# All of them are listed, not just buf, so deleting any one of them reinstalls;
 # keying on buf alone let a partial bin/ pass `make tools` and then fail in
 # `buf generate` with a missing plugin. GNU Make 3.81 (stock macOS) has no
 # grouped-target (`&:`) syntax, so this is a multi-target rule: the recipe
 # runs once per out-of-date target, but since one `go install tool` writes all
-# three, the later targets are already up to date and it runs just once.
+# of them, the later targets are already up to date and it runs just once.
 $(TOOLS): tools/go.mod tools/go.sum
 	GOBIN=$(GOBIN) go -C tools install tool
 
 # tools is the phony convenience alias for a fresh clone's manual setup.
 tools: $(TOOLS)
 
-# generate regenerates gen/ from api/. gen/ is committed; never hand-edit it.
+# generate regenerates gen/ from api/ and internal/testpb/ from testdata/protos.
+# Both are committed; never hand-edit either.
 generate: $(TOOLS)
 	$(BUF) generate
+	$(BUF) generate testdata/protos --template buf.gen.testdata.yaml
 
 lint-api: $(TOOLS)
 	$(BUF) lint

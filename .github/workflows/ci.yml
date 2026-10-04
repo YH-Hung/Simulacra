@@ -87,7 +87,7 @@ jobs:
           fi
       - run: make generate
       - run: go build ./...
-      - name: verify gen/ is in sync with api/
+      - name: verify gen/ and internal/testpb/ are in sync
         # Staged before diffing so added and deleted files fail the check too,
         # not just modified ones.
-        run: git add -A gen && git diff --cached --exit-code -- gen
+        run: git add -A gen internal/testpb && git diff --cached --exit-code -- gen internal/testpb
