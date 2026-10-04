@@ -1,6 +1,7 @@
 // Package simulacratest is a testing.T-integrated Go SDK for Simulacra:
 // Start boots an in-process server, and the helpers on Client create stubs,
-// reset state, and dial the data plane.
+// verify and capture the calls the server received, reset state, and dial the
+// data plane.
 //
 // Everything goes through the admin API over loopback, in-process included.
 // The SDK never touches the server's store, registry, or journal directly, so
@@ -32,4 +33,39 @@
 // before the server stops, and a verifying cleanup runs against a live
 // server. Register verifying cleanups after Start. One registered before
 // Start runs after the server is gone and fails with a transport error.
+//
+// # Method names
+//
+// Every helper that takes a method accepts "/pkg.Svc/M", the form of the
+// generated _FullMethodName constants, or "pkg.Svc/M".
+//
+// # Schemas
+//
+// Stub, StubYAML and Verify first make the method's service known to the
+// server: a service the server does not list but the test binary links is
+// registered from its generated code. A schema the binary does not link — a
+// dynamicpb schema, a descriptor set read from disk — needs RegisterFiles,
+// WithProtoDir or WithDescriptorSet.
+//
+// RegisterFiles keeps the caller's own descriptor instances, not re-parsed
+// copies, and the Client decodes through them: Respond's round-trip guard,
+// RespondStatus' details, and Call.Request and Call.Response. Extensions are
+// matched by descriptor identity: an extension decoded through one instance of
+// a file is invisible through another instance of it, with no error. So build
+// messages and extension values from the very FileDescriptor passed to
+// RegisterFiles. A different instance of a file that declares extensions is
+// refused when registered, and a message built from one is refused when
+// decoded into. One case nothing can detect: an extension descriptor never
+// passed to RegisterFiles that extends a message that was. Build extension
+// values only from extension descriptors you registered, or from generated
+// code.
+//
+// # In-process and container servers
+//
+// The server falls back to its process's global registries for message, Any
+// and extension lookups. In-process, those are the test binary's, so a custom
+// status detail or Any payload type the test never registered resolves there
+// but fails against a server in a container. Register such types with
+// RegisterFiles to behave the same against both. Service lookup has no
+// fallback, so automatic registration behaves the same everywhere.
 package simulacratest
