@@ -89,6 +89,24 @@ func notFoundHint(service string) string {
 	return fmt.Sprintf("simulacratest: hint: the test binary does not link generated code for %s; register its schema with RegisterFiles or WithProtoDir", service)
 }
 
+// notFoundHintFor is the hint line, if any, to append to a NOT_FOUND for
+// method. The hint blames missing generated code, which is true only when the
+// service is unknown to both the server and the test binary: ensure caches every
+// service it finds and never an unknown one. A known service with a mistyped
+// method gets the server's message alone.
+func (c *Client) notFoundHintFor(method string) []string {
+	_, service, _, ok := normalizeMethod(method)
+	if !ok {
+		return nil
+	}
+	c.ensureMu.Lock()
+	defer c.ensureMu.Unlock()
+	if _, known := c.services[service]; known {
+		return nil
+	}
+	return []string{notFoundHint(string(service))}
+}
+
 // normalizeMethod accepts "/pkg.Svc/M" or "pkg.Svc/M" and returns the first
 // form, the service's full name, and the method's name. ok is false when the
 // method is not exactly one service and one method name.

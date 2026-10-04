@@ -162,3 +162,32 @@ func TestEnsureIsSafeForParallelSubtests(t *testing.T) {
 		t.Errorf("RegisterSchemas calls = %d; want exactly 1 across 8 parallel subtests", counter.registers)
 	}
 }
+
+// A hint blaming the missing generated code would misdirect a user whose
+// service is registered and whose method name is merely mistyped.
+func TestEnsureMistypedMethodOnAKnownServiceGetsNoHint(t *testing.T) {
+	const typo = "method: /shop.v1.OrderService/GetOrdr\nrespond:\n  message:\n    note: x\n"
+	for _, tc := range []struct {
+		name  string
+		opts  []simulacratest.Option
+		setup func(*testing.T, *simulacratest.Server)
+	}{
+		{"auto-registered from the test binary", nil, func(t *testing.T, sim *simulacratest.Server) { sim.StubYAML(t, getOrderDoc) }},
+		{"listed by the server", []simulacratest.Option{simulacratest.WithProtoDir("../testdata/protos")}, func(*testing.T, *simulacratest.Server) {}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sim := simulacratest.Start(t, tc.opts...)
+			tc.setup(t, sim)
+			want := createStubError(t, sim.Client, typo)
+			if !strings.Contains(want, "not_found") {
+				t.Fatalf("server error %q is not NOT_FOUND; the test would not exercise the hint gate", want)
+			}
+
+			rec := runRecorded(t, func(tb testing.TB) { sim.StubYAML(tb, typo) })
+
+			if wantMsg := "simulacratest: CreateStub: " + want; rec.FatalMsg() != wantMsg {
+				t.Errorf("FatalMsg() = %q; want %q, with no hint: the service is known, only the method is mistyped", rec.FatalMsg(), wantMsg)
+			}
+		})
+	}
+}

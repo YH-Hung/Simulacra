@@ -131,21 +131,19 @@ func (c *Client) StubYAML(t testing.TB, doc string) *adminv1.Stub {
 		Method string `yaml:"method"`
 	}
 	_ = yaml.Unmarshal([]byte(doc), &head)
-	var hint []string
-	if _, service, _, ok := normalizeMethod(head.Method); ok {
-		if _, known := c.ensure(t, head.Method); !known {
-			hint = []string{notFoundHint(string(service))}
-		}
+	if head.Method != "" {
+		c.ensure(t, head.Method)
 	}
 
 	ctx, cancel := c.rpcContext()
 	defer cancel()
 	resp, err := c.admin.Stub.CreateStub(ctx, connect.NewRequest(&adminv1.CreateStubRequest{Document: doc}))
 	if err != nil {
-		if connect.CodeOf(err) != connect.CodeNotFound {
-			hint = nil
+		var extra []string
+		if connect.CodeOf(err) == connect.CodeNotFound {
+			extra = c.notFoundHintFor(head.Method)
 		}
-		c.fatalRPC(t, "CreateStub", err, hint...)
+		c.fatalRPC(t, "CreateStub", err, extra...)
 	}
 	return resp.Msg.GetStub()
 }
