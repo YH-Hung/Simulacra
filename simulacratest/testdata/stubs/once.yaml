@@ -1,0 +1,5 @@
+- method: shop.v1.OrderService/GetOrder
+  times: 1
+  respond:
+    message:
+      note: from-file
