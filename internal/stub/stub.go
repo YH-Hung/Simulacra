@@ -37,6 +37,11 @@ type Respond struct {
 	OnOpen   []StepSpec        `yaml:"on_open"`
 	Rules    []RuleSpec        `yaml:"rules"`
 	OnClose  *CloseSpec        `yaml:"on_close"`
+	// Literal builds every message body in this response (message, stream,
+	// on_open, rules[].send) verbatim: no "{{ ... }}" site is scanned or
+	// rendered. Status, details, metadata and trailers are never templated, so
+	// it does not affect them.
+	Literal bool `yaml:"literal"`
 }
 
 type StepSpec struct {
@@ -204,7 +209,7 @@ func (c *Compiler) compilePlan(method protoreflect.MethodDescriptor, shape match
 			}
 			return plan, nil
 		}
-		plan.Message, err = c.compileTemplate(method, shape, spec.Message, source+": respond.message")
+		plan.Message, err = c.compileTemplate(method, shape, spec.Message, source+": respond.message", spec.Literal)
 		if err != nil {
 			return nil, err
 		}
@@ -217,7 +222,7 @@ func (c *Compiler) compilePlan(method protoreflect.MethodDescriptor, shape match
 		if len(spec.Stream) == 0 {
 			return nil, fmt.Errorf("%s: respond.stream: server-streaming methods require a non-empty stream script", source)
 		}
-		plan.Stream, err = c.compileSteps(method, shape, spec.Stream, source+": respond.stream")
+		plan.Stream, err = c.compileSteps(method, shape, spec.Stream, source+": respond.stream", spec.Literal)
 		if err != nil {
 			return nil, err
 		}
@@ -231,7 +236,7 @@ func (c *Compiler) compilePlan(method protoreflect.MethodDescriptor, shape match
 			return nil, fmt.Errorf("%s: respond: bidirectional methods require rules and/or on_open", source)
 		}
 		if len(spec.OnOpen) > 0 {
-			plan.OnOpen, err = c.compileSteps(method, match.Bidi, spec.OnOpen, source+": respond.on_open")
+			plan.OnOpen, err = c.compileSteps(method, match.Bidi, spec.OnOpen, source+": respond.on_open", spec.Literal)
 			if err != nil {
 				return nil, err
 			}
@@ -245,7 +250,7 @@ func (c *Compiler) compilePlan(method protoreflect.MethodDescriptor, shape match
 			if compileErr != nil {
 				return nil, fmt.Errorf("%s.match: %w", where, compileErr)
 			}
-			send, compileErr := c.compileSteps(method, match.BidiRule, ruleSpec.Send, where+".send")
+			send, compileErr := c.compileSteps(method, match.BidiRule, ruleSpec.Send, where+".send", spec.Literal)
 			if compileErr != nil {
 				return nil, compileErr
 			}
@@ -267,7 +272,7 @@ func (c *Compiler) compilePlan(method protoreflect.MethodDescriptor, shape match
 	return nil, fmt.Errorf("%s: unsupported method shape %v", source, shape)
 }
 
-func (c *Compiler) compileSteps(method protoreflect.MethodDescriptor, shape match.Shape, specs []StepSpec, where string) ([]Step, error) {
+func (c *Compiler) compileSteps(method protoreflect.MethodDescriptor, shape match.Shape, specs []StepSpec, where string, literal bool) ([]Step, error) {
 	steps := make([]Step, len(specs))
 	for i, spec := range specs {
 		stepWhere := fmt.Sprintf("%s[%d]", where, i)
@@ -292,7 +297,7 @@ func (c *Compiler) compileSteps(method protoreflect.MethodDescriptor, shape matc
 			steps[i].Status = compiled
 			continue
 		}
-		tmpl, err := c.compileTemplate(method, shape, spec.Message, stepWhere+".message")
+		tmpl, err := c.compileTemplate(method, shape, spec.Message, stepWhere+".message", literal)
 		if err != nil {
 			return nil, err
 		}
@@ -301,7 +306,14 @@ func (c *Compiler) compileSteps(method protoreflect.MethodDescriptor, shape matc
 	return steps, nil
 }
 
-func (c *Compiler) compileTemplate(method protoreflect.MethodDescriptor, shape match.Shape, fields map[string]any, source string) (*Template, error) {
+func (c *Compiler) compileTemplate(method protoreflect.MethodDescriptor, shape match.Shape, fields map[string]any, source string, literal bool) (*Template, error) {
+	if literal {
+		msg, err := BuildMessage(c.types, method.Output(), fields)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", source, err)
+		}
+		return &Template{desc: method.Output(), types: c.types, static: msg, source: source}, nil
+	}
 	if !hasSites(fields) {
 		return newTemplate(nil, c.types, method.Output(), fields, source)
 	}
