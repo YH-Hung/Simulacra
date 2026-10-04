@@ -13,7 +13,9 @@ import (
 	"connectrpc.com/connect"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
+	"gopkg.in/yaml.v3"
 
 	adminv1 "github.com/yinghanhung/simulacra/gen/simulacra/admin/v1"
 	"github.com/yinghanhung/simulacra/gen/simulacra/admin/v1/adminv1connect"
@@ -45,6 +47,10 @@ type Client struct {
 	regMu       sync.Mutex // serializes registerFiles from check to swap; readers never take it
 	snap        atomic.Pointer[typeSnapshot]
 	globalFiles *protoregistry.Files // protoregistry.GlobalFiles, except under test
+
+	ensureMu sync.Mutex // serializes ensure, which may register; taken before regMu
+	// services caches what ensure learned: service -> method -> output type.
+	services map[protoreflect.FullName]map[protoreflect.Name]protoreflect.FullName
 }
 
 // Connect returns a Client for a server already running at adminAddr (the
@@ -115,14 +121,31 @@ func (c *Client) Dial(t testing.TB, opts ...grpc.DialOption) *grpc.ClientConn {
 // StubYAML creates one stub from a document in the stub file grammar and
 // returns the server's envelope for it. The server parses it with the same
 // strict loader as stub files, so a malformed document fails the test with the
-// server's own diagnostic.
+// server's own diagnostic. A service the test binary links but the server does
+// not hold is registered first.
 func (c *Client) StubYAML(t testing.TB, doc string) *adminv1.Stub {
 	t.Helper()
+	// Only the method is read here; a document that does not decode skips
+	// registration and reaches the server, which reports it.
+	var head struct {
+		Method string `yaml:"method"`
+	}
+	_ = yaml.Unmarshal([]byte(doc), &head)
+	var hint []string
+	if _, service, _, ok := normalizeMethod(head.Method); ok {
+		if _, known := c.ensure(t, head.Method); !known {
+			hint = []string{notFoundHint(string(service))}
+		}
+	}
+
 	ctx, cancel := c.rpcContext()
 	defer cancel()
 	resp, err := c.admin.Stub.CreateStub(ctx, connect.NewRequest(&adminv1.CreateStubRequest{Document: doc}))
 	if err != nil {
-		c.fatalRPC(t, "CreateStub", err)
+		if connect.CodeOf(err) != connect.CodeNotFound {
+			hint = nil
+		}
+		c.fatalRPC(t, "CreateStub", err, hint...)
 	}
 	return resp.Msg.GetStub()
 }

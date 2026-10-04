@@ -2,6 +2,7 @@ package simulacratest
 
 import (
 	"slices"
+	"testing"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -42,4 +43,11 @@ func ResolveExtension(c *Client, msg protoreflect.FullName, n protoreflect.Field
 // resolve through the Client's types.
 func DecodeWithClientTypes(c *Client, b []byte, into proto.Message) error {
 	return proto.UnmarshalOptions{Resolver: c.resolver()}.Unmarshal(b, into)
+}
+
+// OutputType runs the Client's automatic registration for method and returns
+// what it learned.
+func OutputType(t testing.TB, c *Client, method string) (protoreflect.FullName, bool) {
+	t.Helper()
+	return c.ensure(t, method)
 }

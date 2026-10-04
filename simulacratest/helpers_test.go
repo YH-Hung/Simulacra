@@ -182,13 +182,21 @@ func (l *closeCountingListener) waitAllClosed(t *testing.T, within time.Duration
 	}
 }
 
-// countingSchemaClient counts RegisterSchemas calls and keeps the last
-// response, so a test can assert that a refusal sent nothing and see what the
-// server added.
+// countingSchemaClient counts RegisterSchemas and ListServices calls and keeps
+// the last RegisterSchemas response, so a test can assert that a refusal sent
+// nothing and see what the server added. The counters are plain ints: the SDK
+// serializes the calls a test counts, and a test must not read them while
+// calls are in flight.
 type countingSchemaClient struct {
 	adminv1connect.SchemaServiceClient
 	registers int
+	lists     int
 	last      *adminv1.RegisterSchemasResponse
+}
+
+func (c *countingSchemaClient) ListServices(ctx context.Context, req *connect.Request[adminv1.ListServicesRequest]) (*connect.Response[adminv1.ListServicesResponse], error) {
+	c.lists++
+	return c.SchemaServiceClient.ListServices(ctx, req)
 }
 
 func (c *countingSchemaClient) RegisterSchemas(ctx context.Context, req *connect.Request[adminv1.RegisterSchemasRequest]) (*connect.Response[adminv1.RegisterSchemasResponse], error) {
