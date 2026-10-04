@@ -1,6 +1,7 @@
 package simulacratest
 
 import (
+	"encoding/json"
 	"slices"
 	"testing"
 	"time"
@@ -50,4 +51,15 @@ func DecodeWithClientTypes(c *Client, b []byte, into proto.Message) error {
 func OutputType(t testing.TB, c *Client, method string) (protoreflect.FullName, bool) {
 	t.Helper()
 	return c.ensure(t, method)
+}
+
+// StubDocument is the document Respond would send for msg, without ensure or
+// the output type check, so a golden needs no server state.
+func StubDocument(b *StubBuilder, msg proto.Message) (string, error) {
+	respond, err := respondLiteral(msg, b.c.resolver())
+	if err != nil {
+		return "", err
+	}
+	doc, err := json.Marshal(b.document(respond))
+	return string(doc), err
 }

@@ -134,14 +134,20 @@ func (c *Client) StubYAML(t testing.TB, doc string) *adminv1.Stub {
 	if head.Method != "" {
 		c.ensure(t, head.Method)
 	}
+	return c.createStub(t, head.Method, doc)
+}
 
+// createStub sends one stub document for method. A NOT_FOUND gets the
+// missing-schema hint when method's service is unknown to both sides.
+func (c *Client) createStub(t testing.TB, method, doc string) *adminv1.Stub {
+	t.Helper()
 	ctx, cancel := c.rpcContext()
 	defer cancel()
 	resp, err := c.admin.Stub.CreateStub(ctx, connect.NewRequest(&adminv1.CreateStubRequest{Document: doc}))
 	if err != nil {
 		var extra []string
 		if connect.CodeOf(err) == connect.CodeNotFound {
-			extra = c.notFoundHintFor(head.Method)
+			extra = c.notFoundHintFor(method)
 		}
 		c.fatalRPC(t, "CreateStub", err, extra...)
 	}
