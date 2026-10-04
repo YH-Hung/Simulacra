@@ -5,12 +5,15 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/reflect/protoregistry"
 
 	adminv1 "github.com/yinghanhung/simulacra/gen/simulacra/admin/v1"
 	"github.com/yinghanhung/simulacra/gen/simulacra/admin/v1/adminv1connect"
@@ -38,6 +41,10 @@ type Client struct {
 	dataAddr  string
 	admin     Admin
 	timeout   time.Duration
+
+	regMu       sync.Mutex // serializes registerFiles from check to swap; readers never take it
+	snap        atomic.Pointer[typeSnapshot]
+	globalFiles *protoregistry.Files // protoregistry.GlobalFiles, except under test
 }
 
 // Connect returns a Client for a server already running at adminAddr (the
@@ -56,7 +63,7 @@ func Connect(t testing.TB, adminAddr, dataAddr string) *Client {
 	t.Cleanup(transport.CloseIdleConnections)
 	httpClient := &http.Client{Transport: transport}
 	base := baseURL(adminAddr)
-	return &Client{
+	c := &Client{
 		adminAddr: adminAddr,
 		dataAddr:  dataAddr,
 		admin: Admin{
@@ -66,8 +73,11 @@ func Connect(t testing.TB, adminAddr, dataAddr string) *Client {
 			Verify:  adminv1connect.NewVerifyServiceClient(httpClient, base),
 			Control: adminv1connect.NewControlServiceClient(httpClient, base),
 		},
-		timeout: defaultRPCTimeout,
+		timeout:     defaultRPCTimeout,
+		globalFiles: protoregistry.GlobalFiles,
 	}
+	c.snap.Store(newTypeSnapshot(new(protoregistry.Files)))
+	return c
 }
 
 // baseURL turns an address into a base URL, leaving an explicit scheme alone

@@ -1,12 +1,26 @@
 package simulacratest_test
 
 import (
+	"context"
 	"fmt"
 	"net"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"testing"
 	"time"
+
+	"connectrpc.com/connect"
+	"github.com/bufbuild/protocompile"
+	"google.golang.org/protobuf/encoding/prototext"
+	"google.golang.org/protobuf/reflect/protodesc"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/reflect/protoregistry"
+	"google.golang.org/protobuf/types/descriptorpb"
+
+	adminv1 "github.com/yinghanhung/simulacra/gen/simulacra/admin/v1"
+	"github.com/yinghanhung/simulacra/gen/simulacra/admin/v1/adminv1connect"
+	"github.com/yinghanhung/simulacra/simulacratest"
 )
 
 // recordingTB stands in for the *testing.T an SDK helper is given, so a test
@@ -166,4 +180,116 @@ func (l *closeCountingListener) waitAllClosed(t *testing.T, within time.Duration
 			t.Fatalf("%d accepted connection(s) still open after %v", n, within)
 		}
 	}
+}
+
+// countingSchemaClient counts RegisterSchemas calls and keeps the last
+// response, so a test can assert that a refusal sent nothing and see what the
+// server added.
+type countingSchemaClient struct {
+	adminv1connect.SchemaServiceClient
+	registers int
+	last      *adminv1.RegisterSchemasResponse
+}
+
+func (c *countingSchemaClient) RegisterSchemas(ctx context.Context, req *connect.Request[adminv1.RegisterSchemasRequest]) (*connect.Response[adminv1.RegisterSchemasResponse], error) {
+	c.registers++
+	resp, err := c.SchemaServiceClient.RegisterSchemas(ctx, req)
+	if err == nil {
+		c.last = resp.Msg
+	}
+	return resp, err
+}
+
+// countSchemaRPCs installs a countingSchemaClient on c.
+func countSchemaRPCs(c *simulacratest.Client) *countingSchemaClient {
+	counter := &countingSchemaClient{}
+	simulacratest.WrapAdmin(c, func(a simulacratest.Admin) simulacratest.Admin {
+		counter.SchemaServiceClient = a.Schema
+		a.Schema = counter
+		return a
+	})
+	return counter
+}
+
+// conformanceFiles compiles every file under conformance/v1, keyed by path.
+// Each call compiles afresh, so two calls yield independent descriptor
+// instances of the same files.
+func conformanceFiles(t *testing.T) map[string]protoreflect.FileDescriptor {
+	t.Helper()
+	const root = "../conformance/protos"
+	matches, err := filepath.Glob(filepath.Join(root, "conformance/v1/*.proto"))
+	if err != nil || len(matches) == 0 {
+		t.Fatalf("finding conformance protos: %v (%d found)", err, len(matches))
+	}
+	names := make([]string, len(matches))
+	for i, m := range matches {
+		rel, err := filepath.Rel(root, m)
+		if err != nil {
+			t.Fatalf("relative path of %s: %v", m, err)
+		}
+		names[i] = filepath.ToSlash(rel)
+	}
+	compiler := protocompile.Compiler{
+		Resolver: protocompile.WithStandardImports(&protocompile.SourceResolver{ImportPaths: []string{root}}),
+	}
+	compiled, err := compiler.Compile(context.Background(), names...)
+	if err != nil {
+		t.Fatalf("compiling conformance protos: %v", err)
+	}
+	files := make(map[string]protoreflect.FileDescriptor, len(compiled))
+	for _, f := range compiled {
+		files[f.Path()] = f
+	}
+	return files
+}
+
+// buildFile builds a file from a FileDescriptorProto in text format, resolving
+// its imports against deps. Every call is a new descriptor instance.
+func buildFile(t *testing.T, text string, deps ...protoreflect.FileDescriptor) protoreflect.FileDescriptor {
+	t.Helper()
+	fdp := new(descriptorpb.FileDescriptorProto)
+	if err := prototext.Unmarshal([]byte(text), fdp); err != nil {
+		t.Fatalf("parsing descriptor text: %v", err)
+	}
+	resolver := new(protoregistry.Files)
+	for _, d := range deps {
+		if err := resolver.RegisterFile(d); err != nil {
+			t.Fatalf("registering dependency %s: %v", d.Path(), err)
+		}
+	}
+	fd, err := protodesc.NewFile(fdp, resolver)
+	if err != nil {
+		t.Fatalf("building %s: %v", fdp.GetName(), err)
+	}
+	return fd
+}
+
+// sharedExtendee builds probe/ext.proto twice against one instance of
+// probe/base.proto: the case where the extendee is shared, so only the
+// extension descriptors differ and nothing in a decoded message reveals it.
+func sharedExtendee(t *testing.T) (base, e1, e2 protoreflect.FileDescriptor) {
+	t.Helper()
+	const baseText = `name: "probe/base.proto" package: "probe" syntax: "proto2"
+message_type { name: "Base" extension_range { start: 100 end: 200 } }`
+	const extText = `name: "probe/ext.proto" package: "probe" syntax: "proto2"
+dependency: "probe/base.proto"
+extension { name: "tag" number: 100 label: LABEL_OPTIONAL type: TYPE_STRING extendee: ".probe.Base" }`
+	base = buildFile(t, baseText)
+	return base, buildFile(t, extText, base), buildFile(t, extText, base)
+}
+
+// syntheticFile is syn/file_<i>.proto, package syn<i>, with one message M.
+func syntheticFile(t *testing.T, i int) protoreflect.FileDescriptor {
+	t.Helper()
+	return buildFile(t, fmt.Sprintf(`name: "syn/file_%d.proto" package: "syn%d" syntax: "proto3" message_type { name: "M" }`, i, i))
+}
+
+// nestedExtFile declares an extendee, a message holding it in a repeated
+// field, and an extension of it, all in one file. Each call is a new instance.
+func nestedExtFile(t *testing.T) protoreflect.FileDescriptor {
+	t.Helper()
+	return buildFile(t, `name: "nested/x.proto" package: "nested" syntax: "proto2"
+message_type { name: "Base" extension_range { start: 100 end: 200 } }
+message_type { name: "Outer" field { name: "items" number: 1 label: LABEL_REPEATED type: TYPE_MESSAGE type_name: ".nested.Base" } }
+extension { name: "tag" number: 100 label: LABEL_OPTIONAL type: TYPE_STRING extendee: ".nested.Base" }`)
 }
