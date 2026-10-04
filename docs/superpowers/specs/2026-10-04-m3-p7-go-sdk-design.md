@@ -261,10 +261,12 @@ disk — is not there. So each `Client` keeps a local `protoregistry.Files` and 
 - **The caller's own descriptor instances** are registered, not re-parsed copies. A `dynamicpb`
   message carries the descriptor it was built from, so its extension types must be built from that
   same instance (F7).
-- **A path already present** locally is skipped, matching the server registry's
-  first-registration-wins rule for `AddFile` (`internal/schema/registry.go:162`).
 - **`c.types` resolves `GlobalTypes` first, then the local view.** Generated messages must get their
   generated extension and payload types; the local view only fills in what the binary does not link.
+- **A path already present** — in the local snapshot, or in `GlobalFiles` — is handled by the
+  extension-identity rule below: refused when the file declares extensions and the instance differs,
+  otherwise skipped, matching the server registry's first-registration-wins rule for `AddFile`
+  (`internal/schema/registry.go:162`).
 - **Local registration follows the server.** `RegisterFiles` sends `RegisterSchemas` first and adds
   the files locally only after it succeeds, so the client never resolves types the server rejected.
 
@@ -272,25 +274,51 @@ disk — is not there. So each `Client` keeps a local `protoregistry.Files` and 
 round-trip guard (§5), `RespondStatus`'s detail unpacking (§5), and `Calls`' typed capture (§7).
 Files that `ensure` registers from `GlobalFiles` need no local entry; `GlobalTypes` already holds them.
 
-**Same-named but different descriptor instances decode silently wrong — so the SDK checks for them.**
-F7 established that when the target message was built from a *different instance* of the same file
-than the one registered — two independent compiles of `legacy.proto`, say — decoding an extension
-succeeds with no error and no unknown bytes, yet `Has(ext)` through the caller's own descriptor is
-`false` and `Get` returns the default. The extension is present but invisible. First-wins local
-registration makes this reachable: register one instance, build messages from another.
+**Different descriptor instances of one file decode extensions silently wrong.** `dynamicpb` stores a
+decoded extension under the extension descriptor the *resolver* supplied and answers `Has`/`Get` only
+for that same descriptor instance. So whenever the caller's extension descriptor is not the instance
+`c.types` resolves, the value is present but invisible: decoding succeeds with no error and no unknown
+bytes, yet `Has(ext)` through the caller's descriptor is `false` and `Get` returns the default. F7
+reproduces this two ways:
 
-After every decode the SDK performs through `c.types` — the round-trip guard, detail unpacking, typed
-capture — it walks the decoded message recursively (singular message fields, repeated message
-elements, message map values, message-valued extensions) and requires every populated extension
-field's `ContainingMessage()` to be the **same instance** as the descriptor of the message holding it.
-F7 confirmed that `Range` yields the resolver's extension descriptor in the mismatched case, so the
-check sees it. A mismatch is refused, naming the file:
-`message built from a different descriptor instance of conformance/v1/legacy.proto than the one
-registered with this Client; build messages from the FileDescriptor passed to RegisterFiles`. For typed
-capture this turns a silently invisible extension into a failure. For `Respond`, the guard's equality
-comparison would already refuse, but with no clue why; the instance check runs first and names the
-cause. Generated messages always pass: their extension types come from `GlobalTypes`, built from the
-same descriptor instances as the messages.
+- **Different extendee instances** — two independent compiles of `legacy.proto`, where the message and
+  its extension share a file. The decoded extension's `ContainingMessage()` is not the target message's
+  descriptor instance.
+- **Shared extendee, different extension instances** — an extension file compiled twice against *one*
+  instance of the message file it extends. `ContainingMessage()` **is** the target's descriptor, so no
+  inspection of the decoded message can tell; only the extension descriptors differ.
+
+The SDK closes both, one at registration and one at decode:
+
+1. **Extension-identity rule (`RegisterFiles`).** For every file in the walked closure that declares any
+   extension — at file scope or nested inside a message — the instance `c.types` would resolve that
+   file's extensions from must be the instance passed in. Concretely: if `GlobalFiles` holds the path,
+   it must be that very instance (`GlobalTypes` wins resolution, so any other copy would always lose);
+   else if the local snapshot holds the path, it must be that very instance. A different instance is
+   refused before anything is sent, naming the file:
+   `conformance/v1/legacy.proto declares extensions and is already registered with this Client as a
+   different descriptor instance; extensions are matched by descriptor identity, so values decoded
+   through the registered copy would be invisible through this one — register one instance and build
+   extension values from it`. Files declaring no extensions keep the first-wins skip: a distinct
+   instance of such a file can only cause the first case, which step 2 catches.
+2. **Containing-message check (every decode).** After each decode through `c.types` — the round-trip
+   guard, detail unpacking, typed capture — the SDK walks the decoded message recursively (singular
+   message fields, repeated message elements, message map values, message-valued extensions) and
+   requires every populated extension field's `ContainingMessage()` to be the **same instance** as the
+   descriptor of the message holding it. F7 confirmed `Range` yields the resolver's extension
+   descriptor, so the check sees the first case. A mismatch is refused, naming the file:
+   `message built from a different descriptor instance of conformance/v1/legacy.proto than the one
+   registered with this Client; build messages from the FileDescriptor passed to RegisterFiles`.
+
+For typed capture this turns a silently invisible extension into a failure. For `Respond`, the guard's
+equality comparison would already refuse in both cases, but with no clue why; these checks name the
+cause. Generated messages and extensions always pass: both come from the same `GlobalFiles` instances.
+
+**The one residue no check can see**, documented on `RegisterFiles` and in the package doc: a caller who
+builds extension values from an extension descriptor it **never passed** to `RegisterFiles`, sharing an
+extendee with one it did. Nothing in the message or the registry reveals that third instance. The rule
+for callers is one sentence — *build extension values only from extension descriptors you registered,
+or from generated code*.
 
 **The local registry is copy-on-write.** `dynamicpb.NewTypes` documents that "it is not safe to
 concurrently change the Files while calling Types methods", and parallel subtests sharing one `Client`
@@ -298,8 +326,12 @@ can call `RegisterFiles` while another subtest's `Respond` or typed capture is r
 client mirrors the server registry's design (M3 §6): an `atomic.Pointer` to an immutable snapshot —
 a `protoregistry.Files` and the `dynamicpb.Types` over it — that is never mutated once published.
 `RegisterFiles` builds a fresh `Files` from the current snapshot's files plus the new ones, wraps it,
-and swaps it in. A **writer mutex** serializes that read→build→swap sequence, because the atomic
-pointer alone would let two concurrent registrations both build from the same snapshot and lose one.
+and swaps it in. A **writer mutex** serializes the whole check→RPC→build→swap sequence: the atomic
+pointer alone would let two concurrent registrations both build from the same snapshot and lose one,
+and releasing the mutex between the extension-identity check and the swap would let a concurrent
+registration slip a different instance of the same path in between. Holding it across the RPC
+serializes registrations, which is rare and cheap — the server serializes its writers the same way —
+and readers never touch it.
 Each operation loads one snapshot at its start and resolves through it until it finishes, so a single
 `Respond` or capture never sees two different registries.
 
@@ -467,7 +499,8 @@ registers `0 new`.
 | Verification verdict | `t.Errorf`, return `false` (§7). |
 | Builder misuse | Collected; one `t.Fatalf` from the terminal call (§5). |
 | `Respond` message is not the method's output type | `t.Fatalf` naming both full names (§5, step 1). |
-| Decoded extension resolved from a different descriptor instance than the target's | `t.Fatalf` naming the file and pointing at `RegisterFiles` (§6). |
+| Decoded extension resolved from a different descriptor instance than the target's | `t.Fatalf` naming the file and pointing at `RegisterFiles` (§6, check 2). |
+| `RegisterFiles` given a different instance of an extension-declaring file already resolvable | `t.Fatalf` naming the file, before anything is sent (§6, rule 1). |
 | Round-trip guard mismatch | `t.Fatalf` naming the message type and that the stub grammar cannot represent the value; points at `StubYAML`. |
 | Unregistered service | Server's `NOT_FOUND` verbatim, plus one SDK hint line (§6). |
 | Shutdown failure in cleanup | `t.Errorf` (§3). |
@@ -489,6 +522,7 @@ discriminating test carries a named mutation check (state the mutation, confirm 
 | Verify and Calls | Failure output contains **the same text a direct `VerifyCalls` returns**, compared against the RPC's own response, never hard-coded strings. The recording double embeds `testing.TB` (its unexported method makes a from-scratch fake impossible) and overrides `Errorf`/`Fatalf`, with `Fatalf` calling `runtime.Goexit` inside a goroutine the test joins. `Calls` is oldest first; a `type_name` mismatch is refused; `-bin` metadata merges back; a captured `dynamicpb` request carrying a registered extension has it in the extension field, not in unknown bytes. |
 | Concurrency and lifecycle | One parent server shared across parallel `t.Run` subtests, each passing its own `t`, with `ensure`'s cache under `-race`. `Reset` removes API stubs, empties the journal, and restores a file stub's `times` budget. `Connect` against an in-process server's addresses runs the same helpers. Cleanup closes `Dial` connections before shutdown. |
 | Descriptor-instance check | Two independent compiles of `legacy.proto`: register instance A, then capture a call into, and `Respond` with, a `LegacyReply` built from instance B carrying `ext_tag`. Both are refused naming the file. The same flow with instance A passes, and `Has(ext_tag)` is `true` through A's descriptor. Mutation: remove the check — capture then "succeeds" with `Has(ext_tag)` `false`, the silent failure F7 recorded. The check is also exercised on an extension nested inside a repeated message field. |
+| Extension-identity rule | **Shared extendee:** an extension file built twice with `protodesc.NewFile` against one instance of its message file (F7's second case). `RegisterFiles(e1)` succeeds; `RegisterFiles(e2)` is refused naming the file, and the server receives no RPC for it (decorator count). Mutation: restore the silent first-wins skip — `RegisterFiles(e2)` passes, and capturing a call whose value was set through `e2`'s extension yields `Has` `false`, F7's silent failure. **Linked copy:** the `GlobalFiles` lookup goes through a seam (`export_test.go`) so a test can supply a registry that "links" a different instance of an extension file; `RegisterFiles` of the caller's instance is refused. Re-registering the *same* instance, and a distinct instance of a file declaring no extensions, both pass. |
 | Local registry concurrency | Under `-race`: parallel subtests call `RegisterFiles` with synthetic files on distinct paths while others run `Respond` and typed capture of the `ext_tag` message through the same `Client`. Mutation: register into one shared, mutable `Files` instead of swapping snapshots — `-race` reports it. A functional union test, which `-race` cannot replace: concurrent `RegisterFiles` of disjoint files all land in the final snapshot (observed via `export_test.go`). Mutation: drop the writer mutex — registrations are lost. |
 | Cleanup-time calls | A subtest registers `t.Cleanup(func() { sim.Verify(m).Exactly(t, 1) })` and `t.Cleanup(func() { sim.Reset(t) })` after `Start`; both run against the live server and the subtest passes. Mutation: run RPCs under `t.Context()` — both fail with cancellation. |
 | Transport release | A server started directly with `server.Start` and a counting listener supplied through `server.Options.Listen` (the facade's existing seam) sees the admin connection a `Connect`-ed client opened close when that client's subtest ends — synchronized on the listener's own signal, no sleep. Mutation: drop the `Connect` cleanup — the connection stays open. |
@@ -503,6 +537,7 @@ The package doc comment carries one complete, compiled example.
 | In-process tests pass where a container would fail, because the server shares the test binary's global registries (§6) | Documented in the package doc; auto-registration's own test checks `ListServices`, which has no fallback; phase 8's container smoke test proves container behavior. |
 | Auto-registration collides with an explicitly provisioned shared import | Fails loudly with the file named and its provenance stated. Step 2 of `ensure` prevents the common case. |
 | Go-generated well-known-type descriptors differ from protocompile's copies, so every auto-registration conflicts | F1 probes it. If they differ, the walk omits `google/protobuf/*` files the server already provides, and this spec is amended to say so. |
+| A caller builds extension values from an extension descriptor it never registered, sharing an extendee with one it did (§6, residue) | Undetectable by construction. Documented on `RegisterFiles` and in the package doc. `Respond` still refuses through the guard's equality comparison (F7: `proto.Equal` is `false`); only typed capture is exposed, and only for `dynamicpb` callers — generated code cannot reach it. |
 | The typed builder and the JVM DSL drift | Both render the same JSON document for the same stub; phase 9 can reuse this phase's golden documents as its own fixtures. |
 
 ## 13. Decisions flagged for review
@@ -566,7 +601,14 @@ Verified by throwaway probe during spec review:
     `proto.Equal` to the source is `false`.
   - *Detection:* in the different-instance case, `Range` yields an extension field whose
     `ContainingMessage()` is not the decoded message's `Descriptor()` instance; in the same-instance
-    case it is. This is the check §6 relies on.
+    case it is. This is §6's check 2.
+  - *Shared extendee (second probe, built with `protodesc.NewFile`):* a message file `base.proto`
+    built once, and an extension file `ext.proto` extending it built **twice** against that single
+    instance — `e1`, `e2`. Local registry holds `base` and `e1`; the source value is set through
+    `e2`'s extension. Wire and protojson decoding succeed with no error and no unknown bytes;
+    `ContainingMessage()` **equals** the target's descriptor, so check 2 cannot see it; `Has` through
+    `e2`'s extension is `false`, through `e1`'s is `true`; `proto.Equal` to the source is `false`. This
+    is why §6 needs rule 1 at registration.
 - `dynamicpb.NewTypes` documents that "it is not safe to concurrently change the Files while calling
   Types methods"; `protoregistry.Files` documents only its `Find` and `Range` methods as safe for
   concurrent use.
