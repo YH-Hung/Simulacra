@@ -265,10 +265,43 @@ disk — is not there. So each `Client` keeps a local `protoregistry.Files` and 
   first-registration-wins rule for `AddFile` (`internal/schema/registry.go:162`).
 - **`c.types` resolves `GlobalTypes` first, then the local view.** Generated messages must get their
   generated extension and payload types; the local view only fills in what the binary does not link.
+- **Local registration follows the server.** `RegisterFiles` sends `RegisterSchemas` first and adds
+  the files locally only after it succeeds, so the client never resolves types the server rejected.
 
 `c.types` is the resolver for everything the SDK serializes or captures: `Respond`'s rendering and
 round-trip guard (§5), `RespondStatus`'s detail unpacking (§5), and `Calls`' typed capture (§7).
 Files that `ensure` registers from `GlobalFiles` need no local entry; `GlobalTypes` already holds them.
+
+**Same-named but different descriptor instances decode silently wrong — so the SDK checks for them.**
+F7 established that when the target message was built from a *different instance* of the same file
+than the one registered — two independent compiles of `legacy.proto`, say — decoding an extension
+succeeds with no error and no unknown bytes, yet `Has(ext)` through the caller's own descriptor is
+`false` and `Get` returns the default. The extension is present but invisible. First-wins local
+registration makes this reachable: register one instance, build messages from another.
+
+After every decode the SDK performs through `c.types` — the round-trip guard, detail unpacking, typed
+capture — it walks the decoded message recursively (singular message fields, repeated message
+elements, message map values, message-valued extensions) and requires every populated extension
+field's `ContainingMessage()` to be the **same instance** as the descriptor of the message holding it.
+F7 confirmed that `Range` yields the resolver's extension descriptor in the mismatched case, so the
+check sees it. A mismatch is refused, naming the file:
+`message built from a different descriptor instance of conformance/v1/legacy.proto than the one
+registered with this Client; build messages from the FileDescriptor passed to RegisterFiles`. For typed
+capture this turns a silently invisible extension into a failure. For `Respond`, the guard's equality
+comparison would already refuse, but with no clue why; the instance check runs first and names the
+cause. Generated messages always pass: their extension types come from `GlobalTypes`, built from the
+same descriptor instances as the messages.
+
+**The local registry is copy-on-write.** `dynamicpb.NewTypes` documents that "it is not safe to
+concurrently change the Files while calling Types methods", and parallel subtests sharing one `Client`
+can call `RegisterFiles` while another subtest's `Respond` or typed capture is resolving types. So the
+client mirrors the server registry's design (M3 §6): an `atomic.Pointer` to an immutable snapshot —
+a `protoregistry.Files` and the `dynamicpb.Types` over it — that is never mutated once published.
+`RegisterFiles` builds a fresh `Files` from the current snapshot's files plus the new ones, wraps it,
+and swaps it in. A **writer mutex** serializes that read→build→swap sequence, because the atomic
+pointer alone would let two concurrent registrations both build from the same snapshot and lose one.
+Each operation loads one snapshot at its start and resolves through it until it finishes, so a single
+`Respond` or capture never sees two different registries.
 
 ### Automatic
 
@@ -434,6 +467,7 @@ registers `0 new`.
 | Verification verdict | `t.Errorf`, return `false` (§7). |
 | Builder misuse | Collected; one `t.Fatalf` from the terminal call (§5). |
 | `Respond` message is not the method's output type | `t.Fatalf` naming both full names (§5, step 1). |
+| Decoded extension resolved from a different descriptor instance than the target's | `t.Fatalf` naming the file and pointing at `RegisterFiles` (§6). |
 | Round-trip guard mismatch | `t.Fatalf` naming the message type and that the stub grammar cannot represent the value; points at `StubYAML`. |
 | Unregistered service | Server's `NOT_FOUND` verbatim, plus one SDK hint line (§6). |
 | Shutdown failure in cleanup | `t.Errorf` (§3). |
@@ -454,6 +488,8 @@ discriminating test carries a named mutation check (state the mutation, confirm 
 | Typed responses, end to end | A generated grpc-go client calls a stub built from `Respond(msg)`; the reply equals `msg` by `proto.Equal` **and** deterministic bytes. Cases: a literal `{{ }}` string, 64-bit extremes, `Timestamp`, enums, `Any`. A table of hard cases on the conformance protos as `dynamicpb` messages, registered explicitly: proto3 `optional` presence, `oneof`, maps with message values, proto2 extensions and groups, editions. The extension case (`conformance.v1.ext_tag`) is the discriminating one for the resolver — mutation: render and guard with protojson's default resolver, which fails it with an unknown-field error. `RespondStatus` with `PreconditionFailure`, `BadRequest`, `RetryInfo` arrives with equal details. |
 | Verify and Calls | Failure output contains **the same text a direct `VerifyCalls` returns**, compared against the RPC's own response, never hard-coded strings. The recording double embeds `testing.TB` (its unexported method makes a from-scratch fake impossible) and overrides `Errorf`/`Fatalf`, with `Fatalf` calling `runtime.Goexit` inside a goroutine the test joins. `Calls` is oldest first; a `type_name` mismatch is refused; `-bin` metadata merges back; a captured `dynamicpb` request carrying a registered extension has it in the extension field, not in unknown bytes. |
 | Concurrency and lifecycle | One parent server shared across parallel `t.Run` subtests, each passing its own `t`, with `ensure`'s cache under `-race`. `Reset` removes API stubs, empties the journal, and restores a file stub's `times` budget. `Connect` against an in-process server's addresses runs the same helpers. Cleanup closes `Dial` connections before shutdown. |
+| Descriptor-instance check | Two independent compiles of `legacy.proto`: register instance A, then capture a call into, and `Respond` with, a `LegacyReply` built from instance B carrying `ext_tag`. Both are refused naming the file. The same flow with instance A passes, and `Has(ext_tag)` is `true` through A's descriptor. Mutation: remove the check — capture then "succeeds" with `Has(ext_tag)` `false`, the silent failure F7 recorded. The check is also exercised on an extension nested inside a repeated message field. |
+| Local registry concurrency | Under `-race`: parallel subtests call `RegisterFiles` with synthetic files on distinct paths while others run `Respond` and typed capture of the `ext_tag` message through the same `Client`. Mutation: register into one shared, mutable `Files` instead of swapping snapshots — `-race` reports it. A functional union test, which `-race` cannot replace: concurrent `RegisterFiles` of disjoint files all land in the final snapshot (observed via `export_test.go`). Mutation: drop the writer mutex — registrations are lost. |
 | Cleanup-time calls | A subtest registers `t.Cleanup(func() { sim.Verify(m).Exactly(t, 1) })` and `t.Cleanup(func() { sim.Reset(t) })` after `Start`; both run against the live server and the subtest passes. Mutation: run RPCs under `t.Context()` — both fail with cancellation. |
 | Transport release | A server started directly with `server.Start` and a counting listener supplied through `server.Options.Listen` (the facade's existing seam) sees the admin connection a `Connect`-ed client opened close when that client's subtest ends — synchronized on the listener's own signal, no sleep. Mutation: drop the `Connect` cleanup — the connection stays open. |
 
@@ -517,6 +553,24 @@ Verified while writing this design, from the source at `aa064ed`:
   (`internal/schema/registry.go:162`).
 - `adminv1connect`'s five clients are interfaces, so a decorator needs no new abstraction (P5 §11).
 
+Verified by throwaway probe during spec review:
+
+- **F7 — verified** by a throwaway probe (protocompile v0.14.1, protobuf v1.36.11; deleted) compiling
+  `conformance/v1/legacy.proto` twice into instances A and B, with a local `Files` holding A and
+  `dynamicpb.NewTypes` over it:
+  - *Same instance:* wire and protojson decoding of a `LegacyReply` carrying `ext_tag` into an
+    A-built message succeed; `Has(ext_tag)` is `true` and `Get` returns the value; `proto.Equal`
+    to the source holds.
+  - *Different instance:* decoding into a B-built message also succeeds — **no error, no panic, no
+    unknown bytes** — but `Has(ext_tag)` through B's descriptor is `false` and `Get` returns `""`;
+    `proto.Equal` to the source is `false`.
+  - *Detection:* in the different-instance case, `Range` yields an extension field whose
+    `ContainingMessage()` is not the decoded message's `Descriptor()` instance; in the same-instance
+    case it is. This is the check §6 relies on.
+- `dynamicpb.NewTypes` documents that "it is not safe to concurrently change the Files while calling
+  Types methods"; `protoregistry.Files` documents only its `Find` and `Range` methods as safe for
+  concurrent use.
+
 To establish by throwaway probes before the plan quotes code:
 
 - **F1** — A generated-descriptor closure that includes `google/protobuf/*.proto` registers as `0 new`
@@ -533,8 +587,3 @@ To establish by throwaway probes before the plan quotes code:
   including both 64-bit extremes.
 - **F6** — protojson output → yaml.v3 → `encoding/json` → protojson is lossless across the hard cases
   in §11, or the exact losses are listed (suspected: `-0.0`).
-- **F7** — A `dynamicpb.NewTypes` view over a local `protoregistry.Files` holding the caller's own
-  descriptor instances resolves `conformance.v1.ext_tag` for protojson and `proto.Unmarshal` into
-  `dynamicpb` messages built from those instances. Also record what happens when the message was built
-  from a *different* instance of the same file — an error or a panic — so the SDK can turn either into a
-  clear refusal rather than a crash.
