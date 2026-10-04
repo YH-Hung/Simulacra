@@ -3,6 +3,7 @@ package simulacratest
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -78,7 +79,7 @@ func (b *StubBuilder) MatchMetadata(key string, ms ...Matcher) *StubBuilder {
 }
 
 // Expr sets a CEL expression for what the structured matchers cannot say. It
-// is sent verbatim.
+// is sent verbatim, or refused if the stub grammar would alter it.
 func (b *StubBuilder) Expr(cel string) *StubBuilder {
 	b.match.setExpr(cel)
 	return b
@@ -164,9 +165,7 @@ func (b *StubBuilder) Respond(t testing.TB, msg proto.Message) *adminv1.Stub {
 	if errs := slices.Concat(b.match.errors(), b.errs); len(errs) > 0 {
 		t.Fatalf("%s", strings.Join(errs, "\n"))
 	}
-	// A typed nil pointer is a non-nil interface whose reflection is invalid;
-	// rendering it would panic.
-	if msg == nil || !msg.ProtoReflect().IsValid() {
+	if isNil(msg) {
 		t.Fatalf("simulacratest: Respond: message is nil; pass &T{} for an empty response")
 	}
 	// The guard decodes into msg's own type, so it cannot see a message of
@@ -186,11 +185,25 @@ func (b *StubBuilder) Respond(t testing.TB, msg proto.Message) *adminv1.Stub {
 	return b.send(t, "Respond", respond)
 }
 
+// isNil reports a nil message, typed or not. A typed nil pointer is a non-nil
+// interface, and its ProtoReflect cannot be trusted to say so: a nil
+// *dynamicpb.Message panics in IsValid, where a generated type's nil pointer
+// reports false.
+func isNil(msg proto.Message) bool {
+	if msg == nil {
+		return true
+	}
+	if rv := reflect.ValueOf(msg); rv.Kind() == reflect.Pointer && rv.IsNil() {
+		return true
+	}
+	return !msg.ProtoReflect().IsValid()
+}
+
 // respondLiteral is the response block for msg: its rendering, marked literal
 // and checked by the round-trip guard. One resolver serves both, so the
 // render and the guard see the same registered types.
 func respondLiteral(msg proto.Message, r chainResolver) (respondDoc, error) {
-	tree, err := renderMessage(msg, r)
+	tree, err := renderMessage(msg, r, "respond.message")
 	if err != nil {
 		return respondDoc{}, err
 	}

@@ -1,8 +1,10 @@
 package simulacratest_test
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	spb "google.golang.org/genproto/googleapis/rpc/status"
@@ -76,6 +78,37 @@ func TestRespondStatusRefusesAnUnresolvableDetail(t *testing.T) {
 	}})
 	rec := runRecorded(t, func(tb testing.TB) { sim.Stub(getOrder).RespondStatus(tb, st) })
 	want := "simulacratest: RespondStatus: detail 0: cannot resolve type.googleapis.com/nope.v1.Missing"
+	if rec.FatalMsg() != want {
+		t.Fatalf("FatalMsg() = %q; want %q", rec.FatalMsg(), want)
+	}
+}
+
+func TestRespondStatusRefusesACorruptDetail(t *testing.T) {
+	sim := simulacratest.Start(t)
+	const url = "type.googleapis.com/google.rpc.RetryInfo"
+	st := status.FromProto(&spb.Status{Code: int32(codes.Unavailable), Details: []*anypb.Any{{TypeUrl: url, Value: []byte{0xff}}}})
+	// protobuf's error text varies by build, so the cause is taken from the
+	// same decode.
+	cause := proto.Unmarshal([]byte{0xff}, &errdetails.RetryInfo{})
+	if cause == nil {
+		t.Fatalf("0xff decodes as a RetryInfo; the test would prove nothing")
+	}
+	rec := runRecorded(t, func(tb testing.TB) { sim.Stub(getOrder).RespondStatus(tb, st) })
+	if want := fmt.Sprintf("simulacratest: RespondStatus: detail 0: cannot decode %s: %v", url, cause); rec.FatalMsg() != want {
+		t.Fatalf("FatalMsg() = %q; want %q", rec.FatalMsg(), want)
+	}
+}
+
+// A well-known type with a scalar JSON form cannot be a detail's value, and
+// the refusal names the detail's grammar field, not Respond's.
+func TestRespondStatusRefusesANonObjectDetail(t *testing.T) {
+	sim := simulacratest.Start(t)
+	st, err := status.New(codes.Unavailable, "x").WithDetails(durationpb.New(time.Second))
+	if err != nil {
+		t.Fatalf("WithDetails: %v", err)
+	}
+	rec := runRecorded(t, func(tb testing.TB) { sim.Stub(getOrder).RespondStatus(tb, st) })
+	want := "simulacratest: RespondStatus: detail 0: google.protobuf.Duration renders as a JSON string, not an object; respond.status.details[].value must be a mapping, so this value cannot be expressed in the stub grammar"
 	if rec.FatalMsg() != want {
 		t.Fatalf("FatalMsg() = %q; want %q", rec.FatalMsg(), want)
 	}

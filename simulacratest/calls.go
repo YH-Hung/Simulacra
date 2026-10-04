@@ -71,9 +71,7 @@ func (k Call) Response(t testing.TB, into proto.Message) {
 // when msgs is empty.
 func (k Call) capture(t testing.TB, op, noun string, msgs []*adminv1.DecodedMessage, into proto.Message, ifNone string) {
 	t.Helper()
-	// A typed nil pointer is a non-nil interface whose reflection is invalid;
-	// decoding into it would panic.
-	if into == nil || !into.ProtoReflect().IsValid() {
+	if isNil(into) {
 		t.Fatalf("simulacratest: %s: target message is nil", op)
 	}
 	seq := k.p.GetSeq()

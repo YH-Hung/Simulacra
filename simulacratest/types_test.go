@@ -27,6 +27,12 @@ func identityRefusal(path string) string {
 	return "simulacratest: RegisterFiles: " + path + " declares extensions and is already registered with this Client as a different descriptor instance; extensions are matched by descriptor identity, so values decoded through the registered copy would be invisible through this one — register one instance and build extension values from it"
 }
 
+// linkedRefusal is RegisterFiles' refusal of an instance other than the copy
+// linked into the test binary.
+func linkedRefusal(path string) string {
+	return "simulacratest: RegisterFiles: " + path + " declares extensions and is linked into the test binary as a different descriptor instance; extensions are matched by descriptor identity, so values decoded through the linked copy would be invisible through this one — compile against the linked copy (resolve imports from protoregistry.GlobalFiles)"
+}
+
 // instanceMismatch is checkExtensionInstances' error for path.
 func instanceMismatch(path string) string {
 	return "message built from a different descriptor instance of " + path + " than the one registered with this Client; build messages from the FileDescriptor passed to RegisterFiles"
@@ -124,7 +130,7 @@ func TestRegisterFilesRefusesAnInstanceThatDiffersFromTheLinkedCopy(t *testing.T
 	}
 	simulacratest.SetGlobalFiles(sim.Client, linked)
 	rec := runRecorded(t, func(tb testing.TB) { sim.RegisterFiles(tb, e2) })
-	if want := identityRefusal("probe/ext.proto"); rec.FatalMsg() != want {
+	if want := linkedRefusal("probe/ext.proto"); rec.FatalMsg() != want {
 		t.Fatalf("fatal = %q; want %q", rec.FatalMsg(), want)
 	}
 }

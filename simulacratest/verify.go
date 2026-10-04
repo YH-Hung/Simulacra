@@ -3,6 +3,7 @@ package simulacratest
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 	"testing"
@@ -47,7 +48,7 @@ func (b *VerifyBuilder) MatchMetadata(key string, ms ...Matcher) *VerifyBuilder 
 }
 
 // Expr counts only calls for which the CEL expression holds. It is sent
-// verbatim.
+// verbatim, or refused if the stub grammar would alter it.
 func (b *VerifyBuilder) Expr(cel string) *VerifyBuilder {
 	b.structured = true
 	b.match.setExpr(cel)
@@ -65,25 +66,25 @@ func (b *VerifyBuilder) MatchYAML(doc string) *VerifyBuilder {
 // Exactly passes when exactly n calls match.
 func (b *VerifyBuilder) Exactly(t testing.TB, n int) bool {
 	t.Helper()
-	return b.run(t, &adminv1.Times{Exactly: proto.Int32(int32(n))})
+	return b.run(t, &adminv1.Times{Exactly: proto.Int32(int32(n))}, n)
 }
 
 // AtLeast passes when n or more calls match.
 func (b *VerifyBuilder) AtLeast(t testing.TB, n int) bool {
 	t.Helper()
-	return b.run(t, &adminv1.Times{AtLeast: proto.Int32(int32(n))})
+	return b.run(t, &adminv1.Times{AtLeast: proto.Int32(int32(n))}, n)
 }
 
 // AtMost passes when n or fewer calls match.
 func (b *VerifyBuilder) AtMost(t testing.TB, n int) bool {
 	t.Helper()
-	return b.run(t, &adminv1.Times{AtMost: proto.Int32(int32(n))})
+	return b.run(t, &adminv1.Times{AtMost: proto.Int32(int32(n))}, n)
 }
 
 // Between passes when lo to hi calls match, inclusive.
 func (b *VerifyBuilder) Between(t testing.TB, lo, hi int) bool {
 	t.Helper()
-	return b.run(t, &adminv1.Times{AtLeast: proto.Int32(int32(lo)), AtMost: proto.Int32(int32(hi))})
+	return b.run(t, &adminv1.Times{AtLeast: proto.Int32(int32(lo)), AtMost: proto.Int32(int32(hi))}, lo, hi)
 }
 
 // Never passes when no call matches.
@@ -112,12 +113,18 @@ func (b *VerifyBuilder) matcherDocument() string {
 // run asks the server whether the journal satisfies times and reports a failed
 // verification with t.Errorf, so the test goes on to show every failure. The
 // text is the server's: its verdict, then each call it lists with the request
-// JSON and, for a call that missed, the reason, unchanged.
-func (b *VerifyBuilder) run(t testing.TB, times *adminv1.Times) bool {
+// JSON and, for a call that missed, the reason, unchanged. counts are the
+// caller's ints behind times, which must fit its int32 fields unchanged.
+func (b *VerifyBuilder) run(t testing.TB, times *adminv1.Times, counts ...int) bool {
 	t.Helper()
 	errs := b.match.errors()
 	if b.hasYAML && b.structured {
 		errs = slices.Concat(errs, []string{"simulacratest: Verify: MatchYAML cannot be combined with MatchField, MatchMetadata or Expr"})
+	}
+	for _, n := range counts {
+		if n < 0 || n > math.MaxInt32 {
+			errs = slices.Concat(errs, []string{fmt.Sprintf("simulacratest: Verify: count %d is outside 0..2147483647", n)})
+		}
 	}
 	if len(errs) > 0 {
 		t.Fatalf("%s", strings.Join(errs, "\n"))

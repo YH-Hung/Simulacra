@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/dynamicpb"
 
 	shopv1 "github.com/yinghanhung/simulacra/internal/testpb/shop/v1"
 	"github.com/yinghanhung/simulacra/simulacratest"
@@ -164,6 +165,8 @@ func TestCaptureRejectsNilTarget(t *testing.T) {
 		{"Request typed nil", func(tb testing.TB) { call.Request(tb, (*shopv1.GetOrderRequest)(nil)) }, "simulacratest: Request: target message is nil"},
 		{"Response nil", func(tb testing.TB) { call.Response(tb, nil) }, "simulacratest: Response: target message is nil"},
 		{"Response typed nil", func(tb testing.TB) { call.Response(tb, (*shopv1.GetOrderResponse)(nil)) }, "simulacratest: Response: target message is nil"},
+		{"Request typed nil dynamicpb", func(tb testing.TB) { call.Request(tb, (*dynamicpb.Message)(nil)) }, "simulacratest: Request: target message is nil"},
+		{"Response typed nil dynamicpb", func(tb testing.TB) { call.Response(tb, (*dynamicpb.Message)(nil)) }, "simulacratest: Response: target message is nil"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if rec := runRecorded(t, tc.capture); rec.FatalMsg() != tc.want {

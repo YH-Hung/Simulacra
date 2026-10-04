@@ -1,6 +1,7 @@
 package simulacratest
 
 import (
+	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -8,6 +9,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/known/anypb"
 
 	adminv1 "github.com/yinghanhung/simulacra/gen/simulacra/admin/v1"
@@ -53,10 +55,13 @@ func (b *StubBuilder) RespondStatus(t testing.TB, st *status.Status) *adminv1.St
 	doc := statusDoc{Code: codeNames[st.Code()], Message: st.Message()}
 	for i, a := range st.Proto().GetDetails() {
 		msg, err := anypb.UnmarshalNew(a, proto.UnmarshalOptions{Resolver: r})
-		if err != nil {
+		if errors.Is(err, protoregistry.NotFound) {
 			t.Fatalf("simulacratest: RespondStatus: detail %d: cannot resolve %s", i, a.GetTypeUrl())
 		}
-		tree, err := renderMessage(msg, r)
+		if err != nil {
+			t.Fatalf("simulacratest: RespondStatus: detail %d: cannot decode %s: %v", i, a.GetTypeUrl(), err)
+		}
+		tree, err := renderMessage(msg, r, "respond.status.details[].value")
 		if err == nil {
 			err = guardRoundTrip(tree, msg, r)
 		}

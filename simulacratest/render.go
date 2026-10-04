@@ -16,8 +16,9 @@ import (
 // extensions and Any payloads from registered files render too. Decoding with
 // UseNumber keeps every number as protojson spelled it, and re-encoding the
 // tree drops the whitespace protojson deliberately varies, so the document is
-// stable.
-func renderMessage(msg proto.Message, r chainResolver) (map[string]any, error) {
+// stable. where names the grammar field the body fills, for the refusal of a
+// body that is not a JSON object.
+func renderMessage(msg proto.Message, r chainResolver, where string) (map[string]any, error) {
 	b, err := protojson.MarshalOptions{UseProtoNames: true, Resolver: r}.Marshal(msg)
 	if err != nil {
 		return nil, err
@@ -30,7 +31,7 @@ func renderMessage(msg proto.Message, r chainResolver) (map[string]any, error) {
 	}
 	tree, ok := v.(map[string]any)
 	if !ok {
-		return nil, fmt.Errorf("%s renders as a JSON %s, not an object; respond.message must be a mapping, so this value cannot be expressed in the stub grammar", msg.ProtoReflect().Descriptor().FullName(), jsonKind(v))
+		return nil, fmt.Errorf("%s renders as a JSON %s, not an object; %s must be a mapping, so this value cannot be expressed in the stub grammar", msg.ProtoReflect().Descriptor().FullName(), jsonKind(v), where)
 	}
 	return tree, nil
 }
@@ -76,14 +77,18 @@ func jsonKind(v any) string {
 // It compares by proto.Equal and by deterministic bytes, because each misses
 // something: proto.Equal compares floats with ==, so -0 in a Struct number is
 // equal to the 0 that comes back, while the encodings keep the sign bit.
+//
+// A decode that fails on the way (YAML rejects the U+007F encoding/json
+// writes raw, for example) is the same refusal, with the cause appended.
 func guardRoundTrip(tree map[string]any, msg proto.Message, r chainResolver) error {
+	name := msg.ProtoReflect().Descriptor().FullName()
 	body, err := json.Marshal(tree)
 	if err != nil {
 		return err
 	}
 	var doc map[string]any
 	if err := yaml.Unmarshal([]byte(`{"message": `+string(body)+`}`), &doc); err != nil {
-		return err
+		return fmt.Errorf(guardRefusal+": %v", name, err)
 	}
 	data, err := json.Marshal(doc["message"])
 	if err != nil {
@@ -91,7 +96,7 @@ func guardRoundTrip(tree map[string]any, msg proto.Message, r chainResolver) err
 	}
 	got := msg.ProtoReflect().New()
 	if err := (protojson.UnmarshalOptions{Resolver: r}).Unmarshal(data, got.Interface()); err != nil {
-		return err
+		return fmt.Errorf(guardRefusal+": %v", name, err)
 	}
 	if err := checkExtensionInstances(got); err != nil {
 		return err
@@ -106,7 +111,9 @@ func guardRoundTrip(tree map[string]any, msg proto.Message, r chainResolver) err
 		return err
 	}
 	if !proto.Equal(got.Interface(), msg) || !bytes.Equal(gotBytes, wantBytes) {
-		return fmt.Errorf("%s does not survive the stub grammar's JSON round trip unchanged (unknown fields are dropped and negative zero loses its sign, for example); use StubYAML for full control", got.Descriptor().FullName())
+		return fmt.Errorf(guardRefusal, name)
 	}
 	return nil
 }
+
+const guardRefusal = "%s does not survive the stub grammar's JSON round trip unchanged (unknown fields are dropped and negative zero loses its sign, for example); use StubYAML for full control"

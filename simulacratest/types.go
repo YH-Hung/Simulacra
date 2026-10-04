@@ -91,7 +91,10 @@ func (c *Client) RegisterFiles(t testing.TB, fds ...protoreflect.FileDescriptor)
 	c.registerFiles(t, "RegisterFiles", fds)
 }
 
-const identityRefusal = "simulacratest: %s: %s declares extensions and is already registered with this Client as a different descriptor instance; extensions are matched by descriptor identity, so values decoded through the registered copy would be invisible through this one — register one instance and build extension values from it"
+const (
+	identityRefusal = "simulacratest: %s: %s declares extensions and is already registered with this Client as a different descriptor instance; extensions are matched by descriptor identity, so values decoded through the registered copy would be invisible through this one — register one instance and build extension values from it"
+	linkedRefusal   = "simulacratest: %s: %s declares extensions and is linked into the test binary as a different descriptor instance; extensions are matched by descriptor identity, so values decoded through the linked copy would be invisible through this one — compile against the linked copy (resolve imports from protoregistry.GlobalFiles)"
+)
 
 func (c *Client) registerFiles(t testing.TB, op string, fds []protoreflect.FileDescriptor) {
 	t.Helper()
@@ -113,9 +116,15 @@ func (c *Client) registerFiles(t testing.TB, op string, fds []protoreflect.FileD
 		t.Fatalf(identityRefusal, op, dup)
 	}
 	for _, fd := range files {
+		if !declaresExtensions(fd) {
+			continue
+		}
 		// GlobalTypes wins resolution, so a linked copy that is not this
 		// instance would always be the one decoding.
-		if declaresExtensions(fd) && (otherInstance(c.globalFiles, fd) || otherInstance(cur.files, fd)) {
+		if otherInstance(c.globalFiles, fd) {
+			t.Fatalf(linkedRefusal, op, fd.Path())
+		}
+		if otherInstance(cur.files, fd) {
 			t.Fatalf(identityRefusal, op, fd.Path())
 		}
 	}

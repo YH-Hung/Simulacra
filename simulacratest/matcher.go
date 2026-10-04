@@ -71,9 +71,13 @@ type matchSpec struct {
 // the test sets the stub or runs the verification. kind is "MatchField" or
 // "MatchMetadata" and names the method in the error.
 func (m *matchSpec) add(kind, key string, ms []Matcher) {
-	dst := &m.message
+	dst, noun := &m.message, "path"
 	if kind == "MatchMetadata" {
-		dst = &m.metadata
+		dst, noun = &m.metadata, "key"
+	}
+	if !yamlSafeString(key) {
+		m.errs = append(m.errs, fmt.Sprintf("simulacratest: %s(%q): the %s"+notYAMLSafe, kind, key, noun))
+		return
 	}
 	for _, mt := range ms {
 		val, err := mt.render()
@@ -95,8 +99,15 @@ func (m *matchSpec) add(kind, key string, ms []Matcher) {
 	}
 }
 
-// setExpr sets the CEL expression for what the structured matchers cannot say.
-func (m *matchSpec) setExpr(cel string) { m.expr = cel }
+// setExpr sets the CEL expression for what the structured matchers cannot say,
+// or records it as refused when the document would alter it.
+func (m *matchSpec) setExpr(cel string) {
+	if !yamlSafeString(cel) {
+		m.errs = append(m.errs, "simulacratest: Expr: the expression"+notYAMLSafe)
+		return
+	}
+	m.expr = cel
+}
 
 // block is the `match:` document, or nil when nothing was set so the builder
 // can omit the key entirely.
@@ -122,6 +133,12 @@ func (m *matchSpec) errors() []string { return m.errs }
 
 var errNonFinite = errors.New("NaN and ±Inf cannot be expressed in JSON; use Expr")
 
+// notYAMLSafe ends the refusal of a string the match block would carry
+// altered: the server would match against, or parse, something else.
+const notYAMLSafe = " does not survive the stub grammar's JSON round trip unchanged (invalid UTF-8 or a raw U+0085, for example); use MatchYAML or StubYAML for full control"
+
+var errNotYAMLSafe = errors.New("value" + notYAMLSafe)
+
 // matcherValue renders v as the JSON literal the server's matcher parser reads
 // (internal/match literalFor). The Go kind decides the JSON type, because the
 // parser is strict about it:
@@ -136,10 +153,16 @@ var errNonFinite = errors.New("NaN and ±Inf cannot be expressed in JSON; use Ex
 //
 // Everything else — bytes, messages, maps, slices — has no literal form, and
 // NaN and the infinities have no JSON form, so both are refused in favour of
-// Expr rather than silently stringified.
+// Expr rather than silently stringified. A string the document would alter
+// (invalid UTF-8, a raw U+0085) is refused too, as add refuses such a path.
 func matcherValue(v any) (any, error) {
 	switch x := v.(type) {
-	case string, bool:
+	case string:
+		if !yamlSafeString(x) {
+			return nil, errNotYAMLSafe
+		}
+		return x, nil
+	case bool:
 		return x, nil
 	case int:
 		return int64(x), nil

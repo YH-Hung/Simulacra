@@ -55,10 +55,11 @@
 // messages and extension values from the very FileDescriptor passed to
 // RegisterFiles. A different instance of a file that declares extensions is
 // refused when registered, and a message built from one is refused when
-// decoded into. One case nothing can detect: an extension descriptor never
-// passed to RegisterFiles that extends a message that was. Build extension
-// values only from extension descriptors you registered, or from generated
-// code.
+// decoded into if the decoded message carries a populated extension (one
+// without decodes the same through either instance). One case nothing can
+// detect: an extension descriptor never passed to RegisterFiles that extends
+// a message that was. Build extension values only from extension descriptors
+// you registered, or from generated code.
 //
 // # In-process and container servers
 //

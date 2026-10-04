@@ -2,12 +2,14 @@ package simulacratest_test
 
 import (
 	"math"
+	"strings"
 	"testing"
 	"time"
 
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/dynamicpb"
 	"google.golang.org/protobuf/types/known/structpb"
 
 	shopv1 "github.com/yinghanhung/simulacra/internal/testpb/shop/v1"
@@ -106,7 +108,11 @@ func TestHeaderValuesMustSurviveTheYAMLHop(t *testing.T) {
 func TestRespondRejectsNilMessage(t *testing.T) {
 	sim := simulacratest.Start(t)
 	const want = "simulacratest: Respond: message is nil; pass &T{} for an empty response"
-	for name, msg := range map[string]proto.Message{"nil interface": nil, "typed nil": (*shopv1.GetOrderResponse)(nil)} {
+	for name, msg := range map[string]proto.Message{
+		"nil interface":       nil,
+		"typed nil":           (*shopv1.GetOrderResponse)(nil),
+		"typed nil dynamicpb": (*dynamicpb.Message)(nil),
+	} {
 		t.Run(name, func(t *testing.T) {
 			rec := runRecorded(t, func(tb testing.TB) { sim.Stub(getOrder).Respond(tb, msg) })
 			if rec.FatalMsg() != want {
@@ -124,6 +130,30 @@ func TestRespondRefusesUnknownFields(t *testing.T) {
 	rec := runRecorded(t, func(tb testing.TB) { sim.Stub(getOrder).Respond(tb, msg) })
 
 	if want := guardRefusal("shop.v1.GetOrderResponse"); rec.FatalMsg() != want {
+		t.Fatalf("FatalMsg() = %q; want %q", rec.FatalMsg(), want)
+	}
+}
+
+// encoding/json writes U+007F raw and the YAML loader rejects it, so the
+// guard's own decode fails; the refusal says why, cause appended.
+func TestRespondRefusesAMessageTheGuardCannotDecode(t *testing.T) {
+	sim := simulacratest.Start(t)
+	rec := runRecorded(t, func(tb testing.TB) {
+		sim.Stub(getOrder).Respond(tb, &shopv1.GetOrderResponse{Note: "a\x7fb"})
+	})
+	if prefix := guardRefusal("shop.v1.GetOrderResponse") + ": "; !strings.HasPrefix(rec.FatalMsg(), prefix) || rec.FatalMsg() == prefix {
+		t.Fatalf("FatalMsg() = %q; want %q followed by the cause", rec.FatalMsg(), prefix)
+	}
+}
+
+// The stub builder shares the matcher check with Verify.
+func TestStubRefusesAMatcherStringTheYAMLHopWouldAlter(t *testing.T) {
+	sim := simulacratest.Start(t)
+	rec := runRecorded(t, func(tb testing.TB) {
+		sim.Stub(getOrder).MatchField("order_id", simulacratest.Eq("a\u0085b")).Respond(tb, &shopv1.GetOrderResponse{})
+	})
+	want := `simulacratest: MatchField("order_id"): value does not survive the stub grammar's JSON round trip unchanged (invalid UTF-8 or a raw U+0085, for example); use MatchYAML or StubYAML for full control`
+	if rec.FatalMsg() != want {
 		t.Fatalf("FatalMsg() = %q; want %q", rec.FatalMsg(), want)
 	}
 }

@@ -66,8 +66,10 @@ func TestVerifyTimes(t *testing.T) {
 	}{
 		{"Exactly 2", func(tb testing.TB, b *simulacratest.VerifyBuilder) bool { return b.Exactly(tb, 2) }, true},
 		{"Exactly 1", func(tb testing.TB, b *simulacratest.VerifyBuilder) bool { return b.Exactly(tb, 1) }, false},
+		{"AtLeast 1", func(tb testing.TB, b *simulacratest.VerifyBuilder) bool { return b.AtLeast(tb, 1) }, true},
 		{"AtLeast 2", func(tb testing.TB, b *simulacratest.VerifyBuilder) bool { return b.AtLeast(tb, 2) }, true},
 		{"AtLeast 3", func(tb testing.TB, b *simulacratest.VerifyBuilder) bool { return b.AtLeast(tb, 3) }, false},
+		{"AtMost 3", func(tb testing.TB, b *simulacratest.VerifyBuilder) bool { return b.AtMost(tb, 3) }, true},
 		{"AtMost 2", func(tb testing.TB, b *simulacratest.VerifyBuilder) bool { return b.AtMost(tb, 2) }, true},
 		{"AtMost 1", func(tb testing.TB, b *simulacratest.VerifyBuilder) bool { return b.AtMost(tb, 1) }, false},
 		{"Between 1 and 3", func(tb testing.TB, b *simulacratest.VerifyBuilder) bool { return b.Between(tb, 1, 3) }, true},
@@ -276,6 +278,70 @@ func TestVerifyReportsMatcherMisuse(t *testing.T) {
 
 	if want := `simulacratest: MatchField("f"): []uint8 is not supported by structured matchers; use Expr`; rec.FatalMsg() != want {
 		t.Errorf("FatalMsg() = %q; want %q", rec.FatalMsg(), want)
+	}
+}
+
+// countingVerify counts VerifyCalls, so a test can assert a refusal sent none.
+type countingVerify struct {
+	adminv1connect.VerifyServiceClient
+	calls int
+}
+
+func (c *countingVerify) VerifyCalls(ctx context.Context, req *connect.Request[adminv1.VerifyCallsRequest]) (*connect.Response[adminv1.VerifyCallsResponse], error) {
+	c.calls++
+	return c.VerifyServiceClient.VerifyCalls(ctx, req)
+}
+
+// A matcher string the YAML hop would alter matches something else on the
+// server: Eq("a\u0085b") arrives as "a b", so Never would pass after a call
+// carrying "a\u0085b". Every such string is refused before any RPC.
+func TestVerifyRefusesStringsTheYAMLHopWouldAlter(t *testing.T) {
+	sim := simulacratest.Start(t)
+	callGetOrder(t, sim, "a\u0085b")
+	counter := &countingVerify{}
+	simulacratest.WrapAdmin(sim.Client, func(a simulacratest.Admin) simulacratest.Admin {
+		counter.VerifyServiceClient = a.Verify
+		a.Verify = counter
+		return a
+	})
+	const tail = " does not survive the stub grammar's JSON round trip unchanged (invalid UTF-8 or a raw U+0085, for example); use MatchYAML or StubYAML for full control"
+	value := func(kind, key string) string { return fmt.Sprintf("simulacratest: %s(%q): value", kind, key) + tail }
+	for _, tc := range []struct {
+		name string
+		b    *simulacratest.VerifyBuilder
+		want string
+	}{
+		{"Eq raw U+0085", sim.Verify(getOrder).MatchField("order_id", simulacratest.Eq("a\u0085b")), value("MatchField", "order_id")},
+		{"Eq invalid UTF-8", sim.Verify(getOrder).MatchField("order_id", simulacratest.Eq("a\xffb")), value("MatchField", "order_id")},
+		{"In element", sim.Verify(getOrder).MatchField("order_id", simulacratest.In("x", "a\u0085b")), value("MatchField", "order_id")},
+		{"Matches", sim.Verify(getOrder).MatchMetadata("k", simulacratest.Matches("a\u0085")), value("MatchMetadata", "k")},
+		{"path", sim.Verify(getOrder).MatchField("a\u0085b", simulacratest.Present(true)),
+			fmt.Sprintf("simulacratest: MatchField(%q): the path", "a\u0085b") + tail},
+		{"metadata key", sim.Verify(getOrder).MatchMetadata("k\xff", simulacratest.Present(true)),
+			fmt.Sprintf("simulacratest: MatchMetadata(%q): the key", "k\xff") + tail},
+		{"Expr", sim.Verify(getOrder).Expr("message.order_id == 'a\u0085b'"), "simulacratest: Expr: the expression" + tail},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var ok bool
+			rec := runRecorded(t, func(tb testing.TB) { ok = tc.b.Never(tb) })
+			if ok || rec.FatalMsg() != tc.want {
+				t.Errorf("Never = %v, FatalMsg() = %q; want false, %q", ok, rec.FatalMsg(), tc.want)
+			}
+		})
+	}
+	if counter.calls != 0 {
+		t.Errorf("VerifyCalls sent %d times; want none", counter.calls)
+	}
+}
+
+// A count Times cannot hold would narrow silently: 1<<32 is sent as 0.
+func TestVerifyRefusesACountOutsideInt32(t *testing.T) {
+	sim := simulacratest.Start(t)
+	callGetOrder(t, sim, "o-1")
+	var ok bool
+	rec := runRecorded(t, func(tb testing.TB) { ok = sim.Verify(getOrder).AtLeast(tb, 1<<32) })
+	if want := "simulacratest: Verify: count 4294967296 is outside 0..2147483647"; ok || rec.FatalMsg() != want {
+		t.Errorf("AtLeast(1<<32) = %v, FatalMsg() = %q; want false, %q", ok, rec.FatalMsg(), want)
 	}
 }
 
