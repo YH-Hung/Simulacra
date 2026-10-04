@@ -113,8 +113,9 @@ func (b *StubBuilder) Trailer(key, value string) *StubBuilder {
 // grammar holds one value per key: a repeated key would replace the first
 // value, and the server lowercases keys, so two spellings of one key would
 // arrive as a single key with two values. encoding/json replaces invalid
-// UTF-8 with U+FFFD, which would corrupt a -bin value. Every other metadata
-// rule (reserved keys, printable ASCII) is the server's to diagnose.
+// UTF-8 with U+FFFD, which would corrupt a -bin value, and YAML folds a raw
+// U+0085 into a space; a value altered either way is refused. Every other
+// metadata rule (reserved keys, printable ASCII) is the server's to diagnose.
 func (b *StubBuilder) addMetadata(kind string, m map[string]string, key, value string) map[string]string {
 	for k := range m {
 		if strings.ToLower(k) == strings.ToLower(key) {
@@ -124,6 +125,10 @@ func (b *StubBuilder) addMetadata(kind string, m map[string]string, key, value s
 	}
 	if !utf8.ValidString(value) {
 		b.errs = append(b.errs, fmt.Sprintf("simulacratest: %s(%q): value is not valid UTF-8; JSON would replace the invalid bytes", kind, key))
+		return m
+	}
+	if !yamlSafeString(value) {
+		b.errs = append(b.errs, fmt.Sprintf("simulacratest: %s(%q): value does not survive the stub grammar's JSON round trip unchanged (a raw U+0085, for example); use StubYAML for full control", kind, key))
 		return m
 	}
 	if m == nil {

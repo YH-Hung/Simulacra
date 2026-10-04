@@ -118,3 +118,21 @@ func TestRespondStatusOKShowsTheServerDiagnostic(t *testing.T) {
 		t.Fatalf("FatalMsg() = %q; want it to contain the server's OK diagnostic", got)
 	}
 }
+
+func TestRespondStatusRefusesAMessageTheYAMLHopWouldAlter(t *testing.T) {
+	sim := simulacratest.Start(t)
+	const want = "simulacratest: RespondStatus: the status message does not survive the stub grammar's JSON round trip unchanged (invalid UTF-8 or a raw U+0085, for example); use StubYAML for full control"
+	for _, tc := range []struct{ name, msg string }{
+		{"invalid UTF-8", "a\xffb"},
+		{"raw U+0085", "a\u0085b"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := runRecorded(t, func(tb testing.TB) {
+				sim.Stub(getOrder).RespondStatus(tb, status.New(codes.NotFound, tc.msg))
+			})
+			if rec.FatalMsg() != want {
+				t.Fatalf("FatalMsg() = %q; want %q", rec.FatalMsg(), want)
+			}
+		})
+	}
+}

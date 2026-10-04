@@ -35,6 +35,19 @@ func renderMessage(msg proto.Message, r chainResolver) (map[string]any, error) {
 	return tree, nil
 }
 
+// yamlSafeString reports whether s reaches the server unchanged as a string
+// value of the stub document: the document is JSON, which the server's YAML
+// loader reads, and each hop alters some strings without an error. encoding/json
+// replaces invalid UTF-8 with U+FFFD, and YAML folds a raw U+0085 into a space.
+func yamlSafeString(s string) bool {
+	b, err := json.Marshal(map[string]string{"v": s})
+	if err != nil {
+		return false
+	}
+	var doc map[string]any
+	return yaml.Unmarshal(b, &doc) == nil && doc["v"] == s
+}
+
 // jsonKind names the JSON type of a value decoded with UseNumber.
 func jsonKind(v any) string {
 	switch v.(type) {

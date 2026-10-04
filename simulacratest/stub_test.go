@@ -82,6 +82,27 @@ func TestHeaderValuesMustBeUTF8(t *testing.T) {
 	}
 }
 
+func TestHeaderValuesMustSurviveTheYAMLHop(t *testing.T) {
+	sim := simulacratest.Start(t)
+	for _, tc := range []struct {
+		name string
+		b    *simulacratest.StubBuilder
+		want string
+	}{
+		{"Header", sim.Stub(getOrder).Header("x-raw-bin", "a\u0085b"),
+			`simulacratest: Header("x-raw-bin"): value does not survive the stub grammar's JSON round trip unchanged (a raw U+0085, for example); use StubYAML for full control`},
+		{"Trailer", sim.Stub(getOrder).Trailer("x-raw-bin", "a\u0085b"),
+			`simulacratest: Trailer("x-raw-bin"): value does not survive the stub grammar's JSON round trip unchanged (a raw U+0085, for example); use StubYAML for full control`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := runRecorded(t, func(tb testing.TB) { tc.b.Respond(tb, &shopv1.GetOrderResponse{}) })
+			if rec.FatalMsg() != tc.want {
+				t.Fatalf("FatalMsg() = %q; want %q", rec.FatalMsg(), tc.want)
+			}
+		})
+	}
+}
+
 func TestRespondRejectsNilMessage(t *testing.T) {
 	sim := simulacratest.Start(t)
 	const want = "simulacratest: Respond: message is nil; pass &T{} for an empty response"

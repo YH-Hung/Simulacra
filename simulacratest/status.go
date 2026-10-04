@@ -23,12 +23,14 @@ var codeNames = [17]string{"OK", "CANCELLED", "UNKNOWN", "INVALID_ARGUMENT", "DE
 // RespondStatus sends the stub with st as its response and returns the
 // server's envelope for it.
 //
-// The status message is sent as written, never as a template. Each detail is
-// unpacked through the Client's types and rendered like a Respond message,
-// with the same round-trip guard, so the client receives details equal to
-// st's; a detail whose type neither the test binary links nor the test
-// registered is refused. An OK status is sent too, and the server's own
-// diagnostic for it is what the test sees.
+// The status message is never a template, and it is sent as written or not at
+// all: one the stub grammar would alter (invalid UTF-8, a raw U+0085) is
+// refused rather than sent changed. Each detail is unpacked through the
+// Client's types and rendered like a Respond message, with the same
+// round-trip guard, so the client receives details equal to st's; a detail
+// whose type neither the test binary links nor the test registered is
+// refused. An OK status is sent too, and the server's own diagnostic for it
+// is what the test sees.
 func (b *StubBuilder) RespondStatus(t testing.TB, st *status.Status) *adminv1.Stub {
 	t.Helper()
 	if errs := slices.Concat(b.match.errors(), b.errs); len(errs) > 0 {
@@ -39,6 +41,9 @@ func (b *StubBuilder) RespondStatus(t testing.TB, st *status.Status) *adminv1.St
 	}
 	if st.Code() >= codes.Code(len(codeNames)) {
 		t.Fatalf("simulacratest: RespondStatus: code %d has no canonical name", st.Code())
+	}
+	if !yamlSafeString(st.Message()) {
+		t.Fatalf("simulacratest: RespondStatus: the status message does not survive the stub grammar's JSON round trip unchanged (invalid UTF-8 or a raw U+0085, for example); use StubYAML for full control")
 	}
 	// ensure registers the method's linked schemas, which is where its
 	// details' types may come from, and lets CreateStub hint at an unknown
