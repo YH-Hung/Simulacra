@@ -95,6 +95,7 @@ func TestHelpersWorkFromCleanup(t *testing.T) {
 		sim := simulacratest.Start(t, simulacratest.WithProtoDir("../testdata/protos"))
 		t.Cleanup(func() { sim.Reset(t) })
 		t.Cleanup(func() { sim.StubYAML(t, getOrderDoc) })
+		t.Cleanup(func() { sim.Verify(getOrder).AtLeast(t, 0) })
 	})
 }
 

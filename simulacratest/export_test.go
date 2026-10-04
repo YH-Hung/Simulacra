@@ -67,3 +67,12 @@ func StubDocument(b *StubBuilder, msg proto.Message) (string, error) {
 
 // CodeName is the canonical name RespondStatus sends for c.
 func CodeName(c codes.Code) string { return codeNames[c] }
+
+// StubMatchJSON is the match block b would send.
+func StubMatchJSON(b *StubBuilder) string {
+	doc, _ := json.Marshal(b.match.block())
+	return string(doc)
+}
+
+// VerifyMatchJSON is the matcher document b would send.
+func VerifyMatchJSON(b *VerifyBuilder) string { return b.matcherDocument() }
