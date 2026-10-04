@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
@@ -63,3 +64,6 @@ func StubDocument(b *StubBuilder, msg proto.Message) (string, error) {
 	doc, err := json.Marshal(b.document(respond))
 	return string(doc), err
 }
+
+// CodeName is the canonical name RespondStatus sends for c.
+func CodeName(c codes.Code) string { return codeNames[c] }
