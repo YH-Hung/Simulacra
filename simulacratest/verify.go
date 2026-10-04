@@ -112,7 +112,7 @@ func (b *VerifyBuilder) matcherDocument() string {
 // run asks the server whether the journal satisfies times and reports a failed
 // verification with t.Errorf, so the test goes on to show every failure. The
 // text is the server's: its verdict, then each call it lists with the request
-// JSON and the reason it missed, unchanged.
+// JSON and, for a call that missed, the reason, unchanged.
 func (b *VerifyBuilder) run(t testing.TB, times *adminv1.Times) bool {
 	t.Helper()
 	errs := b.match.errors()
@@ -155,7 +155,12 @@ func (b *VerifyBuilder) run(t testing.TB, times *adminv1.Times) bool {
 		if len(requests) > 0 {
 			shown = strings.Join(requests, ", ")
 		}
-		fmt.Fprintf(&msg, "\n  call seq=%d: %s\n    nearest miss: %s", a.GetCall().GetSeq(), shown, a.GetNearestMiss())
+		fmt.Fprintf(&msg, "\n  call seq=%d: %s", a.GetCall().GetSeq(), shown)
+		// A call that matched, listed because there were too many, has no
+		// miss to explain.
+		if a.GetNearestMiss() != "" {
+			fmt.Fprintf(&msg, "\n    nearest miss: %s", a.GetNearestMiss())
+		}
 	}
 	t.Errorf("%s", msg.String())
 	return false

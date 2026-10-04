@@ -133,6 +133,50 @@ func TestVerifyFailureTextIsTheServers(t *testing.T) {
 	}
 }
 
+// When too many calls match, the server lists the matching calls with nothing
+// to explain, so the report has no nearest-miss line to print for them.
+func TestVerifyOverCountListsMatchedCallsWithoutANearestMiss(t *testing.T) {
+	sim := simulacratest.Start(t)
+	callGetOrder(t, sim, "o-1", "o-1")
+	const doc = "message: { order_id: { eq: o-1 } }"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	direct, err := sim.Admin().Verify.VerifyCalls(ctx, connect.NewRequest(&adminv1.VerifyCallsRequest{
+		Method:          getOrder,
+		MatcherDocument: doc,
+		Times:           &adminv1.Times{Never: true},
+	}))
+	if err != nil {
+		t.Fatalf("VerifyCalls: %v", err)
+	}
+	resp := direct.Msg
+	if resp.GetPassed() || len(resp.GetActual()) != 2 {
+		t.Fatalf("VerifyCalls = %v; want a failure listing both matched calls", resp)
+	}
+	want := "simulacratest: Verify " + getOrder + ": " + resp.GetExplanation()
+	for _, a := range resp.GetActual() {
+		if a.GetNearestMiss() != "" {
+			t.Fatalf("server gave nearest miss %q for a matched call; the test would prove nothing", a.GetNearestMiss())
+		}
+		var reqs []string
+		for _, r := range a.GetCall().GetRequests() {
+			reqs = append(reqs, r.GetJson())
+		}
+		want += fmt.Sprintf("\n  call seq=%d: %s", a.GetCall().GetSeq(), strings.Join(reqs, ", "))
+	}
+
+	rec := runRecorded(t, func(tb testing.TB) {
+		sim.Verify(getOrder).MatchField("order_id", simulacratest.Eq("o-1")).Never(tb)
+	})
+
+	if got := rec.Errors(); !slices.Equal(got, []string{want}) {
+		t.Errorf("Errors() = %q; want [%q]", got, want)
+	}
+	if got := rec.Errors(); len(got) == 1 && strings.Contains(got[0], "nearest miss:") {
+		t.Errorf("failure = %q; want no nearest-miss line for calls that matched", got[0])
+	}
+}
+
 // fakeVerify answers every VerifyCalls with resp.
 type fakeVerify struct {
 	adminv1connect.VerifyServiceClient
